@@ -1,0 +1,36 @@
+[package]
+name = "bloodflow-mahjong"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "High-performance deterministic Blood Flow Mahjong rules engine"
+rust-version = "1.85"
+
+[lib]
+name = "bloodflow_mahjong"
+path = "src/lib.rs"
+
+[[bin]]
+name = "throughput-benchmark"
+path = "benchmarks/throughput.rs"
+
+[[bin]]
+name = "batch-throughput-benchmark"
+path = "benchmarks/batch_throughput.rs"
+
+[[bin]]
+name = "max-wait-benchmark"
+path = "benchmarks/max_wait_benchmark.rs"
+
+[[bin]]
+name = "ffi-throughput-benchmark"
+path = "benchmarks/ffi_throughput.rs"
+
+[features]
+default = []
+
+[dependencies]
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1.11"
+thiserror = "2"

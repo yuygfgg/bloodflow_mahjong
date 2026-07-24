@@ -1,0 +1,621 @@
+use ::bloodflow_mahjong as core_engine;
+use core_engine::{
+    ACTION_ADDED_KONG_OFFSET, ACTION_CHOOSE_MISSING_OFFSET, ACTION_CONCEALED_KONG_OFFSET,
+    ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
+    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, ExchangeDirection, Game,
+    GameError, LEGAL_ACTION_MASK_WORDS, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, MeldKind,
+    Phase, RIVER_OBSERVATION_WIDTH, STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_OBSERVATION_WIDTH,
+};
+use numpy::{
+    PyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray,
+    PyReadwriteArray, PyUntypedArrayMethods,
+};
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::prelude::*;
+
+const PLAYER_COUNT: usize = 4;
+const TILE_KIND_COUNT: usize = 27;
+const TILE_OBSERVATION_PLANES: usize = 10;
+const MELD_SLOTS: usize = 4;
+const MELD_FIELDS: usize = 3;
+const RIVER_TILE_CAPACITY: usize = 108;
+const RIVER_FIELDS: usize = 2;
+
+type StepRecordTuple = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
+
+#[pyclass(name = "Game", module = "bloodflow_mahjong")]
+struct PyGame {
+    inner: Game,
+}
+
+#[pymethods]
+impl PyGame {
+    #[new]
+    #[pyo3(signature = (seed=0))]
+    fn new(seed: u64) -> Self {
+        Self {
+            inner: Game::new(seed),
+        }
+    }
+
+    #[staticmethod]
+    fn with_exchange_direction(seed: u64, direction: u8) -> PyResult<Self> {
+        let direction = exchange_direction(direction)?;
+        Ok(Self {
+            inner: Game::new_with_direction(seed, direction),
+        })
+    }
+
+    fn reset(&mut self, seed: u64) {
+        self.inner.reset(seed);
+    }
+
+    #[getter]
+    fn phase(&self) -> u8 {
+        phase_code(self.inner.phase())
+    }
+
+    #[getter]
+    fn decision(&self) -> Option<(u8, u8)> {
+        self.inner
+            .decision()
+            .map(|decision| (decision.actor.as_u8(), phase_code(decision.phase)))
+    }
+
+    #[getter]
+    fn legal_action_mask(&self) -> (u64, u64) {
+        self.inner
+            .legal_action_mask()
+            .map_or((0, 0), |mask| (mask.words()[0], mask.words()[1]))
+    }
+
+    fn step_id(&mut self, action: u8) -> PyResult<StepRecordTuple> {
+        let action = action_id(action)?;
+        let outcome = self.inner.step_id(action).map_err(game_error)?;
+        Ok(outcome_tuple(outcome))
+    }
+
+    fn step_into<'py>(&mut self, action: u8, output: &Bound<'py, PyArray1<i64>>) -> PyResult<()> {
+        require_shape(output, &[STEP_RECORD_WIDTH], "output")?;
+        require_c_contiguous(output, "output")?;
+        let action = action_id(action)?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        let outcome = self.inner.step_id(action).map_err(game_error)?;
+        encode_outcome(outcome, output);
+        Ok(())
+    }
+
+    #[getter]
+    fn dealer(&self) -> u8 {
+        self.inner.dealer().as_u8()
+    }
+
+    #[getter]
+    fn exchange_direction(&self) -> u8 {
+        self.inner.exchange_direction() as u8
+    }
+
+    #[getter]
+    fn wall_remaining(&self) -> usize {
+        self.inner.wall_remaining()
+    }
+
+    #[getter]
+    fn current_draw(&self) -> Option<(u8, u8, bool)> {
+        self.inner
+            .current_draw()
+            .map(|draw| (draw.player.as_u8(), draw.tile.as_u8(), draw.replacement))
+    }
+
+    fn concealed_into<'py>(&self, seat: u8, output: &Bound<'py, PyArray1<u8>>) -> PyResult<()> {
+        copy_tiles_into(self.inner.concealed(seat_value(seat)?), output, "output")
+    }
+
+    fn locked_into<'py>(&self, seat: u8, output: &Bound<'py, PyArray1<u8>>) -> PyResult<()> {
+        copy_tiles_into(self.inner.locked(seat_value(seat)?), output, "output")
+    }
+
+    fn exchange_selection_into<'py>(
+        &self,
+        seat: u8,
+        output: &Bound<'py, PyArray1<u8>>,
+    ) -> PyResult<()> {
+        copy_tiles_into(
+            self.inner.exchange_selection(seat_value(seat)?),
+            output,
+            "output",
+        )
+    }
+
+    fn scores(&self) -> (i64, i64, i64, i64) {
+        let scores = Seat::ALL.map(|seat| self.inner.score(seat));
+        (scores[0], scores[1], scores[2], scores[3])
+    }
+
+    fn missing_suits(&self) -> (i8, i8, i8, i8) {
+        let suits =
+            Seat::ALL.map(|seat| self.inner.missing_suit(seat).map_or(-1, |suit| suit as i8));
+        (suits[0], suits[1], suits[2], suits[3])
+    }
+
+    fn has_won(&self, seat: u8) -> PyResult<bool> {
+        Ok(self.inner.has_won(seat_value(seat)?))
+    }
+
+    fn max_win_multipliers(&self) -> (u32, u32, u32, u32) {
+        let values = Seat::ALL.map(|seat| self.inner.max_win_multiplier(seat));
+        (values[0], values[1], values[2], values[3])
+    }
+
+    fn melds(&self, seat: u8) -> PyResult<Vec<(u8, u8, u8)>> {
+        let seat = seat_value(seat)?;
+        Ok((0..self.inner.meld_count(seat))
+            .filter_map(|index| self.inner.meld(seat, index))
+            .map(|meld| {
+                (
+                    meld.tile.as_u8(),
+                    meld_kind_code(meld.kind),
+                    meld.source.as_u8(),
+                )
+            })
+            .collect())
+    }
+
+    fn discards(&self) -> Vec<(u8, u8)> {
+        self.inner
+            .discards()
+            .map(|(seat, tile)| (seat.as_u8(), tile.as_u8()))
+            .collect()
+    }
+
+    fn rankings(&self) -> (u8, u8, u8, u8) {
+        let seats = self.inner.rankings().map(Seat::as_u8);
+        (seats[0], seats[1], seats[2], seats[3])
+    }
+}
+
+#[pyclass(name = "Batch", module = "bloodflow_mahjong")]
+struct PyBatch {
+    inner: Batch,
+}
+
+#[pymethods]
+impl PyBatch {
+    #[new]
+    #[pyo3(signature = (size, seed=0))]
+    fn new(py: Python<'_>, size: usize, seed: u64) -> Self {
+        Self {
+            inner: py.detach(|| Batch::new(size, seed)),
+        }
+    }
+
+    fn __len__(&self) -> usize {
+        self.inner.len()
+    }
+
+    #[getter]
+    fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    fn reset_all(&mut self, py: Python<'_>, seed: u64) {
+        py.detach(|| self.inner.reset_all(seed));
+    }
+
+    fn reset_at(&mut self, py: Python<'_>, index: usize, seed: u64) -> PyResult<()> {
+        py.detach(|| self.inner.reset_at(index, seed))
+            .map_err(game_error)
+    }
+
+    fn reset_many<'py>(
+        &mut self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+        seeds: &Bound<'py, PyArray1<u64>>,
+    ) -> PyResult<()> {
+        require_c_contiguous(indices, "indices")?;
+        require_shape(seeds, &[indices.len()], "seeds")?;
+        require_c_contiguous(seeds, "seeds")?;
+
+        let indices = try_readonly(indices, "indices")?;
+        let seeds = try_readonly(seeds, "seeds")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        let seeds = readonly_slice(&seeds, "seeds")?;
+        if let Some(&index) = indices
+            .iter()
+            .find(|&&index| index as usize >= self.inner.len())
+        {
+            return Err(PyValueError::new_err(format!(
+                "batch index {index} is out of range for batch size {}",
+                self.inner.len()
+            )));
+        }
+
+        py.detach(|| -> Result<(), GameError> {
+            for (&index, &seed) in indices.iter().zip(seeds) {
+                self.inner.reset_at(index as usize, seed)?;
+            }
+            Ok(())
+        })
+        .map_err(game_error)
+    }
+
+    fn legal_action_masks_into<'py>(
+        &self,
+        py: Python<'py>,
+        output: &Bound<'py, PyArray2<u64>>,
+    ) -> PyResult<()> {
+        require_shape(
+            output,
+            &[self.inner.len(), LEGAL_ACTION_MASK_WORDS],
+            "output",
+        )?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.legal_action_mask_words_into(output))
+            .map_err(game_error)
+    }
+
+    fn step_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: &Bound<'py, PyArray1<u8>>,
+        records: &Bound<'py, PyArray2<i64>>,
+    ) -> PyResult<()> {
+        require_shape(actions, &[self.inner.len()], "actions")?;
+        require_c_contiguous(actions, "actions")?;
+        require_shape(records, &[self.inner.len(), STEP_RECORD_WIDTH], "records")?;
+        require_c_contiguous(records, "records")?;
+
+        let actions = try_readonly(actions, "actions")?;
+        let mut records = try_readwrite(records, "records")?;
+        let actions = readonly_slice(&actions, "actions")?;
+        let records = writable_slice(&mut records, "records")?;
+        py.detach(|| self.inner.step_indices_into(actions, records))
+            .map_err(game_error)
+    }
+
+    fn observe_into<'py>(
+        &self,
+        py: Python<'py>,
+        tile_obs: &Bound<'py, PyArray3<u8>>,
+        melds: &Bound<'py, PyArray4<u8>>,
+        river: &Bound<'py, PyArray3<u8>>,
+        meta: &Bound<'py, PyArray2<i32>>,
+    ) -> PyResult<()> {
+        validate_observation_arrays(self.inner.len(), tile_obs, melds, river, meta)?;
+
+        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
+        let mut melds = try_readwrite(melds, "melds")?;
+        let mut river = try_readwrite(river, "river")?;
+        let mut meta = try_readwrite(meta, "meta")?;
+        let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
+        let melds = writable_slice(&mut melds, "melds")?;
+        let river = writable_slice(&mut river, "river")?;
+        let meta = writable_slice(&mut meta, "meta")?;
+        py.detach(|| self.inner.observations_into(tile_obs, melds, river, meta))
+            .map_err(game_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_and_observe_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: &Bound<'py, PyArray1<u8>>,
+        records: &Bound<'py, PyArray2<i64>>,
+        mask_words: &Bound<'py, PyArray2<u64>>,
+        tile_obs: &Bound<'py, PyArray3<u8>>,
+        melds: &Bound<'py, PyArray4<u8>>,
+        river: &Bound<'py, PyArray3<u8>>,
+        meta: &Bound<'py, PyArray2<i32>>,
+    ) -> PyResult<()> {
+        let batch_size = self.inner.len();
+        require_shape(actions, &[batch_size], "actions")?;
+        require_c_contiguous(actions, "actions")?;
+        require_shape(records, &[batch_size, STEP_RECORD_WIDTH], "records")?;
+        require_c_contiguous(records, "records")?;
+        require_shape(
+            mask_words,
+            &[batch_size, LEGAL_ACTION_MASK_WORDS],
+            "mask_words",
+        )?;
+        require_c_contiguous(mask_words, "mask_words")?;
+        validate_observation_arrays(batch_size, tile_obs, melds, river, meta)?;
+
+        let actions = try_readonly(actions, "actions")?;
+        let mut records = try_readwrite(records, "records")?;
+        let mut mask_words = try_readwrite(mask_words, "mask_words")?;
+        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
+        let mut melds = try_readwrite(melds, "melds")?;
+        let mut river = try_readwrite(river, "river")?;
+        let mut meta = try_readwrite(meta, "meta")?;
+        let actions = readonly_slice(&actions, "actions")?;
+        let records = writable_slice(&mut records, "records")?;
+        let mask_words = writable_slice(&mut mask_words, "mask_words")?;
+        let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
+        let melds = writable_slice(&mut melds, "melds")?;
+        let river = writable_slice(&mut river, "river")?;
+        let meta = writable_slice(&mut meta, "meta")?;
+
+        py.detach(|| -> Result<(), GameError> {
+            self.inner.step_indices_into(actions, records)?;
+            self.inner.observations_into(tile_obs, melds, river, meta)?;
+            self.inner.legal_action_mask_words_into(mask_words)
+        })
+        .map_err(game_error)
+    }
+}
+
+fn action_id(action: u8) -> PyResult<ActionId> {
+    ActionId::new(action as usize).ok_or_else(|| {
+        PyValueError::new_err(format!(
+            "action must be in 0..{ACTION_SPACE_SIZE}, got {action}"
+        ))
+    })
+}
+
+fn seat_value(seat: u8) -> PyResult<Seat> {
+    Seat::new(seat)
+        .ok_or_else(|| PyValueError::new_err(format!("seat must be in 0..4, got {seat}")))
+}
+
+fn exchange_direction(direction: u8) -> PyResult<ExchangeDirection> {
+    match direction {
+        1 => Ok(ExchangeDirection::Left),
+        2 => Ok(ExchangeDirection::Across),
+        3 => Ok(ExchangeDirection::Right),
+        _ => Err(PyValueError::new_err(format!(
+            "exchange direction must be 1 (left), 2 (across), or 3 (right), got {direction}"
+        ))),
+    }
+}
+
+fn phase_code(phase: Phase) -> u8 {
+    match phase {
+        Phase::Exchange => 0,
+        Phase::ChooseMissing => 1,
+        Phase::Turn => 2,
+        Phase::HuResponse => 3,
+        Phase::MeldResponse => 4,
+        Phase::Finished => 5,
+    }
+}
+
+fn meld_kind_code(kind: MeldKind) -> u8 {
+    match kind {
+        MeldKind::Pong => 0,
+        MeldKind::ExposedKong => 1,
+        MeldKind::AddedKong => 2,
+        MeldKind::ConcealedKong => 3,
+    }
+}
+
+fn game_error(error: GameError) -> PyErr {
+    match error {
+        GameError::Finished => PyRuntimeError::new_err(error.to_string()),
+        GameError::InvalidAction
+        | GameError::InvalidExchange
+        | GameError::BatchLength
+        | GameError::BatchIndex => PyValueError::new_err(error.to_string()),
+    }
+}
+
+fn require_shape<'py>(
+    array: &impl PyUntypedArrayMethods<'py>,
+    expected: &[usize],
+    name: &str,
+) -> PyResult<()> {
+    let shape = array.shape();
+    if shape != expected {
+        return Err(PyValueError::new_err(format!(
+            "{name} must have shape {expected:?}, got {shape:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn require_c_contiguous<'py>(array: &impl PyUntypedArrayMethods<'py>, name: &str) -> PyResult<()> {
+    if !array.is_c_contiguous() {
+        return Err(PyValueError::new_err(format!(
+            "{name} must be C-contiguous"
+        )));
+    }
+    Ok(())
+}
+
+fn copy_tiles_into<'py>(
+    source: &[u8; TILE_KIND_COUNT],
+    output: &Bound<'py, PyArray1<u8>>,
+    name: &str,
+) -> PyResult<()> {
+    require_shape(output, &[TILE_KIND_COUNT], name)?;
+    require_c_contiguous(output, name)?;
+    let mut output = try_readwrite(output, name)?;
+    writable_slice(&mut output, name)?.copy_from_slice(source);
+    Ok(())
+}
+
+fn writable_slice<'array, T, D>(
+    array: &'array mut PyReadwriteArray<'_, T, D>,
+    name: &str,
+) -> PyResult<&'array mut [T]>
+where
+    T: numpy::Element,
+    D: numpy::ndarray::Dimension,
+{
+    if array.len() == 0 {
+        return Ok(&mut []);
+    }
+    require_slice_layout(&***array, name)?;
+    array
+        .as_slice_mut()
+        .map_err(|_| PyValueError::new_err(format!("{name} must be aligned and C-contiguous")))
+}
+
+fn readonly_slice<'array, T, D>(
+    array: &'array PyReadonlyArray<'_, T, D>,
+    name: &str,
+) -> PyResult<&'array [T]>
+where
+    T: numpy::Element,
+    D: numpy::ndarray::Dimension,
+{
+    if array.len() == 0 {
+        return Ok(&[]);
+    }
+    require_slice_layout(&**array, name)?;
+    array
+        .as_slice()
+        .map_err(|_| PyValueError::new_err(format!("{name} must be aligned and C-contiguous")))
+}
+
+fn require_slice_layout<'py, T, D>(array: &Bound<'py, PyArray<T, D>>, name: &str) -> PyResult<()>
+where
+    T: numpy::Element,
+    D: numpy::ndarray::Dimension,
+{
+    let element_size = core::mem::size_of::<T>();
+    let address = array.data() as usize;
+    if address == 0 || address % core::mem::align_of::<T>() != 0 {
+        return Err(PyValueError::new_err(format!(
+            "{name} must have an aligned data pointer"
+        )));
+    }
+    if element_size != 0 && array.len() > isize::MAX as usize / element_size {
+        return Err(PyValueError::new_err(format!(
+            "{name} is too large to expose as a Rust slice"
+        )));
+    }
+    Ok(())
+}
+
+fn try_readonly<'py, T, D>(
+    array: &Bound<'py, PyArray<T, D>>,
+    name: &str,
+) -> PyResult<PyReadonlyArray<'py, T, D>>
+where
+    T: numpy::Element,
+    D: numpy::ndarray::Dimension,
+{
+    array.try_readonly().map_err(|_| {
+        PyValueError::new_err(format!(
+            "{name} overlaps a writable array used by this call"
+        ))
+    })
+}
+
+fn try_readwrite<'py, T, D>(
+    array: &Bound<'py, PyArray<T, D>>,
+    name: &str,
+) -> PyResult<PyReadwriteArray<'py, T, D>>
+where
+    T: numpy::Element,
+    D: numpy::ndarray::Dimension,
+{
+    array.try_readwrite().map_err(|_| {
+        PyValueError::new_err(format!(
+            "{name} overlaps another array used by this call or is not writable"
+        ))
+    })
+}
+
+fn validate_observation_arrays<'py>(
+    batch_size: usize,
+    tile_obs: &Bound<'py, PyArray3<u8>>,
+    melds: &Bound<'py, PyArray4<u8>>,
+    river: &Bound<'py, PyArray3<u8>>,
+    meta: &Bound<'py, PyArray2<i32>>,
+) -> PyResult<()> {
+    require_shape(
+        tile_obs,
+        &[batch_size, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT],
+        "tile_obs",
+    )?;
+    require_c_contiguous(tile_obs, "tile_obs")?;
+    require_shape(
+        melds,
+        &[batch_size, PLAYER_COUNT, MELD_SLOTS, MELD_FIELDS],
+        "melds",
+    )?;
+    require_c_contiguous(melds, "melds")?;
+    require_shape(
+        river,
+        &[batch_size, RIVER_TILE_CAPACITY, RIVER_FIELDS],
+        "river",
+    )?;
+    require_c_contiguous(river, "river")?;
+    require_shape(meta, &[batch_size, META_OBSERVATION_WIDTH], "meta")?;
+    require_c_contiguous(meta, "meta")?;
+    Ok(())
+}
+
+fn encode_outcome(outcome: StepOutcome, record: &mut [i64]) {
+    debug_assert_eq!(record.len(), STEP_RECORD_WIDTH);
+    record.fill(0);
+    record[0] = outcome
+        .draw
+        .map_or(-1, |draw| i64::from(draw.player.as_u8()));
+    record[1] = outcome.draw.map_or(-1, |draw| i64::from(draw.tile.as_u8()));
+    record[2] = outcome.draw.map_or(0, |draw| i64::from(draw.replacement));
+    record[3] = outcome
+        .discard
+        .map_or(-1, |discard| i64::from(discard.player.as_u8()));
+    record[4] = outcome
+        .discard
+        .map_or(-1, |discard| i64::from(discard.tile.as_u8()));
+    record[5..9].copy_from_slice(&outcome.score_delta);
+    record[9] = outcome
+        .next
+        .map_or(-1, |decision| i64::from(decision.actor.as_u8()));
+    record[10] = outcome
+        .next
+        .map_or(-1, |decision| i64::from(phase_code(decision.phase)));
+    record[11] = i64::from(outcome.terminal);
+}
+
+fn outcome_tuple(outcome: StepOutcome) -> StepRecordTuple {
+    let mut record = [0; STEP_RECORD_WIDTH];
+    encode_outcome(outcome, &mut record);
+    (
+        record[0], record[1], record[2], record[3], record[4], record[5], record[6], record[7],
+        record[8], record[9], record[10], record[11],
+    )
+}
+
+#[pymodule]
+fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    module.add_class::<PyGame>()?;
+    module.add_class::<PyBatch>()?;
+    module.add("ACTION_SPACE_SIZE", ACTION_SPACE_SIZE)?;
+    module.add("ACTION_EXCHANGE_TILE_OFFSET", ACTION_EXCHANGE_TILE_OFFSET)?;
+    module.add("ACTION_CHOOSE_MISSING_OFFSET", ACTION_CHOOSE_MISSING_OFFSET)?;
+    module.add("ACTION_DISCARD_OFFSET", ACTION_DISCARD_OFFSET)?;
+    module.add("ACTION_HU", ACTION_HU)?;
+    module.add("ACTION_PONG", ACTION_PONG)?;
+    module.add("ACTION_EXPOSED_KONG", ACTION_EXPOSED_KONG)?;
+    module.add("ACTION_CONCEALED_KONG_OFFSET", ACTION_CONCEALED_KONG_OFFSET)?;
+    module.add("ACTION_ADDED_KONG_OFFSET", ACTION_ADDED_KONG_OFFSET)?;
+    module.add("ACTION_PASS", ACTION_PASS)?;
+    module.add("LEGAL_ACTION_MASK_WORDS", LEGAL_ACTION_MASK_WORDS)?;
+    module.add("STEP_RECORD_WIDTH", STEP_RECORD_WIDTH)?;
+    module.add("TILE_OBSERVATION_WIDTH", TILE_OBSERVATION_WIDTH)?;
+    module.add("TILE_OBSERVATION_PLANES", TILE_OBSERVATION_PLANES)?;
+    module.add("MELD_OBSERVATION_WIDTH", MELD_OBSERVATION_WIDTH)?;
+    module.add("MELD_SLOTS", MELD_SLOTS)?;
+    module.add("MELD_FIELDS", MELD_FIELDS)?;
+    module.add("RIVER_OBSERVATION_WIDTH", RIVER_OBSERVATION_WIDTH)?;
+    module.add("RIVER_TILE_CAPACITY", RIVER_TILE_CAPACITY)?;
+    module.add("RIVER_FIELDS", RIVER_FIELDS)?;
+    module.add("META_OBSERVATION_WIDTH", META_OBSERVATION_WIDTH)?;
+    module.add("PLAYER_COUNT", PLAYER_COUNT)?;
+    module.add("TILE_KIND_COUNT", TILE_KIND_COUNT)?;
+    module.add("PHASE_EXCHANGE", phase_code(Phase::Exchange))?;
+    module.add("PHASE_CHOOSE_MISSING", phase_code(Phase::ChooseMissing))?;
+    module.add("PHASE_TURN", phase_code(Phase::Turn))?;
+    module.add("PHASE_HU_RESPONSE", phase_code(Phase::HuResponse))?;
+    module.add("PHASE_MELD_RESPONSE", phase_code(Phase::MeldResponse))?;
+    module.add("PHASE_FINISHED", phase_code(Phase::Finished))?;
+    Ok(())
+}

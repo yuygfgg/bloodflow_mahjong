@@ -1,0 +1,8 @@
+/target/
+/engine/target/
+*.so
+*.pyd
+*.pyc
+__pycache__/
+.pytest_cache/
+.vscode/
