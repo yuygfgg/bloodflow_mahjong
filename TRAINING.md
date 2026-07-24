@@ -1,50 +1,53 @@
 # 血流麻将 AI 训练设计
 
-本文定义无真人牌谱条件下的首版训练方案、两个候选模型和冷启动规则策略。目标是在单张 RTX 5080 16GB、单次约 24 小时的预算内，建立可重复评测和持续迭代的训练闭环。
+本文定义无真人牌谱条件下的首版训练方案和冷启动规则策略。首个理想实验只用规则 AI 直接启动 Transformer；ResNet 不进入这条训练链路，等 Transformer 训练闭环稳定后再作为吞吐和样本效率对照。目标是在单张 RTX 5080 16GB、单次约 24 小时的预算内，建立可重复评测和持续迭代的训练闭环。
 
 ## 原则与边界
 
 - 只使用当前行动者可见的策略观测。其他玩家暗手和牌墙只允许进入训练期 Critic 或辅助标签，不能进入 Actor。
-- 训练目标以实际分差为主。向听、有效牌等规则指标只用于早期势函数和辅助任务，并在训练前 20% 内退火。
-- 每局只训练一个座位，另外三个座位使用冻结对手。四个座位在不同牌局中均匀轮换。
-- 候选模型通过固定种子、四座轮换的 1v3 对局晋级，不以训练 loss 或单次自博弈胜率选择模型。
-- Transformer 和 ResNet 使用相同的输入语义、动作头、Critic、rollout 和评测器，确保消融结果可比较。
+- Actor 从第一步就只优化实际分差；向听、有效牌等规则指标只作为很小、很短的结构辅助，不作为胡牌奖励。
+- 每局只训练一个座位，另外三个绝对座位分别从四种对手策略族中采样。learner 座位在牌局间轮换，保证四个座位都被训练。
+- 训练过程用固定种子、四座轮换的 1v3 对局评测候选，不以训练 loss 或单次自博弈胜率判断强度。
+- 首版只实现 Transformer 的 rollout、PPO 和评测器。ResNet 的输入和动作接口保留为未来对照，不为了它提前加入一套手工牌形特征。
 
 ## 共享输入编码
 
-引擎观测是行动者视角，包含 `tile_obs[10,27]`、`melds[4,4,3]`、`river[108,2]` 和 `meta[34]`。模型侧按以下语义编码：
+引擎观测是行动者视角，静态状态包含 `tile_obs[10,27]`、`melds[4,4,3]` 和 `meta[34]`；时间轴使用最近最多 192 条 `events[192,8]`。`river[108,2]` 保留给规则检查和消融，不再同时送入首版模型，避免和事件历史重复编码。模型侧按以下语义编码：
 
 - 27 个牌种特征：自己的暗手和换牌选择、四家锁牌、四家弃牌计数、公开副露汇总、当前摸牌和响应牌标记。
-- 108 个牌河事件：牌种、相对持有者、绝对位置和距当前的相对位置。
+- 最多 192 个历史事件：事件类型、相对行动者/目标、牌种、flags、数值字段和时间位置。
 - 16 个副露槽：牌种、类型、相对玩家和来源玩家。
 - 4 个玩家特征：相对庄家、当前分数、缺门、是否已经胡牌、暗手张数和历史最大胡牌倍率。
 - 全局特征：阶段、换牌方向、墙剩余、换牌进度、补牌和响应 flags。
 
 计数 `0..4`、花色、阶段、座位和副露类型使用 categorical embedding；分数除以 `10_000`，墙剩余除以 `55`，最大倍率使用 `log2(1+x)` 后归一化。`meta[1]` 的绝对行动座位不输入模型。
 
-训练时随机应用全部 6 种花色置换，并同步置换牌特征、牌河、副露、缺门以及四段 27 维牌动作。座位不做镜像增强，因为行牌方向和响应次序不是任意置换对称。
+花色置换是合理的后续增强，但不能只在 PPO minibatch 中改观测：那会让 rollout 保存的 old log-prob 与增强后的状态不匹配。首版实现暂不做增强；若加入，必须在 rollout 推理前为每局固定采样一种置换，并把观测、事件、合法动作、执行动作和辅助标签一起映射。座位不做镜像增强，因为行牌方向和响应次序不是任意置换对称。
 
-## 模型 A：结构化 Transformer
+## 首版模型：静态编码器 + GPT 历史编码器
 
-首版使用双向 Transformer Encoder，不使用 recurrent hidden state：
+首版模型明确拆成两条路径：一个小型双向 Transformer 编码“当下”，一个 GPT 式因果 Transformer 编码 viewer-scoped 事件时间轴。两边各自产生一个 192 维 embedding，拼成 384 维后由全连接 Actor 和分布式 Critic 输出。这里不加入 ResNet 或额外手工牌形通道。
 
 | 参数 | 配置 |
 |---|---|
 | `d_model` | 192 |
-| blocks | 6 |
+| static blocks | 2，双向 full attention |
+| history blocks | 4，causal attention |
 | attention heads | 6 |
 | FFN | 768，SwiGLU |
 | normalization | Pre-RMSNorm |
 | dropout | 0 |
 | 计算精度 | BF16，FP32 optimizer state |
 
-Token 顺序为 `[GLOBAL] + 27 TILE + 108 RIVER + 4 PLAYER + 16 MELD`，最大长度 156。使用 padding mask，不使用 causal mask；所有输入事件在当前决策前已经可见。
+静态序列是 `[GLOBAL] + 27 TILE + 4 PLAYER + 16 MELD`，共 48 个 token。双向 attention 可以完整比较三门牌、公开副露、锁牌、当前分数和缺门状态；`GLOBAL` 输出作为 static embedding。
 
-27 个 `TILE` 输出分别经过共享的四分类线性层，形成换牌、弃牌、暗杠和加杠四组牌 logits。`GLOBAL` 输出定缺 3 项以及胡、碰、直杠、过 4 项。按固定动作布局拼成 115 维 logits 后应用 Legal Action Mask。
+历史序列最多 192 个 event token，按时间顺序使用 causal mask，最后一个有效 token 的输出作为 history embedding。每层实现了 K/V cache，并有 cached/full 一致性测试。rollout 为 learner 和冻结 Transformer 各维护一套 `(环境,绝对座位)` cache，按精确的 `(past_length, delta_length)` 分组后追加事件；viewer 变化、reset、事件窗口截断或历史前缀不一致时自动 full rebuild。这样保留 cache 的主要收益，同时不强行 padding 不同长度的因果前缀。
 
-预计参数量约 300 万到 400 万。本机简化的 136 token BF16 eager 基准约为 4.3 万到 4.9 万 state/s。若注意力成为主要瓶颈，备选优化是保留 `[GLOBAL] + 27 TILE` 为 query，把牌河、玩家和副露作为 memory，改用 query self-attention 加 cross-attention。
+拼接后的 384 维表示经过两层 MLP 输出 115 维 Actor logits，再应用 Legal Action Mask。Critic 输出固定 `[-4,4]` support 上的 categorical value distribution，并由其期望得到标量 value；Actor advantage 始终对应未经裁剪的真实分差。
 
-## 模型 B：牌种 ResNet + 牌河塔
+预计参数量约 300 万到 400 万。这个拆分只包含一个明确的结构先验：当下状态允许双向比较，历史只能看过去。先验证规则 AI 直接冷启动能否学到分数策略，再决定是否需要更复杂的融合。
+
+## 后置对照：牌种 ResNet + 牌河塔
 
 牌种分支把 27 种牌 reshape 为 `[3,9]`，卷积只沿同花色的 rank 轴进行：
 
@@ -59,28 +62,27 @@ Token 顺序为 `[GLOBAL] + 27 TILE + 108 RIVER + 4 PLAYER + 16 MELD`，最大�
 | fusion | 512 维全局上下文回注到 27 个牌位置 |
 | 计算精度 | BF16，FP32 optimizer state |
 
-牌种分支不做 pooling。三个花色共享卷积权重，牌种特征与全局上下文融合后使用和模型 A 相同的结构化策略头。牌河塔对 108 个有序弃牌做 embedding 和时间卷积，attention pooling 后进入全局上下文。
+牌种分支不做 pooling。三个花色共享卷积权重，牌种特征与全局上下文融合后使用结构化策略头。该模型只在 Transformer 基线跑通后作为吞吐对照，不参与首版冷启动，不把额外的人类牌形先验混入首个实验。
 
-预计参数量约 600 万到 800 万。本机 718 万参数的代表性牌种 ResNet BF16 eager 基准约为 17 万 state/s。该模型提供更强的牌型归纳偏置和更高吞吐，作为 Transformer 的必要基线长期保留。
+预计参数量约 600 万到 800 万。它可能更快学会向听和普通胡，但不能据此推断后期总分上限；比较时按相同环境步数和 wall-clock 同时报告，不以最初两小时的胡牌率选型。
 
 ## Actor、Critic 与辅助任务
 
-Actor 严格使用 viewer-scoped 观测。Critic 共享公开特征 trunk，并允许拼接训练专用 oracle embedding：
+Actor 和首版 Critic 都只使用当前行动者可见的静态状态 embedding 与 viewer-scoped 历史 embedding。Critic 输出 `[-4,4]` support 上的 categorical 分布，并以期望值作为 PPO value；不对 Actor 暴露其他玩家暗手或牌墙。训练期 oracle Critic（四家暗手和剩余牌墙）作为后续消融，不是首版实现依赖。
 
-- 四家暗手的 `[4,27]` 计数；
-- 剩余牌墙的 27 维牌种直方图，不需要牌墙顺序。
+首版实际训练两个低权重辅助头：
 
-oracle 特征只进入 value head，Actor 导出图中不包含该输入。首版 value head 预测当前行动者从当前状态到终局的归一化分数变化。
+- 首次胡牌前的常规结构向听数，权重 `0.01..0.03`，前 10% 到 15% transitions 退火到零；
+- 首次胡牌前的 27 维有效牌标签，接在静态结构分支，不反向主导历史上下文；
 
-建议联合训练以下辅助头，单项 loss 权重从 `0.05..0.2` 搜索：
+以下只保留为后续候选，不在当前 pipeline 中假装已经实现：
 
-- 首次胡牌前的常规结构向听数；
-- 首次胡牌前的 27 维有效牌标签；
-- 最大可胡倍率；
+- 当前可胡牌型的 `log2(multiplier)` 分类和未来胡牌概率；
+- 分数回报分布或 quantile value，而不是只预测“有没有胡”；
 - 三家暗手计数的 belief prediction；
-- 未来若干个同座位决策内的胡牌、点炮和分差。
+- 未来若干个同座位决策内的胡牌、点炮、杠收益、终局结算和分差。
 
-辅助标签不参与推理。向听辅助头只在目标有效时计算 loss，不把终局哨兵或胡后常规 `-1` 当作标签。
+辅助标签不参与推理。向听辅助头只在目标有效时计算 loss，不把终局哨兵或胡后常规 `-1` 当作标签。Actor 不增加胡牌次数或倍率 bonus；真实 score delta 已经表达低价值多胡和高价值少胡的权衡。
 
 ## 向听 API 与训练用法
 
@@ -113,27 +115,30 @@ oracle 特征只进入 value head，Actor 导出图中不包含该输入。首�
 r_score = score_delta / 10_000
 ```
 
-终局可额外加入零和排名奖励 `[0.15, 0.05, -0.05, -0.15]`，平分时取并列名次奖励的平均值。已经逐步累计分差后不能再次加入最终总分。
+首版不额外加入排名奖励；如果部署目标最终按名次结算，再单独做小权重的后期 rank fine-tune。已经逐步累计分差后不能再次加入最终总分。
 
-冷启动阶段允许加入势函数：
+冷启动阶段曾考虑以下势函数：
 
 ```text
 r = r_score + beta * (potential(next_state) - potential(state))
 ```
 
-首次胡牌前，`potential` 由常规向听数、公开估计有效牌剩余数、缺门张数和最大潜在倍率组成并裁剪到 `[-1,1]`；胡牌后去掉向听和有效牌项。`beta` 从 `0.03..0.05` 开始，在前 20% learner transitions 内线性退火到零。
+首版实现默认令 `beta=0`，即从第一个 transition 起只使用真实分差。只有冷启动实测出现长时间零收益时才开启该消融；首次胡牌前的 `potential` 只能由常规向听数、公开估计有效牌剩余数和缺门张数组成，胡牌后必须关闭。不要用 reward clipping 或 log transform 抹平 1 倍和高倍率实际分差；Critic 使用分布式 value 处理长尾。
 
 ## 冷启动规则对手
 
-规则对手不是专家标签，而是用来打破四个随机共享策略的对称性，并提供永久评测锚点：
+对手池有四种真正接入 rollout 的策略族，不是四个同时上桌的额外玩家：
 
-- `R0`：均匀随机合法动作，但有胡必胡。
-- `R1`：换弱门、定缺最弱门、保留对子和搭子的结构策略；有胡必胡，杠优先，基础版本允许积极碰牌。
-- `R2`：弃牌先最小化精确常规向听，再最大化公开估计的有效牌剩余张数，以局部牌形和公开暴露度破同分；下一步再加入保守碰杠和局面风险。
+| 名称 | 行为 | 用途 |
+|---|---|---|
+| `random_hu` | 有胡必胡，否则均匀随机合法动作 | 保持探索和最低强度锚点 |
+| `rule_fast` | 引擎确定性 R2：弱门换牌/定缺，弃牌最小化精确向听并最大化公开估计有效张；积极碰杠 | 快速成牌冷启动 |
+| `rule_safe` | 以 `rule_fast` 为结构默认，拒绝可过的碰/直杠；有明显更安全的公开熟张时才覆盖原弃牌 | 制造不同攻守轨迹 |
+| `frozen_transformer` | 当前 learner 的冻结快照或保留的历史快照，只读取行动者观测 | 逐步转入自博弈 |
 
-当前实现是确定性的早期 `R2`：它只能读取当前行动者暗手、自己的换牌选择、合法动作及公开锁牌、副露和弃牌。它已经使用精确常规向听与有效牌 mask，但仍然有胡必胡、见杠就杠、可碰就碰，不评估番型收益、点炮风险或胡后下一胡距离，因此只是冷启动对手，不应描述为强 AI。Python 可用 `Game.simple_rule_action()` 和 `Batch.simple_rule_actions_into(uint8[B])` 调用；批量终局槽写 `SIMPLE_RULE_ACTION_TERMINAL=255`。
+`rule_fast` 只能读取当前行动者暗手、自己的换牌选择、合法动作及公开锁牌、副露和弃牌。它不评估番型收益，也不读取对手暗手或牌墙，因此是冷启动基线，不是专家教师。Python 可用 `Game.simple_rule_action()` 和 `Batch.simple_rule_actions_into(uint8[B])` 调用；批量终局槽写 `SIMPLE_RULE_ACTION_TERMINAL=255`。
 
-默认不做长时间规则模仿：直接让 learner 对阵 `R0/R1/R2` 可以产生在线冷启动数据，也不会把规则策略变成模型上限。若随机初始化在 30 分钟内仍出现极高非法数值、几乎不胡或 entropy 崩溃，再用规则动作做最多 1 epoch、100 万到 200 万在线状态的短预热；进入 PPO 前完全移除 imitation loss。
+首版不做规则动作模仿：随机初始化的 Transformer 直接对阵上述在线对手，规则策略不产生监督 loss。只有实测出现数值不稳定、几乎不胡或 entropy 崩溃时，才单独实验最多 1 epoch 的在线动作预热；进入 PPO 前移除 imitation loss。ResNet 不参与首版链路。
 
 ## PPO 与对手联赛
 
@@ -154,23 +159,46 @@ r = r_score + beta * (potential(next_state) - potential(state))
 | target KL | 0.015 |
 | entropy | `H/log(max(legal_count,2))`，系数 `0.01` 退火到 `0.002` |
 
-每局随机指定一个 learner 座位，其他三家使用同一个冻结对手版本，减少推理分组和同局非平稳性。
+每局是 `1 learner + 3 opponent`。另外三个绝对座位独立采样策略类型，因此同桌可以同时出现 `rule_fast`、`rule_safe` 和冻结 Transformer；不会强行让三个 opponent 使用同一种策略。为保持 GPU 批量推理效率，每个 rollout 只激活一个 Transformer 快照，所有抽中 `frozen_transformer` 的座位共享该版本。PPO policy loss 不按高倍率结果重采样。
 
-冷启动分三段：
+默认 `--total-transitions 100000000` 时按 learner transitions 分三段，切换发生在下一次 rollout 开始前：
 
-1. `0..15M` learner transitions：`20% R0 + 60% R1/R2 + 20% 早期快照`，使用势函数和较高 entropy。
-2. `15M..50M`：`30% R0/R1 + 70% 冻结 champion/历史快照`，势函数退火到零。
-3. `50M+`：`50% 当前 champion + 35% 最近 8 个 champion + 15% R1`，只优化真实分差和终局排名。
+| 阶段 | 默认范围 | `random_hu` | `rule_fast` | `rule_safe` | `frozen_transformer` |
+|---|---:|---:|---:|---:|---:|
+| bootstrap | `0..<10M`，即 `0..<10%` | 30% | 50% | 20% | 0% |
+| mixed | `10M..<35M`，即 `10%..<35%` | 10% | 35% | 20% | 35% |
+| league | `35M..<75M`，即 `35%..<75%` | 5% | 15% | 15% | 65% |
+| self-play | `75M+`，即 `75%+` | 0% | 0% | 0% | 100% |
 
-候选模型每 30 到 60 分钟评测一次。只有在配对重复种子的平均效用 95% bootstrap 置信区间下界大于零时才晋级 champion；证据不足时继续训练，不因点估计领先而晋级。
+上表是“每个非 learner 座位”的抽样概率，不是四家座位的占比。league 阶段一桌的 frozen seat 数量服从 `Binomial(3, 0.65)`：平均 `1.95` 个；恰好 0/1/2/3 个 frozen 的概率约为 `4.3%/23.9%/44.4%/27.5%`。最后的 self-play 阶段才是严格的 `1 learner + 3 frozen Transformer`，规则 AI 只用于独立评测和回归，不再进入训练 rollout。日志中的 `opponent_assignments` 统计的是三个 opponent seat 的策略抽样次数。
+
+达到 10M transitions 时创建第一个冻结快照；之后默认每 10 次 PPO 更新刷新一次。最多保留最近 4 个版本。mixed、league 和 self-play 阶段每次刷新时有 25% 概率激活历史快照，否则用最新快照。这里的“历史快照”是训练轨迹样本，不冒充经过显著性检验的 champion。
+
+当前 pipeline 默认每 10 次更新对固定 `rule_fast` 锚点做四座轮换评测，并记录平均分差、分差标准差、首位率和平均名次；`2h/6h/12h/24h` 自动保存完整 checkpoint。训练结束后再对这些候选做更大规模的配对重复种子评测，只有平均效用 95% bootstrap 置信区间下界大于零时才标为 champion。当前训练循环不会根据小样本点估计自动晋级并改变训练分布。
+
+### 阈值与 cache 的预算依据
+
+- 默认 100M learner transitions、65,536 transitions/update，共约 1,526 次 update。BF16 基准的单个 256-state PPO step 为 0.074 秒，按两次 PPO epoch 折算，纯反向约 38 秒/update、约 16 小时；加上引擎 rollout、快照和评测，实际约 20 到 24 小时。因此 10% 规则冷启动约占 2 小时，35% 约在 7 到 9 小时进入 league，75% 后保留约四分之一预算做纯 Transformer self-play；50% 会把切换再推迟约 3 到 4 小时，没有足够收益。
+- 一条 192-token、4 层、6 头、`d_model=192` 的 BF16 K/V cache 是 `4 * 2 * 6 * 192 * 32 * 2 = 589,824` bytes，约 0.56 MiB/viewer。2048 桌中 learner 约 1.1 GiB，三个冻结对手的上界约 3.4 GiB，加上分组拼接的临时峰值约 5 到 6 GiB；和训练 step 的约 2.9 GiB 峰值合计仍适合 16 GiB 卡。
+- 本机 full history 基准约 22.4k state/s，cached history 约 105.7k state/s。实际 rollout 还包含静态编码、Python 分组和 Rust step，不能直接承诺 4.7 倍端到端提升；按 viewer/past-length 分组仍能显著减少历史塔重复计算。达到 192 条并发生环形窗口截断时自动 full rebuild，不能为了 cache 使用错误的旧前缀。
 
 ## 24 小时单次预算
 
-- 前 1 小时：规则对手和辅助任务的在线 warm-up，检查动作分布和奖励归因。
+先运行 CPU smoke，再直接启动默认训练：
+
+```bash
+python -m training.train --smoke --device cpu --output-dir /tmp/bloodflow-smoke
+python -m training.train --device cuda --hours 24 \
+  --total-transitions 100000000 --output-dir runs/transformer
+```
+
+- 前 1 小时：规则对手和 Transformer rollout smoke test，检查动作分布、KV cache 一致性和奖励归因。
 - 中间约 20 小时：PPO 联赛训练，按 learner transitions 而不是 epoch 计进度。
 - 最后约 3 小时：固定快照、四座轮换评测、故障余量和最终候选选择。
 
-Transformer 与 ResNet 首次比较各运行约 2 小时的相同种子短实验，使用每小时固定评测效用提升作为指标。最终 24 小时运行只选择短实验中 wall-clock 效率更好的配置；另一个模型继续作为消融基线。
+首版 24 小时只运行 Transformer。先用短 smoke test 检查实现，不用前两小时胡牌率淘汰模型；保存 `2h/6h/12h/24h` 快照并比较平均分、每次胡牌收入、高倍率尾部、点炮损失和终局结算。后续若实现 ResNet，再按相同环境步数与 wall-clock 做独立对照。
+
+事件缓存必须绑定固定 viewer。若只训练一个 learner 座位，可以在该座位再次决策时追加其事件；若四个座位共享一个模型，则每个座位维护独立 cache，不能把相对座位已经旋转过的历史混用。
 
 ## 评测与“超过 90% 人类”
 
