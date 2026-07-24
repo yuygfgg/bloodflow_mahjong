@@ -2,9 +2,12 @@ use ::bloodflow_mahjong as core_engine;
 use core_engine::{
     ACTION_ADDED_KONG_OFFSET, ACTION_CHOOSE_MISSING_OFFSET, ACTION_CONCEALED_KONG_OFFSET,
     ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
-    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, ExchangeDirection, Game,
-    GameError, LEGAL_ACTION_MASK_WORDS, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, MeldKind,
-    Phase, RIVER_OBSERVATION_WIDTH, STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_OBSERVATION_WIDTH,
+    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, EVENT_FLAG_AFTER_KONG,
+    EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE, EVENT_FLAG_OPENING_DISCARD,
+    EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG, EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY,
+    EVENT_RECORD_WIDTH, EventKind, ExchangeDirection, Game, GameError, LEGAL_ACTION_MASK_WORDS,
+    MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, MeldKind, Phase, RIVER_OBSERVATION_WIDTH,
+    STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_OBSERVATION_WIDTH,
 };
 use numpy::{
     PyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray,
@@ -12,6 +15,7 @@ use numpy::{
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 const PLAYER_COUNT: usize = 4;
 const TILE_KIND_COUNT: usize = 27;
@@ -84,6 +88,46 @@ impl PyGame {
         let outcome = self.inner.step_id(action).map_err(game_error)?;
         encode_outcome(outcome, output);
         Ok(())
+    }
+
+    #[getter]
+    fn event_count(&self) -> usize {
+        self.inner.event_count()
+    }
+
+    #[getter]
+    fn event_dropped(&self) -> u64 {
+        self.inner.event_dropped()
+    }
+
+    fn events_into<'py>(
+        &self,
+        py: Python<'py>,
+        viewer: u8,
+        output: &Bound<'py, PyArray2<i32>>,
+    ) -> PyResult<usize> {
+        let viewer = seat_value(viewer)?;
+        validate_event_array(output, "output")?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.events_into(viewer, output))
+            .map_err(game_error)
+    }
+
+    fn step_events_into<'py>(
+        &self,
+        py: Python<'py>,
+        viewer: u8,
+        output: &Bound<'py, PyArray2<i32>>,
+    ) -> PyResult<usize> {
+        let viewer = seat_value(viewer)?;
+        validate_event_array(output, "output")?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.step_events_into(viewer, output))
+            .map_err(game_error)
     }
 
     #[getter]
@@ -199,6 +243,19 @@ impl PyBatch {
         self.inner.is_empty()
     }
 
+    fn event_dropped_into<'py>(
+        &self,
+        py: Python<'py>,
+        output: &Bound<'py, PyArray1<u64>>,
+    ) -> PyResult<()> {
+        require_shape(output, &[self.inner.len()], "output")?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.event_dropped_into(output))
+            .map_err(game_error)
+    }
+
     fn reset_all(&mut self, py: Python<'_>, seed: u64) {
         py.detach(|| self.inner.reset_all(seed));
     }
@@ -255,6 +312,42 @@ impl PyBatch {
         let mut output = try_readwrite(output, "output")?;
         let output = writable_slice(&mut output, "output")?;
         py.detach(|| self.inner.legal_action_mask_words_into(output))
+            .map_err(game_error)
+    }
+
+    fn events_into<'py>(
+        &self,
+        py: Python<'py>,
+        events: &Bound<'py, PyArray3<i32>>,
+        lengths: &Bound<'py, PyArray1<u16>>,
+    ) -> PyResult<()> {
+        let capacity = validate_batch_event_array(self.inner.len(), events, "events")?;
+        require_shape(lengths, &[self.inner.len()], "lengths")?;
+        require_c_contiguous(lengths, "lengths")?;
+
+        let mut events = try_readwrite(events, "events")?;
+        let mut lengths = try_readwrite(lengths, "lengths")?;
+        let events = writable_slice(&mut events, "events")?;
+        let lengths = writable_slice(&mut lengths, "lengths")?;
+        py.detach(|| self.inner.events_into(capacity, events, lengths))
+            .map_err(game_error)
+    }
+
+    fn step_events_into<'py>(
+        &self,
+        py: Python<'py>,
+        events: &Bound<'py, PyArray3<i32>>,
+        lengths: &Bound<'py, PyArray1<u16>>,
+    ) -> PyResult<()> {
+        let capacity = validate_batch_event_array(self.inner.len(), events, "events")?;
+        require_shape(lengths, &[self.inner.len()], "lengths")?;
+        require_c_contiguous(lengths, "lengths")?;
+
+        let mut events = try_readwrite(events, "events")?;
+        let mut lengths = try_readwrite(lengths, "lengths")?;
+        let events = writable_slice(&mut events, "events")?;
+        let lengths = writable_slice(&mut lengths, "lengths")?;
+        py.detach(|| self.inner.step_events_into(capacity, events, lengths))
             .map_err(game_error)
     }
 
@@ -346,6 +439,72 @@ impl PyBatch {
         })
         .map_err(game_error)
     }
+
+    #[allow(clippy::too_many_arguments)]
+    fn step_and_observe_events_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        actions: &Bound<'py, PyArray1<u8>>,
+        records: &Bound<'py, PyArray2<i64>>,
+        mask_words: &Bound<'py, PyArray2<u64>>,
+        tile_obs: &Bound<'py, PyArray3<u8>>,
+        melds: &Bound<'py, PyArray4<u8>>,
+        river: &Bound<'py, PyArray3<u8>>,
+        meta: &Bound<'py, PyArray2<i32>>,
+        events: &Bound<'py, PyArray3<i32>>,
+        event_lengths: &Bound<'py, PyArray1<u16>>,
+    ) -> PyResult<()> {
+        let batch_size = self.inner.len();
+        require_shape(actions, &[batch_size], "actions")?;
+        require_c_contiguous(actions, "actions")?;
+        require_shape(records, &[batch_size, STEP_RECORD_WIDTH], "records")?;
+        require_c_contiguous(records, "records")?;
+        require_shape(
+            mask_words,
+            &[batch_size, LEGAL_ACTION_MASK_WORDS],
+            "mask_words",
+        )?;
+        require_c_contiguous(mask_words, "mask_words")?;
+        validate_observation_arrays(batch_size, tile_obs, melds, river, meta)?;
+        let event_capacity = validate_batch_event_array(batch_size, events, "events")?;
+        require_shape(event_lengths, &[batch_size], "event_lengths")?;
+        require_c_contiguous(event_lengths, "event_lengths")?;
+
+        let actions = try_readonly(actions, "actions")?;
+        let mut records = try_readwrite(records, "records")?;
+        let mut mask_words = try_readwrite(mask_words, "mask_words")?;
+        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
+        let mut melds = try_readwrite(melds, "melds")?;
+        let mut river = try_readwrite(river, "river")?;
+        let mut meta = try_readwrite(meta, "meta")?;
+        let mut events = try_readwrite(events, "events")?;
+        let mut event_lengths = try_readwrite(event_lengths, "event_lengths")?;
+        let actions = readonly_slice(&actions, "actions")?;
+        let records = writable_slice(&mut records, "records")?;
+        let mask_words = writable_slice(&mut mask_words, "mask_words")?;
+        let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
+        let melds = writable_slice(&mut melds, "melds")?;
+        let river = writable_slice(&mut river, "river")?;
+        let meta = writable_slice(&mut meta, "meta")?;
+        let events = writable_slice(&mut events, "events")?;
+        let event_lengths = writable_slice(&mut event_lengths, "event_lengths")?;
+
+        py.detach(|| {
+            self.inner.step_indices_observe_events_into(
+                actions,
+                records,
+                mask_words,
+                tile_obs,
+                melds,
+                river,
+                meta,
+                event_capacity,
+                events,
+                event_lengths,
+            )
+        })
+        .map_err(game_error)
+    }
 }
 
 fn action_id(action: u8) -> PyResult<ActionId> {
@@ -398,7 +557,8 @@ fn game_error(error: GameError) -> PyErr {
         GameError::InvalidAction
         | GameError::InvalidExchange
         | GameError::BatchLength
-        | GameError::BatchIndex => PyValueError::new_err(error.to_string()),
+        | GameError::BatchIndex
+        | GameError::EventCapacity => PyValueError::new_err(error.to_string()),
     }
 }
 
@@ -551,6 +711,87 @@ fn validate_observation_arrays<'py>(
     Ok(())
 }
 
+fn validate_event_array<'py>(output: &Bound<'py, PyArray2<i32>>, name: &str) -> PyResult<()> {
+    let shape = output.shape();
+    if shape.len() != 2 || shape[1] != EVENT_RECORD_WIDTH {
+        return Err(PyValueError::new_err(format!(
+            "{name} must have shape [capacity, {EVENT_RECORD_WIDTH}], got {shape:?}"
+        )));
+    }
+    if shape[0] > EVENT_HISTORY_CAPACITY {
+        return Err(PyValueError::new_err(format!(
+            "{name} capacity must be at most {EVENT_HISTORY_CAPACITY}, got {}",
+            shape[0]
+        )));
+    }
+    Ok(())
+}
+
+fn validate_batch_event_array<'py>(
+    batch_size: usize,
+    output: &Bound<'py, PyArray3<i32>>,
+    name: &str,
+) -> PyResult<usize> {
+    let shape = output.shape();
+    if shape.len() != 3 || shape[0] != batch_size || shape[2] != EVENT_RECORD_WIDTH {
+        return Err(PyValueError::new_err(format!(
+            "{name} must have shape [{batch_size}, capacity, {EVENT_RECORD_WIDTH}], got {shape:?}"
+        )));
+    }
+    if shape[1] > EVENT_HISTORY_CAPACITY {
+        return Err(PyValueError::new_err(format!(
+            "{name} capacity must be at most {EVENT_HISTORY_CAPACITY}, got {}",
+            shape[1]
+        )));
+    }
+    Ok(shape[1])
+}
+
+fn add_event_enums(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    let py = module.py();
+    let enum_module = py.import("enum")?;
+    let int_enum = enum_module.getattr("IntEnum")?;
+    let int_flag = enum_module.getattr("IntFlag")?;
+
+    let kinds = PyDict::new(py);
+    for (name, value) in [
+        ("ACTION", EventKind::Action.code()),
+        ("GAME_START", EventKind::GameStart.code()),
+        ("TURN_START", EventKind::TurnStart.code()),
+        ("DRAW", EventKind::Draw.code()),
+        ("DISCARD", EventKind::Discard.code()),
+        ("EXCHANGE_COMPLETE", EventKind::ExchangeComplete.code()),
+        ("MISSING_REVEALED", EventKind::MissingRevealed.code()),
+        ("MELD", EventKind::Meld.code()),
+        ("HU", EventKind::Hu.code()),
+        ("PAYMENT", EventKind::Payment.code()),
+        ("GAME_END", EventKind::GameEnd.code()),
+    ] {
+        kinds.set_item(name, value)?;
+    }
+    let event_kind = int_enum.call1(("EventKind", kinds))?;
+    event_kind.setattr("__module__", "bloodflow_mahjong")?;
+    module.add("EventKind", event_kind)?;
+
+    let flags = PyDict::new(py);
+    for (name, value) in [
+        ("REPLACEMENT_DRAW", EVENT_FLAG_REPLACEMENT_DRAW),
+        ("LAST_WALL_TILE", EVENT_FLAG_LAST_WALL_TILE),
+        ("AFTER_KONG", EVENT_FLAG_AFTER_KONG),
+        ("OPENING_DISCARD", EVENT_FLAG_OPENING_DISCARD),
+        ("SELF_DRAW", EVENT_FLAG_SELF_DRAW),
+        ("ROB_KONG", EVENT_FLAG_ROB_KONG),
+        ("HEAVENLY", EVENT_FLAG_HEAVENLY),
+        ("EARTHLY", EVENT_FLAG_EARTHLY),
+    ] {
+        flags.set_item(name, value)?;
+    }
+    let event_flag = int_flag.call1(("EventFlag", flags))?;
+    event_flag.setattr("__module__", "bloodflow_mahjong")?;
+    module.add("EventFlag", event_flag)?;
+    Ok(())
+}
+
 fn encode_outcome(outcome: StepOutcome, record: &mut [i64]) {
     debug_assert_eq!(record.len(), STEP_RECORD_WIDTH);
     record.fill(0);
@@ -588,6 +829,7 @@ fn outcome_tuple(outcome: StepOutcome) -> StepRecordTuple {
 fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyGame>()?;
     module.add_class::<PyBatch>()?;
+    add_event_enums(module)?;
     module.add("ACTION_SPACE_SIZE", ACTION_SPACE_SIZE)?;
     module.add("ACTION_EXCHANGE_TILE_OFFSET", ACTION_EXCHANGE_TILE_OFFSET)?;
     module.add("ACTION_CHOOSE_MISSING_OFFSET", ACTION_CHOOSE_MISSING_OFFSET)?;
@@ -600,6 +842,8 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("ACTION_PASS", ACTION_PASS)?;
     module.add("LEGAL_ACTION_MASK_WORDS", LEGAL_ACTION_MASK_WORDS)?;
     module.add("STEP_RECORD_WIDTH", STEP_RECORD_WIDTH)?;
+    module.add("EVENT_RECORD_WIDTH", EVENT_RECORD_WIDTH)?;
+    module.add("EVENT_HISTORY_CAPACITY", EVENT_HISTORY_CAPACITY)?;
     module.add("TILE_OBSERVATION_WIDTH", TILE_OBSERVATION_WIDTH)?;
     module.add("TILE_OBSERVATION_PLANES", TILE_OBSERVATION_PLANES)?;
     module.add("MELD_OBSERVATION_WIDTH", MELD_OBSERVATION_WIDTH)?;

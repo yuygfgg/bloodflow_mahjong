@@ -31,6 +31,7 @@
 
 - Rust workspace 位于 `engine/`：`engine/core` 只包含规则和批量环境，`engine/pybind` 提供 PyO3 0.27 + NumPy 0.27 扩展，Python 模块名为 `bloodflow_mahjong`。
 - 训练热路径使用 `Batch.step_and_observe_into`。动作从调用方的 C-contiguous `uint8[B]` 直接借用；`records[B,12]`、`mask_words[B,2]`、`tile_obs[B,10,27]`、`melds[B,4,4,3]`、`river[B,108,2]`、`meta[B,34]` 直接写入调用方缓冲。没有 NumPy 中间复制或 Rust 临时 `Vec`，Rust 计算阶段释放 GIL。
+- 事件流由 Rust 为每局维护 512 条固定宽度环形记录，按 viewer 输出时旋转座位并过滤私有动作和暗摸牌面。`Batch.step_and_observe_events_into` 只写本步 delta，避免训练循环每步搬运完整历史；`event_dropped` 用于监控历史环覆盖。
 - `records` 列为 `[draw_player, draw_tile, replacement, discard_player, discard_tile, score_delta[4], next_actor, next_phase, terminal]`；缺失对象使用 `-1`。`mask_words` 是 115 维动作空间的两个 little-endian `u64`，高位未使用位始终为零。
 - 观测以当前行动者为相对座位 `0`；终局使用庄家作为相对座位 `0` 且 `meta[1] = -1`。`tile_obs` 的 10 个 plane 依次为行动者手牌、行动者已选换牌、四家锁牌、四家弃牌计数；`melds` 是 `[tile, kind, source_relative]`；`river` 是按时间顺序的 `[tile, owner_relative]`，空槽为 `255`。
 - `meta[0..34]` 依次为阶段、绝对行动者、相对庄家、换牌方向、墙剩余、摸牌信息、响应来源/牌、牌河长度、换牌进度、四家分数、缺门、胡牌标记、手牌数量、终局标记、响应 flags，以及四家历史最大胡牌倍率。完整索引表见 [`engine/pybind/README.md`](engine/pybind/README.md)。

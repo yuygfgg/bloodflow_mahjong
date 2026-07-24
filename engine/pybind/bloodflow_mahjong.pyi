@@ -1,3 +1,4 @@
+from enum import IntEnum, IntFlag
 from typing import Final
 import numpy as np
 import numpy.typing as npt
@@ -14,6 +15,32 @@ ACTION_ADDED_KONG_OFFSET: Final[int]
 ACTION_PASS: Final[int]
 LEGAL_ACTION_MASK_WORDS: Final[int]
 STEP_RECORD_WIDTH: Final[int]
+EVENT_RECORD_WIDTH: Final[int]
+EVENT_HISTORY_CAPACITY: Final[int]
+
+class EventKind(IntEnum):
+    ACTION: Final[int]
+    GAME_START: Final[int]
+    TURN_START: Final[int]
+    DRAW: Final[int]
+    DISCARD: Final[int]
+    EXCHANGE_COMPLETE: Final[int]
+    MISSING_REVEALED: Final[int]
+    MELD: Final[int]
+    HU: Final[int]
+    PAYMENT: Final[int]
+    GAME_END: Final[int]
+
+class EventFlag(IntFlag):
+    REPLACEMENT_DRAW: Final[int]
+    LAST_WALL_TILE: Final[int]
+    AFTER_KONG: Final[int]
+    OPENING_DISCARD: Final[int]
+    SELF_DRAW: Final[int]
+    ROB_KONG: Final[int]
+    HEAVENLY: Final[int]
+    EARTHLY: Final[int]
+
 TILE_OBSERVATION_WIDTH: Final[int]
 TILE_OBSERVATION_PLANES: Final[int]
 MELD_OBSERVATION_WIDTH: Final[int]
@@ -46,6 +73,20 @@ class Game:
     def step_id(self, action: int) -> tuple[int, ...]: ...
     def step_into(self, action: int, output: npt.NDArray[np.int64]) -> None: ...
     @property
+    def event_count(self) -> int: ...
+    @property
+    def event_dropped(self) -> int: ...
+    def events_into(
+        self,
+        viewer: int,
+        output: npt.NDArray[np.int32],
+    ) -> int: ...
+    def step_events_into(
+        self,
+        viewer: int,
+        output: npt.NDArray[np.int32],
+    ) -> int: ...
+    @property
     def dealer(self) -> int: ...
     @property
     def exchange_direction(self) -> int: ...
@@ -55,7 +96,9 @@ class Game:
     def current_draw(self) -> tuple[int, int, bool] | None: ...
     def concealed_into(self, seat: int, output: npt.NDArray[np.uint8]) -> None: ...
     def locked_into(self, seat: int, output: npt.NDArray[np.uint8]) -> None: ...
-    def exchange_selection_into(self, seat: int, output: npt.NDArray[np.uint8]) -> None: ...
+    def exchange_selection_into(
+        self, seat: int, output: npt.NDArray[np.uint8]
+    ) -> None: ...
     def scores(self) -> tuple[int, int, int, int]: ...
     def missing_suits(self) -> tuple[int, int, int, int]: ...
     def has_won(self, seat: int) -> bool: ...
@@ -69,6 +112,7 @@ class Batch:
     def __len__(self) -> int: ...
     @property
     def is_empty(self) -> bool: ...
+    def event_dropped_into(self, output: npt.NDArray[np.uint64]) -> None: ...
     def reset_all(self, seed: int) -> None: ...
     def reset_at(self, index: int, seed: int) -> None: ...
     def reset_many(
@@ -77,6 +121,16 @@ class Batch:
         seeds: npt.NDArray[np.uint64],
     ) -> None: ...
     def legal_action_masks_into(self, output: npt.NDArray[np.uint64]) -> None: ...
+    def events_into(
+        self,
+        events: npt.NDArray[np.int32],
+        lengths: npt.NDArray[np.uint16],
+    ) -> None: ...
+    def step_events_into(
+        self,
+        events: npt.NDArray[np.int32],
+        lengths: npt.NDArray[np.uint16],
+    ) -> None: ...
     def step_into(
         self,
         actions: npt.NDArray[np.uint8],
@@ -98,4 +152,16 @@ class Batch:
         melds: npt.NDArray[np.uint8],
         river: npt.NDArray[np.uint8],
         meta: npt.NDArray[np.int32],
+    ) -> None: ...
+    def step_and_observe_events_into(
+        self,
+        actions: npt.NDArray[np.uint8],
+        records: npt.NDArray[np.int64],
+        mask_words: npt.NDArray[np.uint64],
+        tile_obs: npt.NDArray[np.uint8],
+        melds: npt.NDArray[np.uint8],
+        river: npt.NDArray[np.uint8],
+        meta: npt.NDArray[np.int32],
+        events: npt.NDArray[np.int32],
+        event_lengths: npt.NDArray[np.uint16],
     ) -> None: ...

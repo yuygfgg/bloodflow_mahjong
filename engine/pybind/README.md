@@ -55,6 +55,49 @@ batch.step_and_observe_into(actions, records, masks, tile_obs, melds, river, met
 | 10 | next phase, or `-1` |
 | 11 | terminal flag |
 
+## Event stream
+
+The extension exposes a fixed-width event stream for recurrent policies,
+replay, and diagnostics. One record is eight `int32` fields:
+
+```text
+[kind, actor_relative, target_relative, tile, flags, value, aux, reserved]
+```
+
+`actor_relative` and `target_relative` use the same seat rotation as the
+observation. `-1` means that a field is not applicable. Event kinds are
+available as the `EventKind(IntEnum)` class and bit flags as
+`EventFlag(IntFlag)`. The values of both enums are the stable integer codes
+stored in the arrays.
+
+| Kind | Fields |
+| --- | --- |
+| `ACTION` | `value=action_id`, `aux=phase`; visible only to the acting player |
+| `GAME_START` | `actor=dealer`, `flags=exchange_direction` |
+| `TURN_START` | initial dealer turn marker; `aux=1` |
+| `DRAW` | `actor=drawer`, `tile` is hidden from other players, `flags` contains replacement/last-wall, `value=wall_remaining` |
+| `DISCARD` | `actor`, `tile`, `flags` contains after-kong/opening-discard |
+| `EXCHANGE_COMPLETE` | `flags=exchange_direction` |
+| `MISSING_REVEALED` | `actor=player`, `value=missing_suit` |
+| `MELD` | `actor`, `target=source` when applicable, `tile`, `flags=MeldKind` |
+| `HU` | `actor=winner`, `target=source` for discard/rob-kong, `tile`, `flags`, `value=multiplier`, `aux=PatternSet.bits()` |
+| `PAYMENT` | `actor=payer`, `target=payee`, `value=actual_amount` |
+| `GAME_END` | `flags` marks an empty wall when applicable |
+
+`Game.events_into(viewer, output)` copies the newest retained history into a
+caller-owned `int32[capacity, EVENT_RECORD_WIDTH]` buffer and returns its
+length. `Game.step_events_into` copies only events emitted by the most recent
+step. For a `Batch`, `events_into` and `step_events_into` write
+`int32[batch, capacity, EVENT_RECORD_WIDTH]` plus `uint16[batch]` lengths.
+The batch viewer is the current decision actor, or the dealer after terminal.
+
+The Rust side retains a 512-record ring per environment; `Game.event_dropped`
+and `Batch.event_dropped_into` report overwritten records. Use the step-delta API in the training loop so a
+large history is not copied on every action. `Batch.step_and_observe_events_into`
+combines step, transition, observation, legal mask, and step-event delta into
+one GIL-free call. Buffers are caller-owned, C-contiguous, aligned, and never
+copied through Python objects.
+
 Array dtypes and shapes are part of the API. Batch calls reject non-contiguous
 views rather than copying them. The GIL is released while reset, mask, and step
 work runs in Rust; the Rust batch implementation uses Rayon for sufficiently

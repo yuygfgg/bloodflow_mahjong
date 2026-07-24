@@ -15,6 +15,10 @@ const STARTING_SCORE: i64 = 10_000;
 const SCORE_UNIT: i64 = 100;
 const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
+/// Number of `i32` fields in one event-stream record.
+pub const EVENT_RECORD_WIDTH: usize = 8;
+/// Retained event history per environment. Older events are overwritten.
+pub const EVENT_HISTORY_CAPACITY: usize = 512;
 /// Ten tile-count channels of 27 tile kinds each.
 pub const TILE_OBSERVATION_WIDTH: usize = 10 * TILE_KIND_COUNT;
 /// Four relative players, four meld slots, and three fields per meld.
@@ -23,6 +27,60 @@ pub const MELD_OBSERVATION_WIDTH: usize = PLAYER_COUNT * 4 * 3;
 pub const RIVER_OBSERVATION_WIDTH: usize = WALL_TILE_COUNT * 2;
 /// Scalar state plus four relative-player feature groups.
 pub const META_OBSERVATION_WIDTH: usize = 34;
+
+/// Event kinds written to the fixed-width event stream.
+///
+/// The stream contains both private decision records and public rule events.
+/// Visibility is applied when a stream is copied for a viewer; the canonical
+/// event ring never exposes its internal visibility masks through FFI.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum EventKind {
+    Action = 0,
+    GameStart = 1,
+    TurnStart = 2,
+    Draw = 3,
+    Discard = 4,
+    ExchangeComplete = 5,
+    MissingRevealed = 6,
+    Meld = 7,
+    Hu = 8,
+    Payment = 9,
+    GameEnd = 10,
+}
+
+impl EventKind {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// Event flags shared by the fixed-width stream schema.
+pub const EVENT_FLAG_REPLACEMENT_DRAW: u8 = 1 << 0;
+pub const EVENT_FLAG_LAST_WALL_TILE: u8 = 1 << 1;
+pub const EVENT_FLAG_AFTER_KONG: u8 = 1 << 2;
+pub const EVENT_FLAG_OPENING_DISCARD: u8 = 1 << 3;
+pub const EVENT_FLAG_SELF_DRAW: u8 = 1 << 4;
+pub const EVENT_FLAG_ROB_KONG: u8 = 1 << 5;
+pub const EVENT_FLAG_HEAVENLY: u8 = 1 << 6;
+pub const EVENT_FLAG_EARTHLY: u8 = 1 << 7;
+
+const ALL_PLAYER_MASK: u8 = (1 << PLAYER_COUNT) - 1;
+
+#[derive(Clone, Copy, Debug)]
+struct StoredEvent {
+    record: [i32; EVENT_RECORD_WIDTH],
+    visible_to: u8,
+    tile_visible_to: u8,
+}
+
+impl StoredEvent {
+    const EMPTY: Self = Self {
+        record: [-1; EVENT_RECORD_WIDTH],
+        visible_to: 0,
+        tile_visible_to: 0,
+    };
+}
 const DUMMY_MELD: Meld = Meld {
     tile: Tile::from_index_unchecked(0),
     kind: MeldKind::Pong,
@@ -201,6 +259,8 @@ pub enum GameError {
     BatchLength,
     #[error("batch index is out of range")]
     BatchIndex,
+    #[error("event output capacity is larger than the retained event history")]
+    EventCapacity,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -334,6 +394,13 @@ pub struct Game {
     discard_len: u8,
     transition_draw: Option<DrawEvent>,
     transition_discard: Option<DiscardEvent>,
+    events: [StoredEvent; EVENT_HISTORY_CAPACITY],
+    event_next: usize,
+    event_len: usize,
+    event_total: u64,
+    event_dropped: u64,
+    step_event_start: u64,
+    step_event_end: u64,
 }
 
 impl Game {
@@ -378,6 +445,13 @@ impl Game {
             discard_len: 0,
             transition_draw: None,
             transition_discard: None,
+            events: [StoredEvent::EMPTY; EVENT_HISTORY_CAPACITY],
+            event_next: 0,
+            event_len: 0,
+            event_total: 0,
+            event_dropped: 0,
+            step_event_start: 0,
+            step_event_end: 0,
         };
 
         for seat in Seat::ALL {
@@ -388,6 +462,17 @@ impl Game {
         }
         let tile = game.draw_head_raw().expect("initial wall has dealer tile");
         game.players[game.dealer.index()].concealed[tile.index()] += 1;
+        game.push_event(
+            EventKind::GameStart,
+            Some(game.dealer),
+            None,
+            None,
+            game.exchange_direction as u8,
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            0,
+        );
         game
     }
 
@@ -526,6 +611,19 @@ impl Game {
     fn apply_legal_action(&mut self, action: Action) -> Result<StepOutcome, GameError> {
         self.transition_draw = None;
         self.transition_discard = None;
+        let event_start = self.event_total;
+        let decision = self.decision().expect("a legal action has a decision");
+        self.push_event(
+            EventKind::Action,
+            Some(decision.actor),
+            None,
+            None,
+            0,
+            action.id().index() as i32,
+            i32::from(decision.phase.code()),
+            seat_bit(decision.actor),
+            0,
+        );
         let scores_before: [i64; PLAYER_COUNT] =
             core::array::from_fn(|index| self.players[index].score);
         let stage = self.stage;
@@ -555,6 +653,21 @@ impl Game {
             } => self.step_meld_response(source, tile, remaining, action),
             Stage::Finished => Err(GameError::Finished),
         }?;
+        if self.phase() == Phase::Finished {
+            self.push_event(
+                EventKind::GameEnd,
+                None,
+                None,
+                None,
+                u8::from(self.wall_remaining() == 0) * EVENT_FLAG_LAST_WALL_TILE,
+                0,
+                0,
+                ALL_PLAYER_MASK,
+                0,
+            );
+        }
+        self.step_event_start = event_start;
+        self.step_event_end = self.event_total;
         Ok(StepOutcome {
             draw: self.transition_draw,
             discard: self.transition_discard,
@@ -616,6 +729,158 @@ impl Game {
             }),
             _ => None,
         }
+    }
+
+    /// Number of retained viewer-independent events in the ring.
+    pub fn event_count(&self) -> usize {
+        self.event_len
+    }
+
+    /// Number of events overwritten since the game was created or reset.
+    pub fn event_dropped(&self) -> u64 {
+        self.event_dropped
+    }
+
+    /// Number of events emitted by the most recent successful step.
+    pub fn step_event_count(&self) -> usize {
+        (self.step_event_end - self.step_event_start) as usize
+    }
+
+    /// Copies the most recent visible events into a caller-owned flat buffer.
+    ///
+    /// The buffer length must be a multiple of [`EVENT_RECORD_WIDTH`] and its
+    /// capacity may be smaller than [`EVENT_HISTORY_CAPACITY`], in which case
+    /// only the newest visible records are copied. Records are ordered from
+    /// oldest to newest, use relative seats for fields 1 and 2, and are filled
+    /// with `-1` before writing. A draw event remains public while its tile
+    /// field is masked to `-1` for every viewer other than the drawer.
+    pub fn events_into(&self, viewer: Seat, output: &mut [i32]) -> Result<usize, GameError> {
+        if output.len() % EVENT_RECORD_WIDTH != 0 {
+            return Err(GameError::BatchLength);
+        }
+        let capacity = output.len() / EVENT_RECORD_WIDTH;
+        if capacity > EVENT_HISTORY_CAPACITY {
+            return Err(GameError::EventCapacity);
+        }
+        self.write_events(viewer, output)
+    }
+
+    /// Copies only the events emitted by the most recent successful step.
+    /// This is the compact form intended for a training loop.
+    pub fn step_events_into(&self, viewer: Seat, output: &mut [i32]) -> Result<usize, GameError> {
+        if output.len() % EVENT_RECORD_WIDTH != 0 {
+            return Err(GameError::BatchLength);
+        }
+        let capacity = output.len() / EVENT_RECORD_WIDTH;
+        if capacity > EVENT_HISTORY_CAPACITY {
+            return Err(GameError::EventCapacity);
+        }
+        self.write_event_range(viewer, self.step_event_start, self.step_event_end, output)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_event(
+        &mut self,
+        kind: EventKind,
+        actor: Option<Seat>,
+        target: Option<Seat>,
+        tile: Option<Tile>,
+        flags: u8,
+        value: i32,
+        aux: i32,
+        visible_to: u8,
+        tile_visible_to: u8,
+    ) {
+        let mut record = [-1_i32; EVENT_RECORD_WIDTH];
+        record[0] = i32::from(kind.code());
+        record[1] = actor.map_or(-1, |seat| i32::from(seat.as_u8()));
+        record[2] = target.map_or(-1, |seat| i32::from(seat.as_u8()));
+        record[3] = tile.map_or(-1, |tile| i32::from(tile.as_u8()));
+        record[4] = i32::from(flags);
+        record[5] = value;
+        record[6] = aux;
+        self.events[self.event_next] = StoredEvent {
+            record,
+            visible_to,
+            tile_visible_to,
+        };
+        self.event_next = (self.event_next + 1) % EVENT_HISTORY_CAPACITY;
+        self.event_total = self.event_total.saturating_add(1);
+        if self.event_len < EVENT_HISTORY_CAPACITY {
+            self.event_len += 1;
+        } else {
+            self.event_dropped = self.event_dropped.saturating_add(1);
+        }
+    }
+
+    fn write_events(&self, viewer: Seat, output: &mut [i32]) -> Result<usize, GameError> {
+        debug_assert_eq!(output.len() % EVENT_RECORD_WIDTH, 0);
+        self.write_event_range(viewer, 0, self.event_total, output)
+    }
+
+    fn write_event_range(
+        &self,
+        viewer: Seat,
+        requested_start: u64,
+        requested_end: u64,
+        output: &mut [i32],
+    ) -> Result<usize, GameError> {
+        debug_assert_eq!(output.len() % EVENT_RECORD_WIDTH, 0);
+        let capacity = output.len() / EVENT_RECORD_WIDTH;
+        output.fill(-1);
+
+        let oldest = self.event_total.saturating_sub(self.event_len as u64);
+        let start = requested_start.max(oldest).min(self.event_total);
+        let end = requested_end.max(start).min(self.event_total);
+        let mut visible: usize = 0;
+        for sequence in start..end {
+            if self.event_at(sequence).visible_to & seat_bit(viewer) != 0 {
+                visible += 1;
+            }
+        }
+        let skip = visible.saturating_sub(capacity);
+        let mut seen = 0;
+        let mut written = 0;
+        for sequence in start..end {
+            let event = self.event_at(sequence);
+            if event.visible_to & seat_bit(viewer) == 0 {
+                continue;
+            }
+            if seen < skip {
+                seen += 1;
+                continue;
+            }
+            if written >= capacity {
+                break;
+            }
+            let mut record = event.record;
+            if record[1] >= 0 {
+                let seat = Seat::new(record[1] as u8).expect("event actor seat is valid");
+                record[1] = i32::from(relative_seat(viewer, seat));
+            }
+            if record[2] >= 0 {
+                let seat = Seat::new(record[2] as u8).expect("event target seat is valid");
+                record[2] = i32::from(relative_seat(viewer, seat));
+            }
+            if record[0] == i32::from(EventKind::Draw.code())
+                && event.tile_visible_to & seat_bit(viewer) == 0
+            {
+                record[3] = -1;
+            }
+            let offset = written * EVENT_RECORD_WIDTH;
+            output[offset..offset + EVENT_RECORD_WIDTH].copy_from_slice(&record);
+            written += 1;
+            seen += 1;
+        }
+        Ok(written)
+    }
+
+    fn event_at(&self, sequence: u64) -> &StoredEvent {
+        let oldest = self.event_total - self.event_len as u64;
+        let offset = (sequence - oldest) as usize;
+        let start =
+            (self.event_next + EVENT_HISTORY_CAPACITY - self.event_len) % EVENT_HISTORY_CAPACITY;
+        &self.events[(start + offset) % EVENT_HISTORY_CAPACITY]
     }
 
     pub fn concealed(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
@@ -809,6 +1074,17 @@ impl Game {
             };
         } else {
             self.apply_exchange();
+            self.push_event(
+                EventKind::ExchangeComplete,
+                None,
+                None,
+                None,
+                self.exchange_direction as u8,
+                0,
+                0,
+                ALL_PLAYER_MASK,
+                0,
+            );
             self.stage = Stage::ChooseMissing { actor: Seat::EAST };
         }
         Ok(())
@@ -866,8 +1142,30 @@ impl Game {
         } else {
             for seat in Seat::ALL {
                 self.players[seat.index()].missing = self.pending_missing[seat.index()];
+                self.push_event(
+                    EventKind::MissingRevealed,
+                    Some(seat),
+                    None,
+                    None,
+                    0,
+                    self.pending_missing[seat.index()].map_or(-1, |suit| suit as i32),
+                    0,
+                    ALL_PLAYER_MASK,
+                    0,
+                );
             }
             let can_hu = self.can_player_win(self.dealer, None);
+            self.push_event(
+                EventKind::TurnStart,
+                Some(self.dealer),
+                None,
+                None,
+                0,
+                0,
+                1,
+                ALL_PLAYER_MASK,
+                0,
+            );
             self.stage = Stage::Turn {
                 actor: self.dealer,
                 origin: TurnOrigin::Initial,
@@ -1010,6 +1308,24 @@ impl Game {
             }
         );
         let opening_discard = actor == self.dealer && self.discard_len == 1;
+        let mut discard_flags = 0;
+        if after_kong {
+            discard_flags |= EVENT_FLAG_AFTER_KONG;
+        }
+        if opening_discard {
+            discard_flags |= EVENT_FLAG_OPENING_DISCARD;
+        }
+        self.push_event(
+            EventKind::Discard,
+            Some(actor),
+            None,
+            Some(tile),
+            discard_flags,
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         let mut candidates = 0_u8;
         for seat in Seat::ALL {
             if seat != actor && self.can_player_win_with_added_tile(seat, tile) {
@@ -1066,6 +1382,17 @@ impl Game {
             source,
         });
         debug_assert!(added);
+        self.push_event(
+            EventKind::Meld,
+            Some(actor),
+            Some(source),
+            Some(tile),
+            MeldKind::Pong.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         self.stage = Stage::Turn {
             actor,
             origin: TurnOrigin::AfterPong,
@@ -1082,6 +1409,17 @@ impl Game {
             source,
         });
         debug_assert!(added);
+        self.push_event(
+            EventKind::Meld,
+            Some(actor),
+            Some(source),
+            Some(tile),
+            MeldKind::ExposedKong.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         self.transfer(source, actor, SCORE_UNIT);
         if self.finish_if_three_zero() {
             return Ok(());
@@ -1098,6 +1436,17 @@ impl Game {
             source: actor,
         });
         debug_assert!(added);
+        self.push_event(
+            EventKind::Meld,
+            Some(actor),
+            None,
+            Some(tile),
+            MeldKind::ConcealedKong.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         for payer in seats_after(actor) {
             self.transfer(payer, actor, SCORE_UNIT * 2);
         }
@@ -1138,6 +1487,17 @@ impl Game {
             .find(|meld| meld.kind == MeldKind::Pong && meld.tile == tile)
             .expect("legal added kong has matching pong");
         meld.kind = MeldKind::AddedKong;
+        self.push_event(
+            EventKind::Meld,
+            Some(actor),
+            None,
+            Some(tile),
+            MeldKind::AddedKong.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         for payer in seats_after(actor) {
             self.transfer(payer, actor, SCORE_UNIT);
         }
@@ -1173,6 +1533,17 @@ impl Game {
             .evaluate_player(actor, required, flags)
             .ok_or(GameError::InvalidAction)?;
         self.apply_win(actor, required, evaluation);
+        self.push_event(
+            EventKind::Hu,
+            Some(actor),
+            None,
+            required,
+            win_event_flags(flags, true),
+            evaluation.multiplier as i32,
+            evaluation.patterns.bits() as i32,
+            ALL_PLAYER_MASK,
+            ALL_PLAYER_MASK,
+        );
         let payment = SCORE_UNIT * i64::from(evaluation.multiplier) * 2;
         for payer in seats_after(actor) {
             self.transfer(payer, actor, payment);
@@ -1212,6 +1583,17 @@ impl Game {
                 .evaluate_player(winner, Some(tile), flags)
                 .expect("response legality was checked");
             self.apply_win(winner, Some(tile), evaluation);
+            self.push_event(
+                EventKind::Hu,
+                Some(winner),
+                Some(source),
+                Some(tile),
+                win_event_flags(flags, false),
+                evaluation.multiplier as i32,
+                evaluation.patterns.bits() as i32,
+                ALL_PLAYER_MASK,
+                ALL_PLAYER_MASK,
+            );
             self.transfer(
                 source,
                 winner,
@@ -1290,6 +1672,17 @@ impl Game {
             replacement: false,
         });
         let last_wall_tile = self.wall_remaining() == 0;
+        self.push_event(
+            EventKind::Draw,
+            Some(actor),
+            None,
+            Some(tile),
+            u8::from(last_wall_tile) * EVENT_FLAG_LAST_WALL_TILE,
+            self.wall_remaining() as i32,
+            0,
+            ALL_PLAYER_MASK,
+            seat_bit(actor),
+        );
         let can_hu = self.can_player_win(actor, Some(tile));
         self.stage = Stage::Turn {
             actor,
@@ -1316,6 +1709,17 @@ impl Game {
             replacement: true,
         });
         let last_wall_tile = self.wall_remaining() == 0;
+        self.push_event(
+            EventKind::Draw,
+            Some(actor),
+            None,
+            Some(tile),
+            EVENT_FLAG_REPLACEMENT_DRAW | (u8::from(last_wall_tile) * EVENT_FLAG_LAST_WALL_TILE),
+            self.wall_remaining() as i32,
+            0,
+            ALL_PLAYER_MASK,
+            seat_bit(actor),
+        );
         let can_hu = self.can_player_win(actor, Some(tile));
         self.stage = Stage::Turn {
             actor,
@@ -1368,6 +1772,19 @@ impl Game {
         let amount = requested.min(self.players[payer.index()].score).max(0);
         self.players[payer.index()].score -= amount;
         self.players[payee.index()].score += amount;
+        if amount > 0 {
+            self.push_event(
+                EventKind::Payment,
+                Some(payer),
+                Some(payee),
+                None,
+                0,
+                amount.min(i64::from(i32::MAX)) as i32,
+                0,
+                ALL_PLAYER_MASK,
+                0,
+            );
+        }
         amount
     }
 
@@ -1484,6 +1901,24 @@ impl Batch {
 
     pub fn is_empty(&self) -> bool {
         self.games.is_empty()
+    }
+
+    /// Writes the number of overwritten events for each environment.
+    pub fn event_dropped_into(&self, output: &mut [u64]) -> Result<(), GameError> {
+        if output.len() != self.games.len() {
+            return Err(GameError::BatchLength);
+        }
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(output.par_iter_mut())
+                .for_each(|(game, dropped)| *dropped = game.event_dropped());
+        } else {
+            for (game, dropped) in self.games.iter().zip(output.iter_mut()) {
+                *dropped = game.event_dropped();
+            }
+        }
+        Ok(())
     }
 
     pub fn games(&self) -> &[Game] {
@@ -1642,6 +2077,108 @@ impl Batch {
         Ok(())
     }
 
+    /// Writes the latest viewer-scoped event history for every environment.
+    ///
+    /// `capacity` is the number of records reserved per environment. The
+    /// output is `[batch, capacity, EVENT_RECORD_WIDTH]` when viewed as a
+    /// multidimensional array and `lengths` receives the number of visible
+    /// records written to each row. The viewer is the current decision actor,
+    /// or the dealer for a terminal environment.
+    pub fn events_into(
+        &self,
+        capacity: usize,
+        output: &mut [i32],
+        lengths: &mut [u16],
+    ) -> Result<(), GameError> {
+        if capacity > EVENT_HISTORY_CAPACITY
+            || self.games.len().checked_mul(capacity * EVENT_RECORD_WIDTH) != Some(output.len())
+            || lengths.len() != self.games.len()
+        {
+            return if capacity > EVENT_HISTORY_CAPACITY {
+                Err(GameError::EventCapacity)
+            } else {
+                Err(GameError::BatchLength)
+            };
+        }
+        if capacity == 0 {
+            lengths.fill(0);
+            return Ok(());
+        }
+        let write = |game: &Game, records: &mut [i32], length: &mut u16| {
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            *length = game
+                .write_events(viewer, records)
+                .expect("batch event buffers were validated") as u16;
+        };
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(output.par_chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.par_iter_mut())
+                .for_each(|((game, records), length)| write(game, records, length));
+        } else {
+            for ((game, records), length) in self
+                .games
+                .iter()
+                .zip(output.chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.iter_mut())
+            {
+                write(game, records, length);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes only the events emitted by each environment's most recent step.
+    pub fn step_events_into(
+        &self,
+        capacity: usize,
+        output: &mut [i32],
+        lengths: &mut [u16],
+    ) -> Result<(), GameError> {
+        if capacity > EVENT_HISTORY_CAPACITY
+            || self.games.len().checked_mul(capacity * EVENT_RECORD_WIDTH) != Some(output.len())
+            || lengths.len() != self.games.len()
+        {
+            return if capacity > EVENT_HISTORY_CAPACITY {
+                Err(GameError::EventCapacity)
+            } else {
+                Err(GameError::BatchLength)
+            };
+        }
+        if capacity == 0 {
+            lengths.fill(0);
+            return Ok(());
+        }
+        let write = |game: &Game, records: &mut [i32], length: &mut u16| {
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            *length = game
+                .step_events_into(viewer, records)
+                .expect("batch event buffers were validated") as u16;
+        };
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(output.par_chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.par_iter_mut())
+                .for_each(|((game, records), length)| write(game, records, length));
+        } else {
+            for ((game, records), length) in self
+                .games
+                .iter()
+                .zip(output.chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.iter_mut())
+            {
+                write(game, records, length);
+            }
+        }
+        Ok(())
+    }
+
     pub fn step(
         &mut self,
         actions: &[Action],
@@ -1727,6 +2264,45 @@ impl Batch {
         Ok(())
     }
 
+    /// Applies actions and fills transitions, next observations, masks, and
+    /// viewer-scoped event histories in one GIL-free-friendly Rust call.
+    #[allow(clippy::too_many_arguments)]
+    pub fn step_indices_observe_events_into(
+        &mut self,
+        actions: &[u8],
+        records: &mut [i64],
+        mask_words: &mut [u64],
+        tile_obs: &mut [u8],
+        melds: &mut [u8],
+        river: &mut [u8],
+        meta: &mut [i32],
+        event_capacity: usize,
+        events: &mut [i32],
+        event_lengths: &mut [u16],
+    ) -> Result<(), GameError> {
+        if event_capacity > EVENT_HISTORY_CAPACITY
+            || self
+                .games
+                .len()
+                .checked_mul(event_capacity * EVENT_RECORD_WIDTH)
+                != Some(events.len())
+            || event_lengths.len() != self.games.len()
+        {
+            return if event_capacity > EVENT_HISTORY_CAPACITY {
+                Err(GameError::EventCapacity)
+            } else {
+                Err(GameError::BatchLength)
+            };
+        }
+        if event_capacity == 0 {
+            event_lengths.fill(0);
+        }
+        self.step_indices_into(actions, records)?;
+        self.observations_into(tile_obs, melds, river, meta)?;
+        self.legal_action_mask_words_into(mask_words)?;
+        self.step_events_into(event_capacity, events, event_lengths)
+    }
+
     fn step_with<A, F>(
         &mut self,
         actions: &[A],
@@ -1803,6 +2379,29 @@ fn seats_in_mask_after(source: Seat, mask: u8) -> impl Iterator<Item = Seat> {
     (1..=PLAYER_COUNT as u8)
         .map(move |offset| source.offset(offset))
         .filter(move |&seat| mask & seat_bit(seat) != 0)
+}
+
+fn win_event_flags(flags: WinFlags, self_draw: bool) -> u8 {
+    let mut output = 0;
+    if self_draw {
+        output |= EVENT_FLAG_SELF_DRAW;
+    }
+    if flags.rob_kong {
+        output |= EVENT_FLAG_ROB_KONG;
+    }
+    if flags.after_kong_discard || flags.after_kong_draw {
+        output |= EVENT_FLAG_AFTER_KONG;
+    }
+    if flags.last_wall_tile {
+        output |= EVENT_FLAG_LAST_WALL_TILE;
+    }
+    if flags.heavenly {
+        output |= EVENT_FLAG_HEAVENLY;
+    }
+    if flags.earthly {
+        output |= EVENT_FLAG_EARTHLY;
+    }
+    output
 }
 
 #[cfg(test)]

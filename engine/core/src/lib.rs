@@ -19,9 +19,12 @@ pub use action::{
     LEGAL_ACTION_MASK_WORDS,
 };
 pub use game::{
-    Batch, Decision, DiscardEvent, DrawEvent, DrawNotice, Game, GameError, LegalActions,
-    MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, Phase, PlayerStepOutcome,
-    RIVER_OBSERVATION_WIDTH, STEP_RECORD_WIDTH, StepOutcome, TILE_OBSERVATION_WIDTH,
+    Batch, Decision, DiscardEvent, DrawEvent, DrawNotice, EVENT_FLAG_AFTER_KONG,
+    EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE, EVENT_FLAG_OPENING_DISCARD,
+    EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG, EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY,
+    EVENT_RECORD_WIDTH, EventKind, Game, GameError, LegalActions, MELD_OBSERVATION_WIDTH,
+    META_OBSERVATION_WIDTH, Phase, PlayerStepOutcome, RIVER_OBSERVATION_WIDTH, STEP_RECORD_WIDTH,
+    StepOutcome, TILE_OBSERVATION_WIDTH,
 };
 pub use hand::{
     MaxWaitEvaluation, Pattern, PatternSet, WinEvaluation, WinFlags, evaluate_max_wait,

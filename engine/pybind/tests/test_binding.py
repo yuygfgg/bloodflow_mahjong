@@ -24,9 +24,7 @@ def buffers(batch_size: int) -> tuple[np.ndarray, ...]:
             (batch_size, bm.PLAYER_COUNT, bm.MELD_SLOTS, bm.MELD_FIELDS),
             dtype=np.uint8,
         ),
-        np.empty(
-            (batch_size, bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8
-        ),
+        np.empty((batch_size, bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8),
         np.empty((batch_size, bm.META_OBSERVATION_WIDTH), dtype=np.int32),
     )
 
@@ -97,9 +95,7 @@ def test_observe_and_combined_step_fill_caller_buffers() -> None:
     batch.legal_action_masks_into(masks)
     for index, words in enumerate(masks):
         actions[index] = first_legal_action(words)
-    batch.step_and_observe_into(
-        actions, records, masks, tile_obs, melds, river, meta
-    )
+    batch.step_and_observe_into(actions, records, masks, tile_obs, melds, river, meta)
     assert np.all(meta[:, 0] == bm.PHASE_EXCHANGE)
     assert np.all(records[:, 9] == 0)
 
@@ -209,3 +205,71 @@ def test_batch_rejects_illegal_actions_atomically() -> None:
         batch.step_into(actions, records)
     batch.legal_action_masks_into(after)
     np.testing.assert_array_equal(after, before)
+
+
+def test_game_event_history_and_step_delta_are_zero_copy_buffers() -> None:
+    game = bm.Game(seed=42)
+    history = np.empty((8, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    assert game.event_count == 1
+    length = game.events_into(0, history)
+    assert length == 1
+    assert history[0, 0] == bm.EventKind.GAME_START
+
+    action = first_legal_action(np.asarray(game.legal_action_mask, dtype=np.uint64))
+    game.step_id(action)
+    delta = np.empty((4, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    delta_length = game.step_events_into(0, delta)
+    assert delta_length == 1
+    assert delta[0, 0] == bm.EventKind.ACTION
+    assert delta[0, 5] == action
+    assert delta[0, 6] == bm.PHASE_EXCHANGE
+
+
+def test_batch_event_history_and_combined_step_delta() -> None:
+    size = 16
+    capacity = 16
+    batch = bm.Batch(size, seed=77)
+    history = np.empty((size, capacity, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    lengths = np.empty(size, dtype=np.uint16)
+    batch.events_into(history, lengths)
+    assert np.all(lengths == 1)
+    assert np.all(history[:, 0, 0] == bm.EventKind.GAME_START)
+
+    records, masks, tile_obs, melds, river, meta = buffers(size)
+    actions = np.empty(size, dtype=np.uint8)
+    batch.legal_action_masks_into(masks)
+    for index, words in enumerate(masks):
+        actions[index] = first_legal_action(words)
+    events = np.empty((size, capacity, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    event_lengths = np.empty(size, dtype=np.uint16)
+    batch.step_and_observe_events_into(
+        actions,
+        records,
+        masks,
+        tile_obs,
+        melds,
+        river,
+        meta,
+        events,
+        event_lengths,
+    )
+    assert np.all(event_lengths >= 1)
+    assert np.all(events[:, 0, 0] == bm.EventKind.ACTION)
+
+
+def test_event_buffers_validate_shape_dtype_and_capacity() -> None:
+    game = bm.Game(seed=3)
+    with pytest.raises(ValueError, match="shape"):
+        game.events_into(0, np.empty((4, 7), dtype=np.int32))
+    with pytest.raises(TypeError):
+        game.events_into(0, np.empty((4, bm.EVENT_RECORD_WIDTH), dtype=np.int64))
+
+    batch = bm.Batch(2, seed=4)
+    with pytest.raises(ValueError, match="capacity"):
+        batch.events_into(
+            np.empty(
+                (2, bm.EVENT_HISTORY_CAPACITY + 1, bm.EVENT_RECORD_WIDTH),
+                dtype=np.int32,
+            ),
+            np.empty(2, dtype=np.uint16),
+        )
