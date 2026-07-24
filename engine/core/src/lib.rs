@@ -10,6 +10,7 @@ mod action;
 mod game;
 mod hand;
 mod rng;
+mod rule_agent;
 mod types;
 
 pub use action::{
@@ -27,7 +28,9 @@ pub use game::{
     StepOutcome, TILE_OBSERVATION_WIDTH,
 };
 pub use hand::{
-    MaxWaitEvaluation, Pattern, PatternSet, WinEvaluation, WinFlags, evaluate_max_wait,
+    MaxWaitEvaluation, Pattern, PatternSet, SHANTEN_COMPLETE, SHANTEN_MAX, SHANTEN_TERMINAL,
+    ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten, evaluate_max_wait, evaluate_shanten,
     evaluate_win, is_winning,
 };
+pub use rule_agent::SIMPLE_RULE_ACTION_TERMINAL;
 pub use types::{ExchangeDirection, Meld, MeldKind, Seat, Suit, Tile, WinSource};

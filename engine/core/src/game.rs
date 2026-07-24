@@ -2,7 +2,10 @@ use crate::action::{
     Action, ActionId, ActionMask, LEGAL_ACTION_MASK_WORDS, added_kong_offset,
     concealed_kong_offset, discard_offset, exchange_offset,
 };
-use crate::hand::{WinEvaluation, WinFlags, evaluate_max_wait, evaluate_win, is_winning};
+use crate::hand::{
+    SHANTEN_TERMINAL, ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten, evaluate_max_wait,
+    evaluate_win, is_winning,
+};
 use crate::rng::Rng;
 use crate::types::{
     ExchangeDirection, Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_COPIES, TILE_KIND_COUNT,
@@ -13,7 +16,7 @@ use thiserror::Error;
 
 const STARTING_SCORE: i64 = 10_000;
 const SCORE_UNIT: i64 = 100;
-const PARALLEL_BATCH_THRESHOLD: usize = 64;
+pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
 pub const EVENT_RECORD_WIDTH: usize = 8;
@@ -918,6 +921,16 @@ impl Game {
     /// Highest shape multiplier from this player's completed wins.
     pub fn max_win_multiplier(&self, seat: Seat) -> u32 {
         self.players[seat.index()].max_win_multiplier
+    }
+
+    /// Returns conventional structural shanten and improving tiles for a seat.
+    ///
+    /// This authoritative accessor can inspect any seat, just like
+    /// [`Game::concealed`]. Policy code should request only its own seat.
+    pub fn hand_analysis(&self, seat: Seat) -> ShantenAnalysis {
+        let player = &self.players[seat.index()];
+        let (melds, len) = player.meld_buffer();
+        analyze_shanten(&player.concealed, &melds[..len], player.missing)
     }
 
     pub fn discards(&self) -> impl Iterator<Item = (Seat, Tile)> + '_ {
@@ -2014,6 +2027,49 @@ impl Batch {
                 .zip(output.chunks_mut(LEGAL_ACTION_MASK_WORDS))
             {
                 write(game, words);
+            }
+        }
+        Ok(())
+    }
+
+    /// Writes current-actor conventional shanten and improving-tile masks.
+    ///
+    /// Terminal slots receive [`SHANTEN_TERMINAL`] and an empty mask. The
+    /// output buffers are `[batch]` arrays owned by the caller.
+    pub fn hand_analysis_into(
+        &self,
+        shanten: &mut [i8],
+        improving_tiles: &mut [u32],
+    ) -> Result<(), GameError> {
+        if shanten.len() != self.games.len() || improving_tiles.len() != self.games.len() {
+            return Err(GameError::BatchLength);
+        }
+        let write = |game: &Game, shanten: &mut i8, improving_tiles: &mut u32| {
+            let Some(decision) = game.decision() else {
+                *shanten = SHANTEN_TERMINAL;
+                *improving_tiles = 0;
+                return;
+            };
+            let analysis = game.hand_analysis(decision.actor);
+            *shanten = analysis.shanten;
+            *improving_tiles = analysis.improving_tiles;
+        };
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(shanten.par_iter_mut())
+                .zip(improving_tiles.par_iter_mut())
+                .for_each(|((game, shanten), improving_tiles)| {
+                    write(game, shanten, improving_tiles);
+                });
+        } else {
+            for ((game, shanten), improving_tiles) in self
+                .games
+                .iter()
+                .zip(shanten.iter_mut())
+                .zip(improving_tiles.iter_mut())
+            {
+                write(game, shanten, improving_tiles);
             }
         }
         Ok(())

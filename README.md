@@ -59,3 +59,5 @@ python engine/pybind/benchmarks/throughput.py --batch-size 1024 --iterations 409
 ```
 
 实现约定和验收矩阵见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)。
+
+无真人牌谱条件下的模型候选、冷启动、自博弈 PPO 和评测方案见 [`TRAINING.md`](TRAINING.md)。

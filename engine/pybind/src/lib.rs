@@ -7,6 +7,7 @@ use core_engine::{
     EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG, EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY,
     EVENT_RECORD_WIDTH, EventKind, ExchangeDirection, Game, GameError, LEGAL_ACTION_MASK_WORDS,
     MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, MeldKind, Phase, RIVER_OBSERVATION_WIDTH,
+    SHANTEN_COMPLETE, SHANTEN_MAX, SHANTEN_TERMINAL, SIMPLE_RULE_ACTION_TERMINAL,
     STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_OBSERVATION_WIDTH,
 };
 use numpy::{
@@ -71,6 +72,13 @@ impl PyGame {
         self.inner
             .legal_action_mask()
             .map_or((0, 0), |mask| (mask.words()[0], mask.words()[1]))
+    }
+
+    /// Returns the deterministic baseline action, or `None` after terminal.
+    fn simple_rule_action(&self) -> Option<u8> {
+        self.inner
+            .simple_rule_action()
+            .map(|action| action.index() as u8)
     }
 
     fn step_id(&mut self, action: u8) -> PyResult<StepRecordTuple> {
@@ -170,6 +178,12 @@ impl PyGame {
             output,
             "output",
         )
+    }
+
+    /// Returns conventional structural shanten and an improving-tile bitmask.
+    fn hand_analysis(&self, seat: u8) -> PyResult<(i8, u32)> {
+        let analysis = self.inner.hand_analysis(seat_value(seat)?);
+        Ok((analysis.shanten, analysis.improving_tiles))
     }
 
     fn scores(&self) -> (i64, i64, i64, i64) {
@@ -312,6 +326,39 @@ impl PyBatch {
         let mut output = try_readwrite(output, "output")?;
         let output = writable_slice(&mut output, "output")?;
         py.detach(|| self.inner.legal_action_mask_words_into(output))
+            .map_err(game_error)
+    }
+
+    fn simple_rule_actions_into<'py>(
+        &self,
+        py: Python<'py>,
+        output: &Bound<'py, PyArray1<u8>>,
+    ) -> PyResult<()> {
+        require_shape(output, &[self.inner.len()], "output")?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.simple_rule_actions_into(output))
+            .map_err(game_error)
+    }
+
+    fn hand_analysis_into<'py>(
+        &self,
+        py: Python<'py>,
+        shanten: &Bound<'py, PyArray1<i8>>,
+        improving_tiles: &Bound<'py, PyArray1<u32>>,
+    ) -> PyResult<()> {
+        let batch_size = self.inner.len();
+        require_shape(shanten, &[batch_size], "shanten")?;
+        require_c_contiguous(shanten, "shanten")?;
+        require_shape(improving_tiles, &[batch_size], "improving_tiles")?;
+        require_c_contiguous(improving_tiles, "improving_tiles")?;
+
+        let mut shanten = try_readwrite(shanten, "shanten")?;
+        let mut improving_tiles = try_readwrite(improving_tiles, "improving_tiles")?;
+        let shanten = writable_slice(&mut shanten, "shanten")?;
+        let improving_tiles = writable_slice(&mut improving_tiles, "improving_tiles")?;
+        py.detach(|| self.inner.hand_analysis_into(shanten, improving_tiles))
             .map_err(game_error)
     }
 
@@ -844,6 +891,10 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("STEP_RECORD_WIDTH", STEP_RECORD_WIDTH)?;
     module.add("EVENT_RECORD_WIDTH", EVENT_RECORD_WIDTH)?;
     module.add("EVENT_HISTORY_CAPACITY", EVENT_HISTORY_CAPACITY)?;
+    module.add("SHANTEN_COMPLETE", SHANTEN_COMPLETE)?;
+    module.add("SHANTEN_MAX", SHANTEN_MAX)?;
+    module.add("SHANTEN_TERMINAL", SHANTEN_TERMINAL)?;
+    module.add("SIMPLE_RULE_ACTION_TERMINAL", SIMPLE_RULE_ACTION_TERMINAL)?;
     module.add("TILE_OBSERVATION_WIDTH", TILE_OBSERVATION_WIDTH)?;
     module.add("TILE_OBSERVATION_PLANES", TILE_OBSERVATION_PLANES)?;
     module.add("MELD_OBSERVATION_WIDTH", MELD_OBSERVATION_WIDTH)?;

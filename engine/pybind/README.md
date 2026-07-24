@@ -41,6 +41,27 @@ batch.legal_action_masks_into(masks)
 batch.step_and_observe_into(actions, records, masks, tile_obs, melds, river, meta)
 ```
 
+## Rule baseline and shanten
+
+`Game.simple_rule_action()` returns a deterministic legal action for the current
+decision, or `None` after terminal. `Batch.simple_rule_actions_into` writes one
+action per environment to a `uint8[batch]` buffer; terminal slots receive
+`SIMPLE_RULE_ACTION_TERMINAL` (`255`). The policy is a cold-start opponent and
+evaluation anchor, not an expert policy.
+
+`Game.hand_analysis(seat)` returns `(shanten, improving_tiles)`. The latter is a
+27-bit tile-kind mask. For training throughput,
+`Batch.hand_analysis_into(shanten, improving_tiles)` writes current-actor values
+to `int8[batch]` and `uint32[batch]` buffers. Ordinary shanten values are
+`SHANTEN_COMPLETE` (`-1`) through `SHANTEN_MAX` (`8`); terminal batch slots use
+`SHANTEN_TERMINAL` (`127`) and an empty mask.
+
+The evaluator measures conventional structural shanten, including standard
+hands, this ruleset's seven-pairs quad rule, exposed melds, and the missing
+suit. Once a blood-flow player has won, its locked old structure remains in the
+holding, so `-1` does not mean the player is one step from another payable win.
+Do not use this API as a post-win shaping target.
+
 `records` has 12 columns:
 
 | Column | Value |

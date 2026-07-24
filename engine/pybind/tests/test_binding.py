@@ -44,10 +44,21 @@ def test_game_step_and_state_buffers() -> None:
     game = bm.Game(seed=42)
     assert game.phase == bm.PHASE_EXCHANGE
     assert game.decision == (0, bm.PHASE_EXCHANGE)
+    rule_action = game.simple_rule_action()
+    assert rule_action is not None
+    rule_word = rule_action // 64
+    rule_bit = rule_action % 64
+    assert int(game.legal_action_mask[rule_word]) & (1 << rule_bit)
 
     hand = np.empty(bm.TILE_KIND_COUNT, dtype=np.uint8)
     game.concealed_into(0, hand)
     assert int(hand.sum()) == 14
+    shanten, improving_tiles = game.hand_analysis(0)
+    assert bm.SHANTEN_COMPLETE <= shanten <= bm.SHANTEN_MAX
+    assert improving_tiles >> bm.TILE_KIND_COUNT == 0
+
+    with pytest.raises(ValueError, match="seat"):
+        game.hand_analysis(4)
 
     action = first_legal_action(np.asarray(game.legal_action_mask, dtype=np.uint64))
     record = game.step_id(action)
@@ -74,12 +85,38 @@ def test_batch_uses_fixed_numpy_buffers() -> None:
     records = np.empty((len(batch), bm.STEP_RECORD_WIDTH), dtype=np.int64)
 
     batch.legal_action_masks_into(masks)
+    batch.simple_rule_actions_into(actions)
+    for action, words in zip(actions, masks, strict=True):
+        assert int(words[int(action) // 64]) & (1 << (int(action) % 64))
+
+    shanten = np.empty(len(batch), dtype=np.int8)
+    improving_tiles = np.empty(len(batch), dtype=np.uint32)
+    batch.hand_analysis_into(shanten, improving_tiles)
+    assert np.all(shanten >= bm.SHANTEN_COMPLETE)
+    assert np.all(shanten <= bm.SHANTEN_MAX)
+    assert np.all(improving_tiles >> bm.TILE_KIND_COUNT == 0)
+
     for index, words in enumerate(masks):
         actions[index] = first_legal_action(words)
     batch.step_into(actions, records)
 
     assert np.all(records[:, 11] == 0)
     assert np.all(records[:, 9] >= 0)
+
+
+def test_rule_and_hand_analysis_buffers_validate_shape_and_dtype() -> None:
+    batch = bm.Batch(8)
+    with pytest.raises(ValueError, match="shape"):
+        batch.simple_rule_actions_into(np.empty(7, dtype=np.uint8))
+    with pytest.raises(TypeError):
+        batch.simple_rule_actions_into(np.empty(8, dtype=np.int8))
+
+    shanten = np.empty(8, dtype=np.int8)
+    improving_tiles = np.empty(8, dtype=np.uint32)
+    with pytest.raises(ValueError, match="shape"):
+        batch.hand_analysis_into(shanten[:-1], improving_tiles)
+    with pytest.raises(TypeError):
+        batch.hand_analysis_into(np.empty(8, dtype=np.uint8), improving_tiles)
 
 
 def test_observe_and_combined_step_fill_caller_buffers() -> None:

@@ -12,6 +12,35 @@ const GROUP_KIND_COUNT: usize = TILE_KIND_COUNT + SUIT_COUNT * 7;
 // same meld counts with a pair. Each entry describes shapes contained in,
 // rather than exactly equal to, the suit state.
 static SUIT_SHAPES: OnceLock<Box<[u16]>> = OnceLock::new();
+// Every bit represents `(melds, taatsu, pair)` for one 5^9 suit state.
+// The table is shared by all three suits and built once on first shanten use.
+static SHANTEN_SUIT_SHAPES: OnceLock<Box<[u64]>> = OnceLock::new();
+
+const fn shanten_shape_bit(melds: usize, taatsu: usize, pair: usize) -> u64 {
+    1_u64 << ((melds * 5 + taatsu) * 2 + pair)
+}
+
+const fn shanten_shape_mask(meld_limit: usize, taatsu_limit: usize, pair_limit: usize) -> u64 {
+    let mut mask = 0_u64;
+    let mut melds = 0;
+    while melds < meld_limit {
+        let mut taatsu = 0;
+        while taatsu < taatsu_limit {
+            let mut pair = 0;
+            while pair < pair_limit {
+                mask |= shanten_shape_bit(melds, taatsu, pair);
+                pair += 1;
+            }
+            taatsu += 1;
+        }
+        melds += 1;
+    }
+    mask
+}
+
+const SHANTEN_MELD_ROOM: u64 = shanten_shape_mask(4, 5, 2);
+const SHANTEN_TAATSU_ROOM: u64 = shanten_shape_mask(5, 4, 2);
+const SHANTEN_NO_PAIR: u64 = shanten_shape_mask(5, 5, 1);
 
 /// A named scoring pattern. Composite variants already include the base
 /// patterns named by the rules and are not scored a second time.
@@ -191,6 +220,215 @@ pub struct WinEvaluation {
 pub struct MaxWaitEvaluation {
     pub winning_tile: Tile,
     pub evaluation: WinEvaluation,
+}
+
+/// A conventional structural shanten result for one concealed holding.
+///
+/// `-1` means the holding already contains a winning structure and `0` means
+/// it is waiting for at least one tile. `improving_tiles` contains every tile
+/// kind whose addition strictly lowers `shanten`, without considering how many
+/// physical copies remain unseen.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ShantenAnalysis {
+    pub shanten: i8,
+    pub improving_tiles: u32,
+}
+
+pub const SHANTEN_COMPLETE: i8 = -1;
+pub const SHANTEN_MAX: i8 = 8;
+pub const SHANTEN_TERMINAL: i8 = i8::MAX;
+
+/// Calculates conventional structural shanten and its improving-tile mask.
+///
+/// Standard four-group-and-a-pair hands and this ruleset's seven-pair hands
+/// are considered. A four-of-a-kind contributes two pairs to the latter.
+/// Tiles in `missing_suit` cannot form groups or pairs. Expanded post-win
+/// holdings are accepted, but this function describes the structure already
+/// present in the full holding; it does not calculate distance to an
+/// additional blood-flow win after an earlier structure has been locked.
+pub fn analyze_shanten(
+    counts: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    missing_suit: Option<Suit>,
+) -> ShantenAnalysis {
+    let shanten = evaluate_shanten(counts, melds, missing_suit);
+    let mut improving_tiles = 0_u32;
+    if shanten > SHANTEN_COMPLETE {
+        let mut augmented = *counts;
+        for index in 0..TILE_KIND_COUNT {
+            let tile = Tile::from_index_unchecked(index as u8);
+            if missing_suit == Some(tile.suit()) || counts[index] >= 4 {
+                continue;
+            }
+            augmented[index] += 1;
+            if evaluate_shanten(&augmented, melds, missing_suit) < shanten {
+                improving_tiles |= 1 << index;
+            }
+            augmented[index] = counts[index];
+        }
+    }
+    ShantenAnalysis {
+        shanten,
+        improving_tiles,
+    }
+}
+
+/// Calculates conventional structural shanten in the range `-1..=8`.
+pub fn evaluate_shanten(
+    counts: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    missing_suit: Option<Suit>,
+) -> i8 {
+    if melds.len() > 4
+        || missing_suit.is_some_and(|missing| melds.iter().any(|meld| meld.tile.suit() == missing))
+    {
+        return SHANTEN_MAX;
+    }
+
+    let counts = capped_counts(counts);
+    let standard = standard_shanten(&counts, melds.len(), missing_suit);
+    let seven_pairs = if melds.is_empty() {
+        seven_pairs_shanten(&counts, missing_suit)
+    } else {
+        SHANTEN_MAX
+    };
+    standard
+        .min(seven_pairs)
+        .clamp(SHANTEN_COMPLETE, SHANTEN_MAX)
+}
+
+fn standard_shanten(
+    counts: &[u8; TILE_KIND_COUNT],
+    fixed_melds: usize,
+    missing_suit: Option<Suit>,
+) -> i8 {
+    type Shapes = [[[bool; 2]; 5]; 5];
+
+    let mut combined = Shapes::default();
+    combined[0][0][0] = true;
+    let suit_table = shanten_suit_shapes();
+    for suit in Suit::ALL {
+        let mut suit_shapes = Shapes::default();
+        if missing_suit == Some(suit) {
+            suit_shapes[0][0][0] = true;
+        } else {
+            let start = suit as usize * RANK_COUNT;
+            let state = counts[start..start + RANK_COUNT]
+                .iter()
+                .copied()
+                .zip(POW5)
+                .map(|(count, factor)| usize::from(count) * factor)
+                .sum::<usize>();
+            let mut shapes = suit_table[state];
+            while shapes != 0 {
+                let index = shapes.trailing_zeros() as usize;
+                shapes &= shapes - 1;
+                let pair = index % 2;
+                let remainder = index / 2;
+                let taatsu = remainder % 5;
+                let melds = remainder / 5;
+                suit_shapes[melds][taatsu][pair] = true;
+            }
+        }
+
+        let mut next = Shapes::default();
+        for melds in 0..=4 {
+            for taatsu in 0..=4 {
+                for pair in 0..=1 {
+                    if !combined[melds][taatsu][pair] {
+                        continue;
+                    }
+                    for suit_melds in 0..=4 - melds {
+                        for suit_taatsu in 0..=4 - taatsu {
+                            for suit_pair in 0..=1 - pair {
+                                if suit_shapes[suit_melds][suit_taatsu][suit_pair] {
+                                    next[melds + suit_melds][taatsu + suit_taatsu]
+                                        [pair + suit_pair] = true;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        combined = next;
+    }
+
+    let mut best = SHANTEN_MAX;
+    for (concealed_melds, taatsu_shapes) in combined.iter().enumerate().take(5 - fixed_melds) {
+        for (taatsu, pair_shapes) in taatsu_shapes.iter().enumerate() {
+            for (pair, &is_shape) in pair_shapes.iter().enumerate() {
+                if !is_shape {
+                    continue;
+                }
+                let melds = fixed_melds + concealed_melds;
+                let useful_taatsu = taatsu.min(4 - melds);
+                let shanten = 8 - 2 * melds as i8 - useful_taatsu as i8 - pair as i8;
+                best = best.min(shanten);
+            }
+        }
+    }
+    best
+}
+
+fn shanten_suit_shapes() -> &'static [u64] {
+    SHANTEN_SUIT_SHAPES.get_or_init(|| {
+        let mut table = vec![0_u64; SUIT_STATE_COUNT];
+        table[0] = shanten_shape_bit(0, 0, 0);
+        for state in 1..SUIT_STATE_COUNT {
+            let mut value = state;
+            let mut counts = [0_u8; RANK_COUNT];
+            for count in &mut counts {
+                *count = (value % 5) as u8;
+                value /= 5;
+            }
+
+            let mut shapes = shanten_shape_bit(0, 0, 0);
+            for rank in 0..RANK_COUNT {
+                if counts[rank] >= 3 {
+                    let smaller = state - 3 * POW5[rank];
+                    shapes |= (table[smaller] & SHANTEN_MELD_ROOM) << 10;
+                }
+                if counts[rank] >= 2 {
+                    let smaller = state - 2 * POW5[rank];
+                    shapes |= (table[smaller] & SHANTEN_NO_PAIR) << 1;
+                    shapes |= (table[smaller] & SHANTEN_TAATSU_ROOM) << 2;
+                }
+                if rank + 1 < RANK_COUNT && counts[rank] != 0 && counts[rank + 1] != 0 {
+                    let smaller = state - POW5[rank] - POW5[rank + 1];
+                    shapes |= (table[smaller] & SHANTEN_TAATSU_ROOM) << 2;
+                }
+                if rank + 2 < RANK_COUNT && counts[rank] != 0 && counts[rank + 2] != 0 {
+                    let smaller = state - POW5[rank] - POW5[rank + 2];
+                    shapes |= (table[smaller] & SHANTEN_TAATSU_ROOM) << 2;
+                }
+                if rank + 2 < RANK_COUNT
+                    && counts[rank] != 0
+                    && counts[rank + 1] != 0
+                    && counts[rank + 2] != 0
+                {
+                    let smaller = state - POW5[rank] - POW5[rank + 1] - POW5[rank + 2];
+                    shapes |= (table[smaller] & SHANTEN_MELD_ROOM) << 10;
+                }
+            }
+            table[state] = shapes;
+        }
+        table.into_boxed_slice()
+    })
+}
+
+fn seven_pairs_shanten(counts: &[u8; TILE_KIND_COUNT], missing_suit: Option<Suit>) -> i8 {
+    let mut pairs = 0_i8;
+    let mut pair_slots = 0_i8;
+    for (index, &count) in counts.iter().enumerate() {
+        let tile = Tile::from_index_unchecked(index as u8);
+        if missing_suit == Some(tile.suit()) {
+            continue;
+        }
+        pairs += i8::try_from(count / 2).expect("tile counts are capped at four");
+        pair_slots += i8::try_from(count.div_ceil(2)).expect("tile counts are capped at four");
+    }
+    6 - pairs + (7 - pair_slots).max(0)
 }
 
 /// Returns whether `counts` contains a winning substructure.
