@@ -362,6 +362,32 @@ impl PyBatch {
             .map_err(game_error)
     }
 
+    fn hand_analysis_indices_into<'py>(
+        &self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+        shanten: &Bound<'py, PyArray1<i8>>,
+        improving_tiles: &Bound<'py, PyArray1<u32>>,
+    ) -> PyResult<()> {
+        require_c_contiguous(indices, "indices")?;
+        require_shape(shanten, &[indices.len()], "shanten")?;
+        require_c_contiguous(shanten, "shanten")?;
+        require_shape(improving_tiles, &[indices.len()], "improving_tiles")?;
+        require_c_contiguous(improving_tiles, "improving_tiles")?;
+
+        let indices = try_readonly(indices, "indices")?;
+        let mut shanten = try_readwrite(shanten, "shanten")?;
+        let mut improving_tiles = try_readwrite(improving_tiles, "improving_tiles")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        let shanten = writable_slice(&mut shanten, "shanten")?;
+        let improving_tiles = writable_slice(&mut improving_tiles, "improving_tiles")?;
+        py.detach(|| {
+            self.inner
+                .hand_analysis_indices_into(indices, shanten, improving_tiles)
+        })
+        .map_err(game_error)
+    }
+
     fn events_into<'py>(
         &self,
         py: Python<'py>,
@@ -440,58 +466,11 @@ impl PyBatch {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn step_and_observe_into<'py>(
+    fn step_and_observe_history_into<'py>(
         &mut self,
         py: Python<'py>,
         actions: &Bound<'py, PyArray1<u8>>,
-        records: &Bound<'py, PyArray2<i64>>,
-        mask_words: &Bound<'py, PyArray2<u64>>,
-        tile_obs: &Bound<'py, PyArray3<u8>>,
-        melds: &Bound<'py, PyArray4<u8>>,
-        river: &Bound<'py, PyArray3<u8>>,
-        meta: &Bound<'py, PyArray2<i32>>,
-    ) -> PyResult<()> {
-        let batch_size = self.inner.len();
-        require_shape(actions, &[batch_size], "actions")?;
-        require_c_contiguous(actions, "actions")?;
-        require_shape(records, &[batch_size, STEP_RECORD_WIDTH], "records")?;
-        require_c_contiguous(records, "records")?;
-        require_shape(
-            mask_words,
-            &[batch_size, LEGAL_ACTION_MASK_WORDS],
-            "mask_words",
-        )?;
-        require_c_contiguous(mask_words, "mask_words")?;
-        validate_observation_arrays(batch_size, tile_obs, melds, river, meta)?;
-
-        let actions = try_readonly(actions, "actions")?;
-        let mut records = try_readwrite(records, "records")?;
-        let mut mask_words = try_readwrite(mask_words, "mask_words")?;
-        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
-        let mut melds = try_readwrite(melds, "melds")?;
-        let mut river = try_readwrite(river, "river")?;
-        let mut meta = try_readwrite(meta, "meta")?;
-        let actions = readonly_slice(&actions, "actions")?;
-        let records = writable_slice(&mut records, "records")?;
-        let mask_words = writable_slice(&mut mask_words, "mask_words")?;
-        let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
-        let melds = writable_slice(&mut melds, "melds")?;
-        let river = writable_slice(&mut river, "river")?;
-        let meta = writable_slice(&mut meta, "meta")?;
-
-        py.detach(|| -> Result<(), GameError> {
-            self.inner.step_indices_into(actions, records)?;
-            self.inner.observations_into(tile_obs, melds, river, meta)?;
-            self.inner.legal_action_mask_words_into(mask_words)
-        })
-        .map_err(game_error)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn step_and_observe_events_into<'py>(
-        &mut self,
-        py: Python<'py>,
-        actions: &Bound<'py, PyArray1<u8>>,
+        history_seat_masks: &Bound<'py, PyArray1<u8>>,
         records: &Bound<'py, PyArray2<i64>>,
         mask_words: &Bound<'py, PyArray2<u64>>,
         tile_obs: &Bound<'py, PyArray3<u8>>,
@@ -504,6 +483,8 @@ impl PyBatch {
         let batch_size = self.inner.len();
         require_shape(actions, &[batch_size], "actions")?;
         require_c_contiguous(actions, "actions")?;
+        require_shape(history_seat_masks, &[batch_size], "history_seat_masks")?;
+        require_c_contiguous(history_seat_masks, "history_seat_masks")?;
         require_shape(records, &[batch_size, STEP_RECORD_WIDTH], "records")?;
         require_c_contiguous(records, "records")?;
         require_shape(
@@ -518,6 +499,7 @@ impl PyBatch {
         require_c_contiguous(event_lengths, "event_lengths")?;
 
         let actions = try_readonly(actions, "actions")?;
+        let history_seat_masks = try_readonly(history_seat_masks, "history_seat_masks")?;
         let mut records = try_readwrite(records, "records")?;
         let mut mask_words = try_readwrite(mask_words, "mask_words")?;
         let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
@@ -527,6 +509,7 @@ impl PyBatch {
         let mut events = try_readwrite(events, "events")?;
         let mut event_lengths = try_readwrite(event_lengths, "event_lengths")?;
         let actions = readonly_slice(&actions, "actions")?;
+        let history_seat_masks = readonly_slice(&history_seat_masks, "history_seat_masks")?;
         let records = writable_slice(&mut records, "records")?;
         let mask_words = writable_slice(&mut mask_words, "mask_words")?;
         let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
@@ -537,9 +520,82 @@ impl PyBatch {
         let event_lengths = writable_slice(&mut event_lengths, "event_lengths")?;
 
         py.detach(|| {
-            self.inner.step_indices_observe_events_into(
+            self.inner.step_indices_observe_history_into(
                 actions,
+                history_seat_masks,
                 records,
+                mask_words,
+                tile_obs,
+                melds,
+                river,
+                meta,
+                event_capacity,
+                events,
+                event_lengths,
+            )
+        })
+        .map_err(game_error)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn reset_and_observe_history_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        reset_flags: &Bound<'py, PyArray1<u8>>,
+        seeds: &Bound<'py, PyArray1<u64>>,
+        history_seat_masks: &Bound<'py, PyArray1<u8>>,
+        mask_words: &Bound<'py, PyArray2<u64>>,
+        tile_obs: &Bound<'py, PyArray3<u8>>,
+        melds: &Bound<'py, PyArray4<u8>>,
+        river: &Bound<'py, PyArray3<u8>>,
+        meta: &Bound<'py, PyArray2<i32>>,
+        events: &Bound<'py, PyArray3<i32>>,
+        event_lengths: &Bound<'py, PyArray1<u16>>,
+    ) -> PyResult<()> {
+        let batch_size = self.inner.len();
+        require_shape(reset_flags, &[batch_size], "reset_flags")?;
+        require_c_contiguous(reset_flags, "reset_flags")?;
+        require_shape(seeds, &[batch_size], "seeds")?;
+        require_c_contiguous(seeds, "seeds")?;
+        require_shape(history_seat_masks, &[batch_size], "history_seat_masks")?;
+        require_c_contiguous(history_seat_masks, "history_seat_masks")?;
+        require_shape(
+            mask_words,
+            &[batch_size, LEGAL_ACTION_MASK_WORDS],
+            "mask_words",
+        )?;
+        require_c_contiguous(mask_words, "mask_words")?;
+        validate_observation_arrays(batch_size, tile_obs, melds, river, meta)?;
+        let event_capacity = validate_batch_event_array(batch_size, events, "events")?;
+        require_shape(event_lengths, &[batch_size], "event_lengths")?;
+        require_c_contiguous(event_lengths, "event_lengths")?;
+
+        let reset_flags = try_readonly(reset_flags, "reset_flags")?;
+        let seeds = try_readonly(seeds, "seeds")?;
+        let history_seat_masks = try_readonly(history_seat_masks, "history_seat_masks")?;
+        let mut mask_words = try_readwrite(mask_words, "mask_words")?;
+        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
+        let mut melds = try_readwrite(melds, "melds")?;
+        let mut river = try_readwrite(river, "river")?;
+        let mut meta = try_readwrite(meta, "meta")?;
+        let mut events = try_readwrite(events, "events")?;
+        let mut event_lengths = try_readwrite(event_lengths, "event_lengths")?;
+        let reset_flags = readonly_slice(&reset_flags, "reset_flags")?;
+        let seeds = readonly_slice(&seeds, "seeds")?;
+        let history_seat_masks = readonly_slice(&history_seat_masks, "history_seat_masks")?;
+        let mask_words = writable_slice(&mut mask_words, "mask_words")?;
+        let tile_obs = writable_slice(&mut tile_obs, "tile_obs")?;
+        let melds = writable_slice(&mut melds, "melds")?;
+        let river = writable_slice(&mut river, "river")?;
+        let meta = writable_slice(&mut meta, "meta")?;
+        let events = writable_slice(&mut events, "events")?;
+        let event_lengths = writable_slice(&mut event_lengths, "event_lengths")?;
+
+        py.detach(|| {
+            self.inner.reset_observe_history_into(
+                reset_flags,
+                seeds,
+                history_seat_masks,
                 mask_words,
                 tile_obs,
                 melds,

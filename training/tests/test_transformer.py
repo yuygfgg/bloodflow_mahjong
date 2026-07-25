@@ -71,6 +71,23 @@ def test_default_model_stays_in_the_planned_size() -> None:
     assert 3_000_000 <= parameters <= 5_000_000
 
 
+def test_history_uses_rope_and_requires_even_head_dimensions() -> None:
+    model = BloodFlowTransformer(config())
+    assert not hasattr(model.history_encoder, "position_embedding")
+    assert all(
+        hasattr(block.attention, "rope_inverse")
+        for block in model.history_encoder.blocks
+    )
+    with pytest.raises(ValueError, match="even attention head dimension"):
+        TransformerConfig(
+            d_model=30,
+            num_heads=6,
+            static_layers=1,
+            history_layers=1,
+            ffn_dim=60,
+        )
+
+
 def test_transformer_forward_backward_and_masking() -> None:
     model = BloodFlowTransformer(config())
     model.train()
@@ -118,6 +135,20 @@ def test_cached_history_matches_full_history() -> None:
     )
     torch.testing.assert_close(cached.logits, full.logits, atol=1e-5, rtol=1e-5)
     torch.testing.assert_close(cached.value, full.value, atol=1e-5, rtol=1e-5)
+
+
+def test_right_padding_can_be_safely_trimmed_before_forward() -> None:
+    model = BloodFlowTransformer(config()).eval()
+    tile_obs, melds, meta, events, lengths, legal = state(batch=2, history=7)
+    padded = torch.zeros((2, 32, 8), dtype=torch.int32)
+    padded[:, :7] = events
+    with torch.no_grad():
+        trimmed = model(tile_obs, melds, meta, events, lengths, legal)
+        masked_padding = model(tile_obs, melds, meta, padded, lengths, legal)
+    torch.testing.assert_close(
+        trimmed.history_embedding, masked_padding.history_embedding, atol=1e-5, rtol=1e-5
+    )
+    torch.testing.assert_close(trimmed.logits, masked_padding.logits, atol=1e-5, rtol=1e-5)
 
 
 def test_empty_history_length_uses_finite_learned_summary() -> None:

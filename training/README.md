@@ -1,9 +1,9 @@
 # Transformer training components
 
 The first model is deliberately narrow: a 48-token bidirectional encoder for
-the current actor-visible state, a 192-event causal history encoder, and fully
-connected actor/distributional-critic heads. It does not depend on a ResNet or
-behavior cloning.
+the current actor-visible state, a 192-event causal history encoder with
+standard RoPE on Q/K, and fully connected actor/distributional-critic heads. It
+does not depend on a ResNet or behavior cloning.
 
 ```python
 import torch
@@ -19,8 +19,15 @@ actions = torch.distributions.Categorical(logits=output.logits).sample()
 append viewer-scoped events to per-layer K/V tensors. The rollout collector
 uses grouped `(environment, absolute-seat)` caches for both learner and frozen
 opponent inference, and falls back to a full rebuild after reset or a sliding
-window change. A cache is valid only for one game, one fixed viewer, and one
-fixed model version.
+window change. Exact cache-shape groups smaller than 32 rows are merged into a
+single padded full forward instead of launching many small GPU kernels. A cache
+is valid only for one game, one fixed viewer, and one fixed model version; all
+rollout K/V tensors are released before PPO starts.
+
+History positions use standard interleaved RoPE with `theta=10_000`. Full
+forwards rotate positions `0..L-1`; cached appends rotate the absolute suffix
+starting at the cached length. The cached/full equivalence test covers this
+position offset path.
 
 Run the unit and engine integration tests with:
 
@@ -43,20 +50,24 @@ Start the default 24-hour run on one GPU with:
 python -m training.train \
   --device cuda \
   --hours 24 \
-  --total-transitions 100000000 \
+  --total-transitions 200000000 \
   --output-dir runs/transformer
 ```
 
 `metrics.jsonl` records the learning rate, curriculum stage, the four policy
 family assignment counts across the three non-learner seats, active snapshot,
-PPO statistics, and fixed-rule evaluation.
+PPO statistics, rollout/PPO/evaluation wall times, cache hit/full/group counts,
+and fixed-rule evaluation.
 `latest.pt` contains the learner, optimizer, RNG state, and retained frozen
 opponent snapshots, and can be resumed with `--resume runs/transformer/latest.pt`.
 
-The three non-learner seats are sampled independently.  The default transition
-schedule is `bootstrap` before 10%, `mixed` from 10% through 35%, `league` from
-35% through 75%, and pure Transformer `self-play` after 75%; see `TRAINING.md`
-for exact policy probabilities and snapshot timing.
+The three non-learner seats are sampled independently.  Opponent stages are
+gated by repeated rule-anchor evaluations rather than transition percentages:
+the learner stays in `bootstrap` below 70% first-place rate, enters `mixed`
+between 70% and 80%, and enters the rule-anchored `league` stage at 80%.  The
+league stage still retains rule opponents; it does not silently become pure
+self-play.  See `TRAINING.md` for exact policy probabilities and snapshot
+timing.
 
 On the local RTX 5080, the smoke benchmark is:
 

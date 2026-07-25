@@ -119,11 +119,29 @@ def test_rule_and_hand_analysis_buffers_validate_shape_and_dtype() -> None:
         batch.hand_analysis_into(np.empty(8, dtype=np.uint8), improving_tiles)
 
 
+def test_indexed_hand_analysis_matches_full_batch() -> None:
+    batch = bm.Batch(128, seed=31)
+    full_shanten = np.empty(128, dtype=np.int8)
+    full_improving = np.empty(128, dtype=np.uint32)
+    batch.hand_analysis_into(full_shanten, full_improving)
+    indices = np.asarray([0, 7, 63, 127], dtype=np.uint32)
+    shanten = np.empty(len(indices), dtype=np.int8)
+    improving = np.empty(len(indices), dtype=np.uint32)
+
+    batch.hand_analysis_indices_into(indices, shanten, improving)
+
+    np.testing.assert_array_equal(shanten, full_shanten[indices])
+    np.testing.assert_array_equal(improving, full_improving[indices])
+
+
 def test_observe_and_combined_step_fill_caller_buffers() -> None:
     size = 16
     batch = bm.Batch(size, seed=13)
     records, masks, tile_obs, melds, river, meta = buffers(size)
     actions = np.empty(size, dtype=np.uint8)
+    history_seat_masks = np.full(size, 0x0F, dtype=np.uint8)
+    events = np.empty((size, 16, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    event_lengths = np.empty(size, dtype=np.uint16)
 
     batch.observe_into(tile_obs, melds, river, meta)
     assert np.all(tile_obs[:, 0].sum(axis=1) == 14)
@@ -132,9 +150,21 @@ def test_observe_and_combined_step_fill_caller_buffers() -> None:
     batch.legal_action_masks_into(masks)
     for index, words in enumerate(masks):
         actions[index] = first_legal_action(words)
-    batch.step_and_observe_into(actions, records, masks, tile_obs, melds, river, meta)
+    batch.step_and_observe_history_into(
+        actions,
+        history_seat_masks,
+        records,
+        masks,
+        tile_obs,
+        melds,
+        river,
+        meta,
+        events,
+        event_lengths,
+    )
     assert np.all(meta[:, 0] == bm.PHASE_EXCHANGE)
     assert np.all(records[:, 9] == 0)
+    assert np.all(event_lengths >= 2)
 
 
 def test_combined_step_rejects_overlapping_output_views() -> None:
@@ -142,6 +172,9 @@ def test_combined_step_rejects_overlapping_output_views() -> None:
     batch = bm.Batch(size, seed=3)
     records, masks, tile_obs, _, river, meta = buffers(size)
     actions = np.empty(size, dtype=np.uint8)
+    history_seat_masks = np.full(size, 0x0F, dtype=np.uint8)
+    events = np.empty((size, 16, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    event_lengths = np.empty(size, dtype=np.uint16)
     batch.legal_action_masks_into(masks)
     for index, words in enumerate(masks):
         actions[index] = first_legal_action(words)
@@ -155,18 +188,73 @@ def test_combined_step_rejects_overlapping_output_views() -> None:
         size, bm.PLAYER_COUNT, bm.MELD_SLOTS, bm.MELD_FIELDS
     )
     with pytest.raises(ValueError, match="overlaps"):
-        batch.step_and_observe_into(
+        batch.step_and_observe_history_into(
             actions,
+            history_seat_masks,
             records,
             masks,
             overlapping_tile_obs,
             overlapping_melds,
             river,
             meta,
+            events,
+            event_lengths,
         )
     after = np.empty_like(masks)
     batch.legal_action_masks_into(after)
     np.testing.assert_array_equal(after, before)
+
+
+def test_history_selection_and_selective_reset_touch_only_requested_rows() -> None:
+    size = 16
+    batch = bm.Batch(size, seed=17)
+    records, masks, tile_obs, melds, river, meta = buffers(size)
+    actions = np.empty(size, dtype=np.uint8)
+    events = np.empty((size, 16, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+    event_lengths = np.empty(size, dtype=np.uint16)
+    history_seat_masks = np.zeros(size, dtype=np.uint8)
+    history_seat_masks[1::2] = 0x0F
+    batch.legal_action_masks_into(masks)
+    for index, words in enumerate(masks):
+        actions[index] = first_legal_action(words)
+
+    batch.step_and_observe_history_into(
+        actions,
+        history_seat_masks,
+        records,
+        masks,
+        tile_obs,
+        melds,
+        river,
+        meta,
+        events,
+        event_lengths,
+    )
+    assert np.all(event_lengths[::2] == 0)
+    assert np.all(event_lengths[1::2] >= 2)
+
+    before_tile_obs = tile_obs.copy()
+    before_meta = meta.copy()
+    reset_flags = np.zeros(size, dtype=np.uint8)
+    reset_flags[[1, 3]] = 1
+    seeds = np.arange(size, dtype=np.uint64) + 100
+    batch.reset_and_observe_history_into(
+        reset_flags,
+        seeds,
+        history_seat_masks,
+        masks,
+        tile_obs,
+        melds,
+        river,
+        meta,
+        events,
+        event_lengths,
+    )
+    untouched = np.asarray([row for row in range(size) if row not in (1, 3)])
+    np.testing.assert_array_equal(tile_obs[untouched], before_tile_obs[untouched])
+    np.testing.assert_array_equal(meta[untouched], before_meta[untouched])
+    assert np.all(meta[[1, 3], 0] == bm.PHASE_EXCHANGE)
+    assert np.all(event_lengths[[1, 3]] == 1)
 
 
 def test_reset_many_validates_all_indices_before_mutating() -> None:
@@ -262,7 +350,7 @@ def test_game_event_history_and_step_delta_are_zero_copy_buffers() -> None:
     assert delta[0, 6] == bm.PHASE_EXCHANGE
 
 
-def test_batch_event_history_and_combined_step_delta() -> None:
+def test_batch_event_history_and_combined_step_history() -> None:
     size = 16
     capacity = 16
     batch = bm.Batch(size, seed=77)
@@ -279,8 +367,10 @@ def test_batch_event_history_and_combined_step_delta() -> None:
         actions[index] = first_legal_action(words)
     events = np.empty((size, capacity, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
     event_lengths = np.empty(size, dtype=np.uint16)
-    batch.step_and_observe_events_into(
+    history_seat_masks = np.full(size, 0x0F, dtype=np.uint8)
+    batch.step_and_observe_history_into(
         actions,
+        history_seat_masks,
         records,
         masks,
         tile_obs,
@@ -290,8 +380,9 @@ def test_batch_event_history_and_combined_step_delta() -> None:
         events,
         event_lengths,
     )
-    assert np.all(event_lengths >= 1)
-    assert np.all(events[:, 0, 0] == bm.EventKind.ACTION)
+    assert np.all(event_lengths >= 2)
+    assert np.all(events[:, 0, 0] == bm.EventKind.GAME_START)
+    assert np.all(events[np.arange(size), event_lengths - 1, 0] == bm.EventKind.ACTION)
 
 
 def test_event_buffers_validate_shape_dtype_and_capacity() -> None:

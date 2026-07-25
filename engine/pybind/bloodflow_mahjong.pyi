@@ -133,6 +133,12 @@ class Batch:
         shanten: npt.NDArray[np.int8],
         improving_tiles: npt.NDArray[np.uint32],
     ) -> None: ...
+    def hand_analysis_indices_into(
+        self,
+        indices: npt.NDArray[np.uint32],
+        shanten: npt.NDArray[np.int8],
+        improving_tiles: npt.NDArray[np.uint32],
+    ) -> None: ...
     def events_into(
         self,
         events: npt.NDArray[np.int32],
@@ -155,20 +161,24 @@ class Batch:
         river: npt.NDArray[np.uint8],
         meta: npt.NDArray[np.int32],
     ) -> None: ...
-    def step_and_observe_into(
+    def step_and_observe_history_into(
         self,
         actions: npt.NDArray[np.uint8],
+        history_seat_masks: npt.NDArray[np.uint8],
         records: npt.NDArray[np.int64],
         mask_words: npt.NDArray[np.uint64],
         tile_obs: npt.NDArray[np.uint8],
         melds: npt.NDArray[np.uint8],
         river: npt.NDArray[np.uint8],
         meta: npt.NDArray[np.int32],
+        events: npt.NDArray[np.int32],
+        event_lengths: npt.NDArray[np.uint16],
     ) -> None: ...
-    def step_and_observe_events_into(
+    def reset_and_observe_history_into(
         self,
-        actions: npt.NDArray[np.uint8],
-        records: npt.NDArray[np.int64],
+        reset_flags: npt.NDArray[np.uint8],
+        seeds: npt.NDArray[np.uint64],
+        history_seat_masks: npt.NDArray[np.uint8],
         mask_words: npt.NDArray[np.uint64],
         tile_obs: npt.NDArray[np.uint8],
         melds: npt.NDArray[np.uint8],

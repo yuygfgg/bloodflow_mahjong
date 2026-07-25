@@ -37,18 +37,32 @@ def run_iterations(
     melds: np.ndarray,
     river: np.ndarray,
     meta: np.ndarray,
+    events: np.ndarray,
+    event_lengths: np.ndarray,
+    history_seat_masks: np.ndarray,
     terminal: np.ndarray,
+    reset_flags: np.ndarray,
     all_indices: np.ndarray,
     reset_indices: np.ndarray,
     reset_ordinals: np.ndarray,
     reset_seeds: np.ndarray,
+    reset_seed_buffer: np.ndarray,
     next_game: int,
 ) -> tuple[int, int]:
     completed_games = 0
     for _ in range(iterations):
         choose_first_legal(masks, actions)
-        batch.step_and_observe_into(
-            actions, records, masks, tile_obs, melds, river, meta
+        batch.step_and_observe_history_into(
+            actions,
+            history_seat_masks,
+            records,
+            masks,
+            tile_obs,
+            melds,
+            river,
+            meta,
+            events,
+            event_lengths,
         )
 
         np.equal(records[:, 11], 1, out=terminal)
@@ -60,9 +74,20 @@ def run_iterations(
         np.add(reset_ordinals[:reset_count], next_game, out=reset_seeds[:reset_count])
         np.multiply(reset_seeds[:reset_count], SEED_STEP, out=reset_seeds[:reset_count])
         np.add(reset_seeds[:reset_count], RESET_SEED, out=reset_seeds[:reset_count])
-        batch.reset_many(reset_indices[:reset_count], reset_seeds[:reset_count])
-        batch.observe_into(tile_obs, melds, river, meta)
-        batch.legal_action_masks_into(masks)
+        reset_flags[:] = terminal
+        reset_seed_buffer[reset_indices[:reset_count]] = reset_seeds[:reset_count]
+        batch.reset_and_observe_history_into(
+            reset_flags,
+            reset_seed_buffer,
+            history_seat_masks,
+            masks,
+            tile_obs,
+            melds,
+            river,
+            meta,
+            events,
+            event_lengths,
+        )
         next_game += reset_count
         completed_games += reset_count
 
@@ -93,11 +118,18 @@ def main() -> None:
         (args.batch_size, bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8
     )
     meta = np.empty((args.batch_size, bm.META_OBSERVATION_WIDTH), dtype=np.int32)
+    events = np.empty(
+        (args.batch_size, 192, bm.EVENT_RECORD_WIDTH), dtype=np.int32
+    )
+    event_lengths = np.empty(args.batch_size, dtype=np.uint16)
+    history_seat_masks = np.full(args.batch_size, 0x0F, dtype=np.uint8)
     terminal = np.empty(args.batch_size, dtype=np.bool_)
+    reset_flags = np.zeros(args.batch_size, dtype=np.uint8)
     all_indices = np.arange(args.batch_size, dtype=np.uint32)
     reset_indices = np.empty(args.batch_size, dtype=np.uint32)
     reset_ordinals = np.arange(args.batch_size, dtype=np.uint64)
     reset_seeds = np.empty(args.batch_size, dtype=np.uint64)
+    reset_seed_buffer = np.zeros(args.batch_size, dtype=np.uint64)
 
     batch.observe_into(tile_obs, melds, river, meta)
     batch.legal_action_masks_into(masks)
@@ -111,11 +143,16 @@ def main() -> None:
         melds,
         river,
         meta,
+        events,
+        event_lengths,
+        history_seat_masks,
         terminal,
+        reset_flags,
         all_indices,
         reset_indices,
         reset_ordinals,
         reset_seeds,
+        reset_seed_buffer,
         args.batch_size,
     )
 
@@ -134,11 +171,16 @@ def main() -> None:
         melds,
         river,
         meta,
+        events,
+        event_lengths,
+        history_seat_masks,
         terminal,
+        reset_flags,
         all_indices,
         reset_indices,
         reset_ordinals,
         reset_seeds,
+        reset_seed_buffer,
         args.batch_size,
     )
 

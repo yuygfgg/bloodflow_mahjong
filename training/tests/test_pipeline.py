@@ -53,13 +53,10 @@ def test_four_opponents_are_assigned_per_seat_at_schedule_boundaries() -> None:
     pool = OpponentPool(config, seed=19)
     learner_seats = np.array([0, 1, 2, 3] * 64, dtype=np.uint8)
 
-    assert pool.stage(0.0) == "bootstrap"
-    assert pool.stage(config.rule_only_fraction) == "mixed"
-    assert pool.stage(config.mixed_opponent_fraction) == "league"
-    assert pool.stage(config.self_play_fraction) == "self_play"
-    np.testing.assert_allclose(pool.probabilities(0.0), [0.30, 0.50, 0.20, 0.0])
+    assert pool.stage() == "bootstrap"
+    np.testing.assert_allclose(pool.probabilities(), [0.30, 0.50, 0.20, 0.0])
 
-    bootstrap = pool.assign_seats(learner_seats, 0.0)
+    bootstrap = pool.assign_seats(learner_seats)
     assert bootstrap.shape == (len(learner_seats), 4)
     assert np.all(bootstrap[np.arange(len(learner_seats)), learner_seats] == -1)
     assert set(np.unique(bootstrap[bootstrap >= 0])) == {
@@ -69,25 +66,33 @@ def test_four_opponents_are_assigned_per_seat_at_schedule_boundaries() -> None:
     }
 
     pool.set_frozen(tiny_model())
+    for _ in range(config.rule_gate_consecutive_evals):
+        pool.update_rule_evaluation({"first_rate": 0.70})
+    assert pool.stage() == "mixed"
     np.testing.assert_allclose(
-        pool.probabilities(config.rule_only_fraction), [0.10, 0.35, 0.20, 0.35]
+        pool.probabilities(), [0.10, 0.35, 0.20, 0.35]
     )
+    for _ in range(config.rule_gate_consecutive_evals):
+        pool.update_rule_evaluation({"first_rate": 0.80})
+    assert pool.stage() == "league"
     np.testing.assert_allclose(
-        pool.probabilities(config.mixed_opponent_fraction), [0.05, 0.15, 0.15, 0.65]
+        pool.probabilities(), [0.05, 0.15, 0.15, 0.65]
     )
-    np.testing.assert_allclose(
-        pool.probabilities(config.self_play_fraction), [0.0, 0.0, 0.0, 1.0]
-    )
-    league = pool.assign_seats(learner_seats, 1.0)
+    league = pool.assign_seats(learner_seats)
     assert OpponentPool.FROZEN_TRANSFORMER in league
-    assert np.all(league[league >= 0] == OpponentPool.FROZEN_TRANSFORMER)
+    assert set(np.unique(league[league >= 0])) <= {
+        OpponentPool.RANDOM_HU,
+        OpponentPool.RULE_FAST,
+        OpponentPool.RULE_SAFE,
+        OpponentPool.FROZEN_TRANSFORMER,
+    }
 
 
 def test_rollout_has_legal_finite_transitions_and_mixed_seat_counts() -> None:
     config = tiny_ppo()
     model = tiny_model()
     collector = RolloutCollector(config, torch.device("cpu"), seed=23)
-    rollout = collector.collect(model, config.rollout_transitions, progress=0.0)
+    rollout = collector.collect(model, config.rollout_transitions)
     storage = rollout.storage
     slots = rollout.indices
 
@@ -100,6 +105,16 @@ def test_rollout_has_legal_finite_transitions_and_mixed_seat_counts() -> None:
     assert np.isfinite(storage.reward[slots]).all()
     assert np.isfinite(rollout.advantages[slots]).all()
     assert np.isfinite(rollout.returns[slots]).all()
+
+
+def test_rollout_can_disable_auxiliary_labels() -> None:
+    config = tiny_ppo(rollout_transitions=8)
+    collector = RolloutCollector(config, torch.device("cpu"), seed=24)
+    rollout = collector.collect(tiny_model(), config.rollout_transitions, collect_auxiliary=False)
+
+    assert len(rollout) == config.rollout_transitions
+    assert np.all(rollout.storage.shanten[rollout.indices] == 127)
+    assert np.all(rollout.storage.improving[rollout.indices] == 0)
 
 
 def test_gae_keeps_environment_reward_streams_separate() -> None:
@@ -128,7 +143,7 @@ def test_rollout_cache_append_matches_full_history() -> None:
     buffers.refresh()
     buffers.events[0, :3] = np.arange(24, dtype=np.int32).reshape(3, 8)
     buffers.event_lengths[0] = 3
-    cache = HistoryCacheStore(max_history=192)
+    cache = HistoryCacheStore(max_history=192, min_cache_batch=1)
 
     cached_first = infer_actions(
         model,
@@ -167,6 +182,8 @@ def test_rollout_cache_append_matches_full_history() -> None:
     )
     np.testing.assert_array_equal(cached_append[0], full_append[0])
     np.testing.assert_allclose(cached_append[1:], full_append[1:], rtol=1e-5, atol=1e-5)
+    assert cache.statistics()["hit_rows"] == 1
+    assert cache.statistics()["cached_groups"] == 2
 
 
 def test_ppo_update_changes_parameters() -> None:
@@ -174,7 +191,7 @@ def test_ppo_update_changes_parameters() -> None:
     config = tiny_ppo()
     model = tiny_model()
     collector = RolloutCollector(config, torch.device("cpu"), seed=31)
-    rollout = collector.collect(model, config.rollout_transitions, progress=0.0)
+    rollout = collector.collect(model, config.rollout_transitions)
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     before = model.actor[-1].weight.detach().clone()
 
@@ -191,8 +208,10 @@ def test_checkpoint_restores_model_optimizer_and_opponent_snapshots(tmp_path) ->
     model = tiny_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     pool = OpponentPool(config, seed=37)
-    pool.refresh_snapshot(model, torch.device("cpu"), progress=0.6)
-    pool.refresh_snapshot(model, torch.device("cpu"), progress=0.7)
+    for _ in range(config.rule_gate_consecutive_evals):
+        pool.update_rule_evaluation({"first_rate": 0.70})
+    pool.refresh_snapshot(model, torch.device("cpu"))
+    pool.refresh_snapshot(model, torch.device("cpu"))
     path = tmp_path / "checkpoint.pt"
     save_checkpoint(path, model, optimizer, 7, 1234, config, pool)
 

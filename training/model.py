@@ -29,6 +29,7 @@ class TransformerConfig:
     ffn_dim: int = 768
     dropout: float = 0.0
     max_history: int = 192
+    rope_theta: float = 10_000.0
     value_atoms: int = 129
     value_min: float = -4.0
     value_max: float = 4.0
@@ -36,12 +37,16 @@ class TransformerConfig:
     def __post_init__(self) -> None:
         if self.d_model % self.num_heads != 0:
             raise ValueError("d_model must be divisible by num_heads")
+        if (self.d_model // self.num_heads) % 2 != 0:
+            raise ValueError("RoPE requires an even attention head dimension")
         if self.static_layers <= 0 or self.history_layers <= 0:
             raise ValueError("both encoders need at least one layer")
         if self.max_history <= 0 or self.value_atoms < 2:
             raise ValueError("max_history and value_atoms must be positive")
         if self.value_min >= self.value_max:
             raise ValueError("value_min must be less than value_max")
+        if self.rope_theta <= 0:
+            raise ValueError("rope_theta must be positive")
 
 
 @dataclass(frozen=True)
@@ -109,12 +114,32 @@ class SelfAttention(nn.Module):
         self.num_heads = config.num_heads
         self.head_dim = config.d_model // config.num_heads
         self.dropout = config.dropout
+        inverse = torch.arange(0, self.head_dim, 2, dtype=torch.float32)
+        inverse = 1.0 / (config.rope_theta ** (inverse / self.head_dim))
+        self.register_buffer("rope_inverse", inverse, persistent=False)
+        positions = torch.arange(config.max_history, dtype=torch.float32)
+        angles = positions[:, None] * inverse[None, :]
+        self.register_buffer("rope_cos", angles.cos(), persistent=False)
+        self.register_buffer("rope_sin", angles.sin(), persistent=False)
         self.qkv = nn.Linear(config.d_model, config.d_model * 3, bias=False)
         self.output = nn.Linear(config.d_model, config.d_model, bias=False)
 
     def _split_heads(self, tensor: Tensor) -> Tensor:
         batch, length, _ = tensor.shape
         return tensor.view(batch, length, self.num_heads, self.head_dim).transpose(1, 2)
+
+    def _apply_rope(self, tensor: Tensor, positions: Tensor) -> Tensor:
+        if positions.ndim != 1 or positions.shape[0] != tensor.shape[2]:
+            raise ValueError("RoPE positions must have shape [query_length]")
+        cosine = self.rope_cos.index_select(0, positions).to(tensor.dtype)
+        sine = self.rope_sin.index_select(0, positions).to(tensor.dtype)
+        cosine = cosine[None, None, :, :]
+        sine = sine[None, None, :, :]
+        even = tensor[..., 0::2]
+        odd = tensor[..., 1::2]
+        return torch.stack(
+            (even * cosine - odd * sine, even * sine + odd * cosine), dim=-1
+        ).flatten(-2)
 
     def forward(
         self,
@@ -123,11 +148,16 @@ class SelfAttention(nn.Module):
         causal: bool,
         key_valid: Tensor | None = None,
         past: LayerKV | None = None,
+        positions: Tensor | None = None,
     ) -> tuple[Tensor, LayerKV]:
         query, key, value = self.qkv(inputs).chunk(3, dim=-1)
         query = self._split_heads(query)
         key = self._split_heads(key)
         value = self._split_heads(value)
+
+        if positions is not None:
+            query = self._apply_rope(query, positions)
+            key = self._apply_rope(key, positions)
 
         past_length = 0
         if past is not None:
@@ -191,12 +221,14 @@ class TransformerBlock(nn.Module):
         causal: bool,
         key_valid: Tensor | None = None,
         past: LayerKV | None = None,
+        positions: Tensor | None = None,
     ) -> tuple[Tensor, LayerKV]:
         attended, present = self.attention(
             self.attention_norm(inputs),
             causal=causal,
             key_valid=key_valid,
             past=past,
+            positions=positions,
         )
         hidden = inputs + attended
         return hidden + self.ffn(self.ffn_norm(hidden)), present
@@ -266,7 +298,7 @@ class StaticStateEncoder(nn.Module):
             + self.reaction_embedding(flags)
             + self.binary_embedding(meta[:, 6].long().clamp(0, 1))
             + self.binary_embedding(meta[:, 28].long().clamp(0, 1))
-            + self.global_numeric(numeric)
+            + self.global_numeric(numeric.to(self.global_numeric.weight.dtype))
             + self.token_type_embedding.weight[0]
         )
 
@@ -312,7 +344,7 @@ class StaticStateEncoder(nn.Module):
             + self.binary_embedding(dealer.long())
             + self.optional_suit_embedding(missing)
             + self.binary_embedding(won)
-            + self.player_numeric(numeric)
+            + self.player_numeric(numeric.to(self.player_numeric.weight.dtype))
             + self.token_type_embedding.weight[2]
         )
 
@@ -370,7 +402,6 @@ class HistoryEncoder(nn.Module):
         self.seat_embedding = nn.Embedding(PLAYER_COUNT + 1, width)
         self.tile_embedding = nn.Embedding(TILE_KIND_COUNT + 1, width)
         self.flags_embedding = nn.Embedding(256, width)
-        self.position_embedding = nn.Embedding(config.max_history, width)
         self.numeric = nn.Linear(2, width, bias=False)
         self.blocks = nn.ModuleList(
             TransformerBlock(config) for _ in range(config.history_layers)
@@ -378,7 +409,7 @@ class HistoryEncoder(nn.Module):
         self.output_norm = RMSNorm(width)
         self.empty_summary = nn.Parameter(torch.zeros(width))
 
-    def _embed(self, events: Tensor, positions: Tensor) -> Tensor:
+    def _embed(self, events: Tensor) -> Tensor:
         kind = events[:, :, 0].long().clamp(0, self.EVENT_KIND_COUNT - 1)
         actor = _optional_index(events[:, :, 1], PLAYER_COUNT, PLAYER_COUNT - 1)
         target = _optional_index(events[:, :, 2], PLAYER_COUNT, PLAYER_COUNT - 1)
@@ -393,21 +424,22 @@ class HistoryEncoder(nn.Module):
             + self.seat_embedding(target)
             + self.tile_embedding(tile)
             + self.flags_embedding(flags)
-            + self.position_embedding(positions)[None, :, :]
-            + self.numeric(values)
+            + self.numeric(values.to(self.numeric.weight.dtype))
         )
 
     def forward(self, events: Tensor, lengths: Tensor) -> Tensor:
         _validate_history_inputs(events, lengths, self.config.max_history)
         batch, length, _ = events.shape
         positions = torch.arange(length, device=events.device)
-        hidden = self._embed(events, positions)
+        hidden = self._embed(events)
         key_valid = positions[None, :] < lengths[:, None]
         if length:
             empty_rows = lengths == 0
             key_valid[:, 0] |= empty_rows
         for block in self.blocks:
-            hidden, _ = block(hidden, causal=True, key_valid=key_valid)
+            hidden, _ = block(
+                hidden, causal=True, key_valid=key_valid, positions=positions
+            )
         hidden = self.output_norm(hidden)
         indices = (lengths.long() - 1).clamp_min(0)
         summary = hidden[torch.arange(batch, device=events.device), indices]
@@ -442,11 +474,13 @@ class HistoryEncoder(nn.Module):
             past_length + new_events.shape[1],
             device=new_events.device,
         )
-        hidden = self._embed(new_events, positions)
+        hidden = self._embed(new_events)
         present_layers: list[LayerKV] = []
         for index, block in enumerate(self.blocks):
             past = None if cache is None else cache.layers[index]
-            hidden, present = block(hidden, causal=True, past=past)
+            hidden, present = block(
+                hidden, causal=True, past=past, positions=positions
+            )
             present_layers.append(present)
         summary = self.output_norm(hidden[:, -1])
         present_cache = HistoryKVCache(
@@ -581,5 +615,12 @@ def _validate_history_inputs(events: Tensor, lengths: Tensor, maximum: int) -> N
         raise ValueError("events must allocate at least one history slot")
     if lengths.shape != (events.shape[0],):
         raise ValueError("event_lengths must have shape [batch]")
-    if torch.any(lengths < 0) or torch.any(lengths > events.shape[1]):
-        raise ValueError("event_lengths contain an out-of-range value")
+    # Keep validation on the device.  Converting torch.any(...) to a Python
+    # bool here synchronizes the CUDA stream on every model forward.
+    torch._assert_async(
+        (lengths >= 0).all(), "event_lengths contain an out-of-range value"
+    )
+    torch._assert_async(
+        (lengths <= events.shape[1]).all(),
+        "event_lengths contain an out-of-range value",
+    )

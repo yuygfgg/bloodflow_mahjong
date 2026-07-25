@@ -529,7 +529,10 @@ impl Game {
                 let player = &self.players[actor.index()];
                 legal.can_hu = can_hu;
                 legal.discard_mask = self.legal_discard_mask(actor);
-                if player.meld_count < 4 && origin != TurnOrigin::AfterPong {
+                // After a player has won, only a self-drawn fourth tile for
+                // an existing pong may be used as an added kong.  Concealed
+                // kongs are no longer legal for that player.
+                if !player.has_won && player.meld_count < 4 && origin != TurnOrigin::AfterPong {
                     for index in 0..TILE_KIND_COUNT {
                         let tile = Tile::from_index_unchecked(index as u8);
                         if player.missing == Some(tile.suit()) {
@@ -557,7 +560,7 @@ impl Game {
             }
             Stage::MeldResponse { tile, .. } => {
                 let player = &self.players[decision.actor.index()];
-                legal.can_pong = player.meld_count < 4 && player.unlocked_count(tile) >= 2;
+                legal.can_pong = self.can_pong(decision.actor, tile);
                 legal.can_exposed_kong =
                     player.meld_count < 4 && player.concealed[tile.index()] >= 3;
                 legal.can_pass = true;
@@ -1265,7 +1268,7 @@ impl Game {
     ) -> Result<(), GameError> {
         let actor = first_seat_in_mask(source, remaining).ok_or(GameError::InvalidAction)?;
         let player = &self.players[actor.index()];
-        let can_pong = player.meld_count < 4 && player.unlocked_count(tile) >= 2;
+        let can_pong = self.can_pong(actor, tile);
         let can_kong = player.meld_count < 4 && player.concealed[tile.index()] >= 3;
         match action {
             Action::Pong if can_pong => return self.pong(actor, source, tile),
@@ -1362,6 +1365,19 @@ impl Game {
         Ok(())
     }
 
+    fn can_pong(&self, actor: Seat, tile: Tile) -> bool {
+        let player = &self.players[actor.index()];
+        player.meld_count < 4
+            && player.unlocked_count(tile) >= 2
+            && player
+                .concealed
+                .iter()
+                .zip(player.locked.iter())
+                .map(|(&concealed, &locked)| concealed.saturating_sub(locked) as usize)
+                .sum::<usize>()
+                >= 3
+    }
+
     fn begin_meld_responses(&mut self, source: Seat, tile: Tile) {
         let mut candidates = 0_u8;
         for seat in Seat::ALL {
@@ -1372,7 +1388,10 @@ impl Game {
             if player.missing == Some(tile.suit()) || player.meld_count >= 4 {
                 continue;
             }
-            if player.unlocked_count(tile) >= 2 || player.concealed[tile.index()] >= 3 {
+            // A pong must leave one unlocked tile for the immediate discard
+            // that follows it.  Keep the response window aligned with the
+            // same predicate used by `legal_actions` and `step_meld_response`.
+            if self.can_pong(seat, tile) || player.concealed[tile.index()] >= 3 {
                 candidates |= seat_bit(seat);
             }
         }
@@ -2075,6 +2094,57 @@ impl Batch {
         Ok(())
     }
 
+    /// Writes hand analysis only for selected batch rows.
+    ///
+    /// Indices are validated before any output is changed. Outputs are compact
+    /// arrays in the same order as `indices`.
+    pub fn hand_analysis_indices_into(
+        &self,
+        indices: &[u32],
+        shanten: &mut [i8],
+        improving_tiles: &mut [u32],
+    ) -> Result<(), GameError> {
+        if shanten.len() != indices.len() || improving_tiles.len() != indices.len() {
+            return Err(GameError::BatchLength);
+        }
+        if indices
+            .iter()
+            .any(|&index| index as usize >= self.games.len())
+        {
+            return Err(GameError::BatchIndex);
+        }
+        let write = |index: u32, shanten: &mut i8, improving_tiles: &mut u32| {
+            let game = &self.games[index as usize];
+            let Some(decision) = game.decision() else {
+                *shanten = SHANTEN_TERMINAL;
+                *improving_tiles = 0;
+                return;
+            };
+            let analysis = game.hand_analysis(decision.actor);
+            *shanten = analysis.shanten;
+            *improving_tiles = analysis.improving_tiles;
+        };
+        if indices.len() >= PARALLEL_BATCH_THRESHOLD {
+            indices
+                .par_iter()
+                .copied()
+                .zip(shanten.par_iter_mut())
+                .zip(improving_tiles.par_iter_mut())
+                .for_each(|((index, shanten), improving_tiles)| {
+                    write(index, shanten, improving_tiles);
+                });
+        } else {
+            for ((&index, shanten), improving_tiles) in indices
+                .iter()
+                .zip(shanten.iter_mut())
+                .zip(improving_tiles.iter_mut())
+            {
+                write(index, shanten, improving_tiles);
+            }
+        }
+        Ok(())
+    }
+
     /// Writes current-actor observations into four caller-owned flat buffers.
     ///
     /// Seat-indexed channels and metadata are rotated so relative seat zero is
@@ -2320,12 +2390,14 @@ impl Batch {
         Ok(())
     }
 
-    /// Applies actions and fills transitions, next observations, masks, and
-    /// viewer-scoped event histories in one GIL-free-friendly Rust call.
+    /// Applies actions and writes every next-state training buffer in one
+    /// batch traversal. Full event history is emitted only when the next
+    /// actor's bit is set in the corresponding `history_seat_masks` row.
     #[allow(clippy::too_many_arguments)]
-    pub fn step_indices_observe_events_into(
+    pub fn step_indices_observe_history_into(
         &mut self,
         actions: &[u8],
+        history_seat_masks: &[u8],
         records: &mut [i64],
         mask_words: &mut [u64],
         tile_obs: &mut [u8],
@@ -2336,27 +2408,346 @@ impl Batch {
         events: &mut [i32],
         event_lengths: &mut [u16],
     ) -> Result<(), GameError> {
-        if event_capacity > EVENT_HISTORY_CAPACITY
-            || self
-                .games
-                .len()
-                .checked_mul(event_capacity * EVENT_RECORD_WIDTH)
-                != Some(events.len())
-            || event_lengths.len() != self.games.len()
+        let size = self.games.len();
+        if actions.len() != size
+            || history_seat_masks.len() != size
+            || size.checked_mul(STEP_RECORD_WIDTH) != Some(records.len())
+            || size.checked_mul(LEGAL_ACTION_MASK_WORDS) != Some(mask_words.len())
+            || size.checked_mul(TILE_OBSERVATION_WIDTH) != Some(tile_obs.len())
+            || size.checked_mul(MELD_OBSERVATION_WIDTH) != Some(melds.len())
+            || size.checked_mul(RIVER_OBSERVATION_WIDTH) != Some(river.len())
+            || size.checked_mul(META_OBSERVATION_WIDTH) != Some(meta.len())
+            || event_capacity == 0
+            || event_capacity > EVENT_HISTORY_CAPACITY
+            || size.checked_mul(event_capacity * EVENT_RECORD_WIDTH) != Some(events.len())
+            || event_lengths.len() != size
         {
-            return if event_capacity > EVENT_HISTORY_CAPACITY {
+            return if event_capacity == 0 || event_capacity > EVENT_HISTORY_CAPACITY {
                 Err(GameError::EventCapacity)
             } else {
                 Err(GameError::BatchLength)
             };
         }
-        if event_capacity == 0 {
-            event_lengths.fill(0);
+
+        let all_legal = if size >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(actions.par_iter().copied())
+                .all(|(game, index)| {
+                    ActionId::new(index as usize)
+                        .is_some_and(|id| game.is_legal_action(id.action()))
+                })
+        } else {
+            self.games
+                .iter()
+                .zip(actions.iter().copied())
+                .all(|(game, index)| {
+                    ActionId::new(index as usize)
+                        .is_some_and(|id| game.is_legal_action(id.action()))
+                })
+        };
+        if !all_legal {
+            return Err(GameError::InvalidAction);
         }
-        self.step_indices_into(actions, records)?;
-        self.observations_into(tile_obs, melds, river, meta)?;
-        self.legal_action_mask_words_into(mask_words)?;
-        self.step_events_into(event_capacity, events, event_lengths)
+
+        let write = |game: &mut Game,
+                     index: u8,
+                     history_seat_mask: u8,
+                     record: &mut [i64],
+                     words: &mut [u64],
+                     tile_obs: &mut [u8],
+                     melds: &mut [u8],
+                     river: &mut [u8],
+                     meta: &mut [i32],
+                     events: &mut [i32],
+                     event_length: &mut u16|
+         -> Result<(), GameError> {
+            let action = ActionId::new(index as usize)
+                .expect("action index was validated")
+                .action();
+            let outcome = game.apply_legal_action(action)?;
+            outcome.write_record(record.try_into().expect("record width was validated"));
+            game.write_observation(tile_obs, melds, river, meta);
+            if let Some(mask) = game.legal_action_mask() {
+                words.copy_from_slice(mask.words());
+            } else {
+                words.fill(0);
+            }
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            if history_seat_mask & seat_bit(viewer) != 0 {
+                *event_length =
+                    game.write_events(viewer, events)
+                        .expect("batch event buffers were validated") as u16;
+            } else {
+                *event_length = 0;
+            }
+            Ok(())
+        };
+
+        if size >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter_mut()
+                .zip(actions.par_iter().copied())
+                .zip(history_seat_masks.par_iter().copied())
+                .zip(records.par_chunks_mut(STEP_RECORD_WIDTH))
+                .zip(mask_words.par_chunks_mut(LEGAL_ACTION_MASK_WORDS))
+                .zip(tile_obs.par_chunks_mut(TILE_OBSERVATION_WIDTH))
+                .zip(melds.par_chunks_mut(MELD_OBSERVATION_WIDTH))
+                .zip(river.par_chunks_mut(RIVER_OBSERVATION_WIDTH))
+                .zip(meta.par_chunks_mut(META_OBSERVATION_WIDTH))
+                .zip(events.par_chunks_mut(event_capacity * EVENT_RECORD_WIDTH))
+                .zip(event_lengths.par_iter_mut())
+                .try_for_each(
+                    |(
+                        (
+                            (
+                                (
+                                    (
+                                        (
+                                            ((((game, index), history_seat_mask), record), words),
+                                            tile_obs,
+                                        ),
+                                        melds,
+                                    ),
+                                    river,
+                                ),
+                                meta,
+                            ),
+                            events,
+                        ),
+                        event_length,
+                    )| {
+                        write(
+                            game,
+                            index,
+                            history_seat_mask,
+                            record,
+                            words,
+                            tile_obs,
+                            melds,
+                            river,
+                            meta,
+                            events,
+                            event_length,
+                        )
+                    },
+                )?;
+        } else {
+            for (
+                (
+                    (
+                        (
+                            (
+                                (((((game, &index), &history_seat_mask), record), words), tile_obs),
+                                melds,
+                            ),
+                            river,
+                        ),
+                        meta,
+                    ),
+                    events,
+                ),
+                event_length,
+            ) in self
+                .games
+                .iter_mut()
+                .zip(actions.iter())
+                .zip(history_seat_masks.iter())
+                .zip(records.chunks_mut(STEP_RECORD_WIDTH))
+                .zip(mask_words.chunks_mut(LEGAL_ACTION_MASK_WORDS))
+                .zip(tile_obs.chunks_mut(TILE_OBSERVATION_WIDTH))
+                .zip(melds.chunks_mut(MELD_OBSERVATION_WIDTH))
+                .zip(river.chunks_mut(RIVER_OBSERVATION_WIDTH))
+                .zip(meta.chunks_mut(META_OBSERVATION_WIDTH))
+                .zip(events.chunks_mut(event_capacity * EVENT_RECORD_WIDTH))
+                .zip(event_lengths.iter_mut())
+            {
+                write(
+                    game,
+                    index,
+                    history_seat_mask,
+                    record,
+                    words,
+                    tile_obs,
+                    melds,
+                    river,
+                    meta,
+                    events,
+                    event_length,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Resets selected environments and refreshes only their caller-owned
+    /// observation rows. Non-selected rows and their output buffers are left
+    /// untouched.
+    #[allow(clippy::too_many_arguments)]
+    pub fn reset_observe_history_into(
+        &mut self,
+        reset_flags: &[u8],
+        seeds: &[u64],
+        history_seat_masks: &[u8],
+        mask_words: &mut [u64],
+        tile_obs: &mut [u8],
+        melds: &mut [u8],
+        river: &mut [u8],
+        meta: &mut [i32],
+        event_capacity: usize,
+        events: &mut [i32],
+        event_lengths: &mut [u16],
+    ) -> Result<(), GameError> {
+        let size = self.games.len();
+        if reset_flags.len() != size
+            || seeds.len() != size
+            || history_seat_masks.len() != size
+            || size.checked_mul(LEGAL_ACTION_MASK_WORDS) != Some(mask_words.len())
+            || size.checked_mul(TILE_OBSERVATION_WIDTH) != Some(tile_obs.len())
+            || size.checked_mul(MELD_OBSERVATION_WIDTH) != Some(melds.len())
+            || size.checked_mul(RIVER_OBSERVATION_WIDTH) != Some(river.len())
+            || size.checked_mul(META_OBSERVATION_WIDTH) != Some(meta.len())
+            || event_capacity == 0
+            || event_capacity > EVENT_HISTORY_CAPACITY
+            || size.checked_mul(event_capacity * EVENT_RECORD_WIDTH) != Some(events.len())
+            || event_lengths.len() != size
+        {
+            return if event_capacity == 0 || event_capacity > EVENT_HISTORY_CAPACITY {
+                Err(GameError::EventCapacity)
+            } else {
+                Err(GameError::BatchLength)
+            };
+        }
+
+        let write = |game: &mut Game,
+                     reset: u8,
+                     seed: u64,
+                     history_seat_mask: u8,
+                     words: &mut [u64],
+                     tile_obs: &mut [u8],
+                     melds: &mut [u8],
+                     river: &mut [u8],
+                     meta: &mut [i32],
+                     events: &mut [i32],
+                     event_length: &mut u16| {
+            if reset == 0 {
+                return;
+            }
+            game.reset(seed);
+            game.write_observation(tile_obs, melds, river, meta);
+            if let Some(mask) = game.legal_action_mask() {
+                words.copy_from_slice(mask.words());
+            } else {
+                words.fill(0);
+            }
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            if history_seat_mask & seat_bit(viewer) != 0 {
+                *event_length =
+                    game.write_events(viewer, events)
+                        .expect("batch event buffers were validated") as u16;
+            } else {
+                *event_length = 0;
+            }
+        };
+
+        if size >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter_mut()
+                .zip(reset_flags.par_iter().copied())
+                .zip(seeds.par_iter().copied())
+                .zip(history_seat_masks.par_iter().copied())
+                .zip(mask_words.par_chunks_mut(LEGAL_ACTION_MASK_WORDS))
+                .zip(tile_obs.par_chunks_mut(TILE_OBSERVATION_WIDTH))
+                .zip(melds.par_chunks_mut(MELD_OBSERVATION_WIDTH))
+                .zip(river.par_chunks_mut(RIVER_OBSERVATION_WIDTH))
+                .zip(meta.par_chunks_mut(META_OBSERVATION_WIDTH))
+                .zip(events.par_chunks_mut(event_capacity * EVENT_RECORD_WIDTH))
+                .zip(event_lengths.par_iter_mut())
+                .for_each(
+                    |(
+                        (
+                            (
+                                (
+                                    (
+                                        (
+                                            ((((game, reset), seed), history_seat_mask), words),
+                                            tile_obs,
+                                        ),
+                                        melds,
+                                    ),
+                                    river,
+                                ),
+                                meta,
+                            ),
+                            events,
+                        ),
+                        event_length,
+                    )| {
+                        write(
+                            game,
+                            reset,
+                            seed,
+                            history_seat_mask,
+                            words,
+                            tile_obs,
+                            melds,
+                            river,
+                            meta,
+                            events,
+                            event_length,
+                        );
+                    },
+                );
+        } else {
+            for (
+                (
+                    (
+                        (
+                            (
+                                (((((game, &reset), &seed), &history_seat_mask), words), tile_obs),
+                                melds,
+                            ),
+                            river,
+                        ),
+                        meta,
+                    ),
+                    events,
+                ),
+                event_length,
+            ) in self
+                .games
+                .iter_mut()
+                .zip(reset_flags.iter())
+                .zip(seeds.iter())
+                .zip(history_seat_masks.iter())
+                .zip(mask_words.chunks_mut(LEGAL_ACTION_MASK_WORDS))
+                .zip(tile_obs.chunks_mut(TILE_OBSERVATION_WIDTH))
+                .zip(melds.chunks_mut(MELD_OBSERVATION_WIDTH))
+                .zip(river.chunks_mut(RIVER_OBSERVATION_WIDTH))
+                .zip(meta.chunks_mut(META_OBSERVATION_WIDTH))
+                .zip(events.chunks_mut(event_capacity * EVENT_RECORD_WIDTH))
+                .zip(event_lengths.iter_mut())
+            {
+                write(
+                    game,
+                    reset,
+                    seed,
+                    history_seat_mask,
+                    words,
+                    tile_obs,
+                    melds,
+                    river,
+                    meta,
+                    events,
+                    event_length,
+                );
+            }
+        }
+        Ok(())
     }
 
     fn step_with<A, F>(
@@ -2633,6 +3024,91 @@ mod tests {
         assert_eq!(game.decision(), decision);
         assert_eq!(game.wall_remaining(), wall);
         assert_eq!(*game.concealed(Seat::EAST), hand);
+    }
+
+    #[test]
+    fn pong_is_rejected_when_it_would_leave_no_discard() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let called = tile(Suit::Characters, 1);
+        let next_draw = tile(Suit::Bamboo, 1);
+        game.players[actor.index()].concealed[called.index()] = 2;
+        game.wall[0] = next_draw.as_u8();
+        game.wall_head = 0;
+        game.wall_tail = 1;
+        game.stage = Stage::MeldResponse {
+            source: Seat::EAST,
+            tile: called,
+            remaining: seat_bit(actor),
+        };
+
+        let legal = game.legal_actions().expect("meld response has a decision");
+        assert!(!legal.can_pong);
+        assert!(legal.can_pass);
+        let outcome = game.step(Action::Pass).unwrap();
+        assert_eq!(outcome.draw.unwrap().tile, next_draw);
+        assert_eq!(game.phase(), Phase::Turn);
+    }
+
+    #[test]
+    fn impossible_pong_does_not_create_a_response_window() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let called = tile(Suit::Characters, 1);
+        let next_draw = tile(Suit::Bamboo, 1);
+        game.players[actor.index()].concealed[called.index()] = 2;
+        set_wall(&mut game, &[next_draw]);
+
+        game.begin_meld_responses(Seat::EAST, called);
+
+        assert_eq!(
+            game.decision(),
+            Some(Decision {
+                actor: Seat::ALL[1],
+                phase: Phase::Turn,
+            })
+        );
+        assert_eq!(game.current_draw().unwrap().tile, next_draw);
+    }
+
+    #[test]
+    fn concealed_kong_is_rejected_after_hu() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let locked_quad = tile(Suit::Characters, 1);
+        let fresh_quad = tile(Suit::Characters, 2);
+
+        // Both shapes can appear in a post-win holding: the first is an
+        // all-locked seven-pairs quad, while the second is three locked tiles
+        // plus one newly drawn tile. Neither may be declared as a concealed
+        // kong after the player has already won; only an added kong remains.
+        let player = &mut game.players[actor.index()];
+        player.missing = None;
+        player.concealed[locked_quad.index()] = 4;
+        player.locked[locked_quad.index()] = 4;
+        player.concealed[fresh_quad.index()] = 4;
+        player.locked[fresh_quad.index()] = 3;
+        player.has_won = true;
+        game.stage = Stage::Turn {
+            actor,
+            origin: TurnOrigin::Draw {
+                tile: fresh_quad,
+                after_kong: false,
+                last_wall_tile: false,
+            },
+            can_hu: false,
+        };
+
+        let legal = game.legal_actions().unwrap();
+        assert_eq!(legal.concealed_kong_mask, 0);
+        assert_eq!(
+            game.step(Action::ConcealedKong(locked_quad)),
+            Err(GameError::InvalidAction)
+        );
+        assert_eq!(
+            game.step(Action::ConcealedKong(fresh_quad)),
+            Err(GameError::InvalidAction)
+        );
     }
 
     #[test]

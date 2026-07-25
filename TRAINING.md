@@ -35,13 +35,14 @@
 | history blocks | 4，causal attention |
 | attention heads | 6 |
 | FFN | 768，SwiGLU |
+| history position encoding | standard RoPE on Q/K，`theta=10,000` |
 | normalization | Pre-RMSNorm |
 | dropout | 0 |
 | 计算精度 | BF16，FP32 optimizer state |
 
 静态序列是 `[GLOBAL] + 27 TILE + 4 PLAYER + 16 MELD`，共 48 个 token。双向 attention 可以完整比较三门牌、公开副露、锁牌、当前分数和缺门状态；`GLOBAL` 输出作为 static embedding。
 
-历史序列最多 192 个 event token，按时间顺序使用 causal mask，最后一个有效 token 的输出作为 history embedding。每层实现了 K/V cache，并有 cached/full 一致性测试。rollout 为 learner 和冻结 Transformer 各维护一套 `(环境,绝对座位)` cache，按精确的 `(past_length, delta_length)` 分组后追加事件；viewer 变化、reset、事件窗口截断或历史前缀不一致时自动 full rebuild。这样保留 cache 的主要收益，同时不强行 padding 不同长度的因果前缀。
+历史序列最多 192 个 event token，按时间顺序使用 causal mask，最后一个有效 token 的输出作为 history embedding。历史塔不再把可学习绝对位置向量加到 event embedding，而是在每层 attention 的 Q/K 上使用标准交错 RoPE（`theta=10,000`）。full forward 使用 `0..L-1` 位置；KV cache 追加时使用 `past_length..past_length+delta-1`，因此 cached/full 输出保持一致。rollout 为 learner 和冻结 Transformer 各维护一套 `(环境,绝对座位)` cache；viewer 变化、reset 或 192-token 滑动窗口变化时自动 full rebuild。少于 32 行的碎组并入一次 padded full forward，避免 cache 反而制造大量小 kernel；rollout 结束后释放全部 K/V，再进入 PPO。
 
 拼接后的 384 维表示经过两层 MLP 输出 115 维 Actor logits，再应用 Legal Action Mask。Critic 输出固定 `[-4,4]` support 上的 categorical value distribution，并由其期望得到标量 value；Actor advantage 始终对应未经裁剪的真实分差。
 
@@ -89,8 +90,8 @@ Actor 和首版 Critic 都只使用当前行动者可见的静态状态 embeddin
 引擎提供常规结构向听 evaluator，同时考虑标准四组一对、血流规则下龙七对的“四张算两对”、公开副露和定缺约束：
 
 - Rust `analyze_shanten(counts, melds, missing_suit)` 返回 `ShantenAnalysis { shanten, improving_tiles }`；只需要数值时使用 `evaluate_shanten`。
-- Rust `Game::hand_analysis(seat)` 分析指定座位；`Batch::hand_analysis_into` 批量分析当前行动者。
-- Python `Game.hand_analysis(seat) -> (shanten, improving_mask)`；`Batch.hand_analysis_into(int8[B], uint32[B])` 直接写调用方 NumPy 缓冲区。
+- Rust `Game::hand_analysis(seat)` 分析指定座位；`Batch::hand_analysis_into` 批量分析全部当前行动者，`Batch::hand_analysis_indices_into` 只分析所选行。
+- Python `Game.hand_analysis(seat) -> (shanten, improving_mask)`；训练使用 `Batch.hand_analysis_indices_into(uint32[N], int8[N], uint32[N])`，不会为约四分之一的 learner 行计算整个 batch。
 - `shanten=-1` 表示已经包含胡牌结构，`0` 表示听牌，普通结果上限为 `8`。批量终局槽使用 `SHANTEN_TERMINAL=127`。
 - `improving_tiles` 的低 27 bit 对应牌种；置位表示加入该牌会严格降低结构向听，不代表牌墙中一定还有该牌。
 
@@ -149,7 +150,8 @@ r = r_score + beta * (potential(next_state) - potential(state))
 | parallel environments | 2048 |
 | learner batch | 65,536 个完整逐玩家 transitions |
 | PPO epochs | 2 |
-| minibatch | 4096，按显存使用 microbatch 256 或 1024 累积 |
+| minibatch | 4096，microbatch 512 累积；按历史长度分桶并裁剪右侧 padding |
+| rollout KV cache 分组阈值 | 1024 行；小于阈值走一次合并的 full forward |
 | learning rate | `2e-4` cosine decay 到 `3e-5` |
 | gamma | 1.0 |
 | GAE lambda | 0.95 |
@@ -157,30 +159,44 @@ r = r_score + beta * (potential(next_state) - potential(state))
 | value coefficient | 0.5 |
 | max gradient norm | 0.5 |
 | target KL | 0.015 |
+| 规则混入门槛 | 首位率 `>= 0.70`，连续 3 次评测 |
+| league 门槛 | 首位率 `>= 0.80`，连续 3 次评测 |
 | entropy | `H/log(max(legal_count,2))`，系数 `0.01` 退火到 `0.002` |
 
 每局是 `1 learner + 3 opponent`。另外三个绝对座位独立采样策略类型，因此同桌可以同时出现 `rule_fast`、`rule_safe` 和冻结 Transformer；不会强行让三个 opponent 使用同一种策略。为保持 GPU 批量推理效率，每个 rollout 只激活一个 Transformer 快照，所有抽中 `frozen_transformer` 的座位共享该版本。PPO policy loss 不按高倍率结果重采样。
 
-默认 `--total-transitions 100000000` 时按 learner transitions 分三段，切换发生在下一次 rollout 开始前：
+对手 curriculum 不再按 learner transitions 的百分比切换，而由固定规则锚点评测门控。规则评测使用模型作为一方、另外三家使用 `simple_rule_actions_into`，以首位率作为“赢过三家规则对手”的定义。为避免 256 局噪声误触发，必须连续 3 次评测通过门槛；评测状态也会写入 checkpoint。
 
 | 阶段 | 默认范围 | `random_hu` | `rule_fast` | `rule_safe` | `frozen_transformer` |
 |---|---:|---:|---:|---:|---:|
-| bootstrap | `0..<10M`，即 `0..<10%` | 30% | 50% | 20% | 0% |
-| mixed | `10M..<35M`，即 `10%..<35%` | 10% | 35% | 20% | 35% |
-| league | `35M..<75M`，即 `35%..<75%` | 5% | 15% | 15% | 65% |
-| self-play | `75M+`，即 `75%+` | 0% | 0% | 0% | 100% |
+| bootstrap | 规则首位率 `< 70%`，或尚未连续通过 3 次 | 30% | 50% | 20% | 0% |
+| mixed | 规则首位率 `70%..<80%`，连续通过 70% 门槛 | 10% | 35% | 20% | 35% |
+| league | 规则首位率 `>= 80%`，连续通过 80% 门槛 | 5% | 15% | 15% | 65% |
 
-上表是“每个非 learner 座位”的抽样概率，不是四家座位的占比。league 阶段一桌的 frozen seat 数量服从 `Binomial(3, 0.65)`：平均 `1.95` 个；恰好 0/1/2/3 个 frozen 的概率约为 `4.3%/23.9%/44.4%/27.5%`。最后的 self-play 阶段才是严格的 `1 learner + 3 frozen Transformer`，规则 AI 只用于独立评测和回归，不再进入训练 rollout。日志中的 `opponent_assignments` 统计的是三个 opponent seat 的策略抽样次数。
+上表是“每个非 learner 座位”的抽样概率，不是四家座位的占比。达到 70% 只代表开始引入 Transformer 对手，不代表已经可以纯自博弈；达到 80% 后仍保留 35% 的规则对手作为锚点。当前版本不根据规则胜率自动切换到纯 Transformer self-play，避免模型在尚未证明能稳定击败规则策略时脱离外部锚点。日志中的 `opponent_assignments` 统计的是三个 opponent seat 的策略抽样次数。
 
-达到 10M transitions 时创建第一个冻结快照；之后默认每 10 次 PPO 更新刷新一次。最多保留最近 4 个版本。mixed、league 和 self-play 阶段每次刷新时有 25% 概率激活历史快照，否则用最新快照。这里的“历史快照”是训练轨迹样本，不冒充经过显著性检验的 champion。
+首次连续通过 70% 门槛时创建第一个冻结快照；之后默认每 10 次 PPO 更新刷新一次。最多保留最近 4 个版本。league 阶段每次刷新时有 25% 概率激活历史快照，否则用最新快照。这里的“历史快照”是训练轨迹样本，不冒充经过显著性检验的 champion。
 
 当前 pipeline 默认每 10 次更新对固定 `rule_fast` 锚点做四座轮换评测，并记录平均分差、分差标准差、首位率和平均名次；`2h/6h/12h/24h` 自动保存完整 checkpoint。训练结束后再对这些候选做更大规模的配对重复种子评测，只有平均效用 95% bootstrap 置信区间下界大于零时才标为 champion。当前训练循环不会根据小样本点估计自动晋级并改变训练分布。
 
 ### 阈值与 cache 的预算依据
 
-- 默认 100M learner transitions、65,536 transitions/update，共约 1,526 次 update。BF16 基准的单个 256-state PPO step 为 0.074 秒，按两次 PPO epoch 折算，纯反向约 38 秒/update、约 16 小时；加上引擎 rollout、快照和评测，实际约 20 到 24 小时。因此 10% 规则冷启动约占 2 小时，35% 约在 7 到 9 小时进入 league，75% 后保留约四分之一预算做纯 Transformer self-play；50% 会把切换再推迟约 3 到 4 小时，没有足够收益。
-- 一条 192-token、4 层、6 头、`d_model=192` 的 BF16 K/V cache 是 `4 * 2 * 6 * 192 * 32 * 2 = 589,824` bytes，约 0.56 MiB/viewer。2048 桌中 learner 约 1.1 GiB，三个冻结对手的上界约 3.4 GiB，加上分组拼接的临时峰值约 5 到 6 GiB；和训练 step 的约 2.9 GiB 峰值合计仍适合 16 GiB 卡。
-- 本机 full history 基准约 22.4k state/s，cached history 约 105.7k state/s。实际 rollout 还包含静态编码、Python 分组和 Rust step，不能直接承诺 4.7 倍端到端提升；按 viewer/past-length 分组仍能显著减少历史塔重复计算。达到 192 条并发生环形窗口截断时自动 full rebuild，不能为了 cache 使用错误的旧前缀。
+- 2026-07-24 在本机 RTX 5080 的实测为 65,536 transitions/update 用 25.60 秒：rollout 4.80 秒，PPO 20.80 秒，总吞吐约 2,560 transitions/s。默认 200M 约 3,052 次 update，纯训练约 21.7 小时；加周期评测和 checkpoint 后对应约 22 到 24 小时。进入 mixed 或 league 的时间取决于规则胜率，不再由 wall-clock 或 transition 百分比保证。
+- 一条 192-token、4 层、6 头、`d_model=192` 的 BF16 K/V cache 是 `4 * 2 * 6 * 192 * 32 * 2 = 589,824` bytes，约 0.56 MiB/viewer。`history_seat_masks` 只为 learner/冻结 Transformer 的下一决策写历史；只有达到 `history_cache_min_batch=1024` 的大组才走 cache，小碎组改走合并 full forward。所有 rollout cache 在 PPO 前释放，因此不会和 microbatch 512 的训练激活峰值叠加。
+- 本机 full history 基准约 22.4k state/s，cached history 约 105.7k state/s；但端到端 rollout 还受 Python 分组、KV 拼接和 GPU launch 数量影响。RTX 5080、真实 `65,536` transitions 的 bootstrap rollout 为阈值 32/1024 分别约 4.90/3.77 秒；league 为约 10.47/8.18 秒。达到 192 条并发生环形窗口截断时自动 full rebuild，不能为了 cache 使用错误的旧前缀。
+
+### 训练速度诊断与优化
+
+此前一次约 5 小时的日志中，单个 update 平均约 25.6 秒，其中 rollout 约 11 秒、PPO 约 20.7 秒；因此瓶颈是 Python 侧重复的 Transformer forward 和过小的 GPU microbatch，而不是 Rayon 引擎 step。现有实现做了三项直接优化：
+
+- PPO 使用适合 16GB 卡的 microbatch 512，并提供 `--microbatch` 覆盖值；先确认显存余量后再尝试 768 或 1024。
+- rollout 数据不再整批常驻 GPU；每个 microbatch 只传输所需状态，避免 65,536 条历史记录额外占用数百 MB 显存。
+- PPO 每个 epoch 按历史长度分桶，每个 microbatch 只把事件序列裁到该批次的最大有效长度。rollout 的 full/cache-miss forward 也做同样裁剪，保留 192 的上限和绝对 RoPE 位置。KV cache 只对达到 1024 行的同形状组启用；小组的动态 cache bookkeeping 比省下的 attention 更贵，因此合并为 full forward。
+- RoPE 的 `sin/cos` 表按 `max_history` 预计算并在各层共享，避免每次 forward 重复三角函数计算。
+- `training` 包在导入模型前默认设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，让变长 KV cache 使用可扩展 segment；不在每个 update 调用 `torch.cuda.empty_cache()`，避免强制每轮重新申请大块显存。
+- 辅助向听标签退火后不再调用引擎分析；修复了此前 `collect_auxiliary=False` 时没有写入 pending transition、第二个 update 永久等待的逻辑错误。
+
+这些改动只减少 padding、分析和 kernel-launch 开销，不改变合法动作、奖励、GAE 或 PPO loss。GPU 机器上应比较日志的 `rollout_seconds`、`ppo_seconds` 和 `states_per_second`；如果提高 microbatch 后出现 OOM，退回 `--microbatch 512`。
 
 ## 24 小时单次预算
 
@@ -189,14 +205,14 @@ r = r_score + beta * (potential(next_state) - potential(state))
 ```bash
 python -m training.train --smoke --device cpu --output-dir /tmp/bloodflow-smoke
 python -m training.train --device cuda --hours 24 \
-  --total-transitions 100000000 --output-dir runs/transformer
+  --total-transitions 200000000 --output-dir runs/transformer
 ```
 
 - 前 1 小时：规则对手和 Transformer rollout smoke test，检查动作分布、KV cache 一致性和奖励归因。
-- 中间约 20 小时：PPO 联赛训练，按 learner transitions 而不是 epoch 计进度。
-- 最后约 3 小时：固定快照、四座轮换评测、故障余量和最终候选选择。
+- 中间阶段：先持续规则 bootstrap，达到规则首位率门槛后逐步加入冻结 Transformer 对手。
+- 后段：保留规则锚点的 league 训练、固定快照、四座轮换评测和最终候选选择。
 
-首版 24 小时只运行 Transformer。先用短 smoke test 检查实现，不用前两小时胡牌率淘汰模型；保存 `2h/6h/12h/24h` 快照并比较平均分、每次胡牌收入、高倍率尾部、点炮损失和终局结算。后续若实现 ResNet，再按相同环境步数与 wall-clock 做独立对照。
+首版重训从随机初始化开始，不恢复旧的 self-play checkpoint。先用短 smoke test 检查实现；只有规则首位率连续达到 70% 才开始混入 Transformer 对手，达到 80% 后仍保留规则锚点。保存 `2h/6h/12h/24h` 快照并比较平均分、每次胡牌收入、高倍率尾部、点炮损失和终局结算。后续若实现 ResNet，再按相同环境步数与 wall-clock 做独立对照。
 
 事件缓存必须绑定固定 viewer。若只训练一个 learner 座位，可以在该座位再次决策时追加其事件；若四个座位共享一个模型，则每个座位维护独立 cache，不能把相对座位已经旋转过的历史混用。
 

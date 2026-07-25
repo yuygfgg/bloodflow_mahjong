@@ -35,10 +35,25 @@ tile_obs = np.empty((len(batch), bm.TILE_OBSERVATION_PLANES, 27), dtype=np.uint8
 melds = np.empty((len(batch), 4, bm.MELD_SLOTS, bm.MELD_FIELDS), dtype=np.uint8)
 river = np.empty((len(batch), bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8)
 meta = np.empty((len(batch), bm.META_OBSERVATION_WIDTH), dtype=np.int32)
+events = np.empty((len(batch), 192, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
+event_lengths = np.empty(len(batch), dtype=np.uint16)
+# Absolute-seat bits whose decisions are handled by a neural policy.
+history_seat_masks = np.full(len(batch), 0b0001, dtype=np.uint8)
 
 batch.legal_action_masks_into(masks)
 # Fill actions from the two packed mask words, then step all environments.
-batch.step_and_observe_into(actions, records, masks, tile_obs, melds, river, meta)
+batch.step_and_observe_history_into(
+    actions,
+    history_seat_masks,
+    records,
+    masks,
+    tile_obs,
+    melds,
+    river,
+    meta,
+    events,
+    event_lengths,
+)
 ```
 
 ## Rule baseline and shanten
@@ -55,6 +70,9 @@ evaluation anchor, not an expert policy.
 to `int8[batch]` and `uint32[batch]` buffers. Ordinary shanten values are
 `SHANTEN_COMPLETE` (`-1`) through `SHANTEN_MAX` (`8`); terminal batch slots use
 `SHANTEN_TERMINAL` (`127`) and an empty mask.
+`Batch.hand_analysis_indices_into(indices, shanten, improving_tiles)` writes
+compact outputs for selected `uint32` batch rows and is the training API when
+only learner decisions need auxiliary labels.
 
 The evaluator measures conventional structural shanten, including standard
 hands, this ruleset's seven-pairs quad rule, exposed melds, and the missing
@@ -113,11 +131,14 @@ step. For a `Batch`, `events_into` and `step_events_into` write
 The batch viewer is the current decision actor, or the dealer after terminal.
 
 The Rust side retains a 512-record ring per environment; `Game.event_dropped`
-and `Batch.event_dropped_into` report overwritten records. Use the step-delta API in the training loop so a
-large history is not copied on every action. `Batch.step_and_observe_events_into`
-combines step, transition, observation, legal mask, and step-event delta into
-one GIL-free call. Buffers are caller-owned, C-contiguous, aligned, and never
-copied through Python objects.
+and `Batch.event_dropped_into` report overwritten records.
+`Batch.step_and_observe_history_into` combines step, transition, observation,
+legal mask, and full viewer history into one GIL-free Rayon traversal. Each
+`history_seat_masks` byte is a four-bit absolute-seat mask; history is written
+only when the next actor's bit is present, and `event_lengths[row]` is zero
+otherwise. This avoids copying 192 records for rule-controlled decisions.
+`Batch.reset_and_observe_history_into` resets and refreshes only rows selected
+by `reset_flags`, leaving every other output row untouched.
 
 Array dtypes and shapes are part of the API. Batch calls reject non-contiguous
 views rather than copying them. The GIL is released while reset, mask, and step
@@ -126,8 +147,9 @@ large batches.
 
 Observations are rotated to the current actor: relative seat zero is the policy
 that acts next, followed by seats 1, 2, and 3 in turn order. A terminal game has
-no actor and uses the dealer as relative seat zero. `step_and_observe_into`
-writes the state and legal mask after applying the submitted actions.
+no actor and uses the dealer as relative seat zero.
+`step_and_observe_history_into` writes the state and legal mask after applying
+the submitted actions.
 
 `tile_obs` has shape `[batch, 10, 27]` and contains tile counts:
 
