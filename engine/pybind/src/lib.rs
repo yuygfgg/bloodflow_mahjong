@@ -2,13 +2,14 @@ use ::bloodflow_mahjong as core_engine;
 use core_engine::{
     ACTION_ADDED_KONG_OFFSET, ACTION_CHOOSE_MISSING_OFFSET, ACTION_CONCEALED_KONG_OFFSET,
     ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
-    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, EVENT_FLAG_AFTER_KONG,
-    EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE, EVENT_FLAG_OPENING_DISCARD,
-    EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG, EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY,
-    EVENT_RECORD_WIDTH, EventKind, ExchangeDirection, Game, GameError, LEGAL_ACTION_MASK_WORDS,
-    MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, MeldKind, Phase, RIVER_OBSERVATION_WIDTH,
-    SHANTEN_COMPLETE, SHANTEN_MAX, SHANTEN_TERMINAL, SIMPLE_RULE_ACTION_TERMINAL,
-    STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_OBSERVATION_WIDTH,
+    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, ENGINE_RULES_VERSION,
+    EVENT_FLAG_AFTER_KONG, EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE,
+    EVENT_FLAG_OPENING_DISCARD, EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG,
+    EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY, EVENT_RECORD_WIDTH, EventKind, ExchangeDirection,
+    Game, GameError, LEGAL_ACTION_MASK_WORDS, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH,
+    MeldKind, ORACLE_TILE_COUNT_PLANES, Phase, RIVER_OBSERVATION_WIDTH, SHANTEN_COMPLETE,
+    SHANTEN_MAX, SHANTEN_TERMINAL, SIMPLE_RULE_ACTION_TERMINAL, STEP_RECORD_WIDTH, Seat,
+    StepOutcome, TILE_OBSERVATION_WIDTH, TerminationReason,
 };
 use numpy::{
     PyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray,
@@ -53,6 +54,15 @@ impl PyGame {
 
     fn reset(&mut self, seed: u64) {
         self.inner.reset(seed);
+    }
+
+    fn resample_information_set(&self, seed: u64) -> PyResult<Self> {
+        Ok(Self {
+            inner: self
+                .inner
+                .resample_information_set(seed)
+                .map_err(game_error)?,
+        })
     }
 
     #[getter]
@@ -135,6 +145,56 @@ impl PyGame {
         let mut output = try_readwrite(output, "output")?;
         let output = writable_slice(&mut output, "output")?;
         py.detach(|| self.inner.step_events_into(viewer, output))
+            .map_err(game_error)
+    }
+
+    fn observe_into<'py>(
+        &self,
+        viewer: u8,
+        tile_obs: &Bound<'py, PyArray2<u8>>,
+        melds: &Bound<'py, PyArray3<u8>>,
+        river: &Bound<'py, PyArray2<u8>>,
+        meta: &Bound<'py, PyArray1<i32>>,
+    ) -> PyResult<()> {
+        let viewer = seat_value(viewer)?;
+        require_shape(
+            tile_obs,
+            &[TILE_OBSERVATION_PLANES, TILE_KIND_COUNT],
+            "tile_obs",
+        )?;
+        require_c_contiguous(tile_obs, "tile_obs")?;
+        require_shape(melds, &[PLAYER_COUNT, MELD_SLOTS, MELD_FIELDS], "melds")?;
+        require_c_contiguous(melds, "melds")?;
+        require_shape(river, &[RIVER_TILE_CAPACITY, RIVER_FIELDS], "river")?;
+        require_c_contiguous(river, "river")?;
+        require_shape(meta, &[META_OBSERVATION_WIDTH], "meta")?;
+        require_c_contiguous(meta, "meta")?;
+
+        let mut tile_obs = try_readwrite(tile_obs, "tile_obs")?;
+        let mut melds = try_readwrite(melds, "melds")?;
+        let mut river = try_readwrite(river, "river")?;
+        let mut meta = try_readwrite(meta, "meta")?;
+        self.inner
+            .observation_into(
+                viewer,
+                writable_slice(&mut tile_obs, "tile_obs")?,
+                writable_slice(&mut melds, "melds")?,
+                writable_slice(&mut river, "river")?,
+                writable_slice(&mut meta, "meta")?,
+            )
+            .map_err(game_error)
+    }
+
+    fn oracle_tile_counts_into<'py>(&self, output: &Bound<'py, PyArray2<u8>>) -> PyResult<()> {
+        require_shape(
+            output,
+            &[ORACLE_TILE_COUNT_PLANES, TILE_KIND_COUNT],
+            "output",
+        )?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        self.inner
+            .oracle_tile_counts_into(writable_slice(&mut output, "output")?)
             .map_err(game_error)
     }
 
@@ -231,6 +291,11 @@ impl PyGame {
         let seats = self.inner.rankings().map(Seat::as_u8);
         (seats[0], seats[1], seats[2], seats[3])
     }
+
+    #[getter]
+    fn termination_reason(&self) -> Option<u8> {
+        self.inner.termination_reason().map(TerminationReason::code)
+    }
 }
 
 #[pyclass(name = "Batch", module = "bloodflow_mahjong")]
@@ -310,6 +375,82 @@ impl PyBatch {
             Ok(())
         })
         .map_err(game_error)
+    }
+
+    fn clone_indices<'py>(
+        &self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+    ) -> PyResult<Self> {
+        require_c_contiguous(indices, "indices")?;
+        let indices = try_readonly(indices, "indices")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        if let Some(&index) = indices
+            .iter()
+            .find(|&&index| index as usize >= self.inner.len())
+        {
+            return Err(PyValueError::new_err(format!(
+                "batch index {index} is out of range for batch size {}",
+                self.inner.len()
+            )));
+        }
+        let indices = indices
+            .iter()
+            .map(|&index| index as usize)
+            .collect::<Vec<_>>();
+        let inner = py
+            .detach(|| self.inner.clone_indices(&indices))
+            .map_err(game_error)?;
+        Ok(Self { inner })
+    }
+
+    fn resample_information_sets<'py>(
+        &self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+        seeds: &Bound<'py, PyArray1<u64>>,
+    ) -> PyResult<Self> {
+        require_c_contiguous(indices, "indices")?;
+        require_shape(seeds, &[indices.len()], "seeds")?;
+        require_c_contiguous(seeds, "seeds")?;
+        let indices = try_readonly(indices, "indices")?;
+        let seeds = try_readonly(seeds, "seeds")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        let seeds = readonly_slice(&seeds, "seeds")?;
+        if let Some(&index) = indices
+            .iter()
+            .find(|&&index| index as usize >= self.inner.len())
+        {
+            return Err(PyValueError::new_err(format!(
+                "batch index {index} is out of range for batch size {}",
+                self.inner.len()
+            )));
+        }
+        let indices = indices
+            .iter()
+            .map(|&index| index as usize)
+            .collect::<Vec<_>>();
+        let inner = py
+            .detach(|| self.inner.resample_information_sets(&indices, seeds))
+            .map_err(game_error)?;
+        Ok(Self { inner })
+    }
+
+    fn oracle_tile_counts_into<'py>(
+        &self,
+        py: Python<'py>,
+        output: &Bound<'py, PyArray3<u8>>,
+    ) -> PyResult<()> {
+        require_shape(
+            output,
+            &[self.inner.len(), ORACLE_TILE_COUNT_PLANES, TILE_KIND_COUNT],
+            "output",
+        )?;
+        require_c_contiguous(output, "output")?;
+        let mut output = try_readwrite(output, "output")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.oracle_tile_counts_into(output))
+            .map_err(game_error)
     }
 
     fn legal_action_masks_into<'py>(
@@ -661,7 +802,8 @@ fn game_error(error: GameError) -> PyErr {
         | GameError::InvalidExchange
         | GameError::BatchLength
         | GameError::BatchIndex
-        | GameError::EventCapacity => PyValueError::new_err(error.to_string()),
+        | GameError::EventCapacity
+        | GameError::InformationSetUnavailable => PyValueError::new_err(error.to_string()),
     }
 }
 
@@ -947,6 +1089,7 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("STEP_RECORD_WIDTH", STEP_RECORD_WIDTH)?;
     module.add("EVENT_RECORD_WIDTH", EVENT_RECORD_WIDTH)?;
     module.add("EVENT_HISTORY_CAPACITY", EVENT_HISTORY_CAPACITY)?;
+    module.add("ENGINE_RULES_VERSION", ENGINE_RULES_VERSION)?;
     module.add("SHANTEN_COMPLETE", SHANTEN_COMPLETE)?;
     module.add("SHANTEN_MAX", SHANTEN_MAX)?;
     module.add("SHANTEN_TERMINAL", SHANTEN_TERMINAL)?;
@@ -960,6 +1103,7 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("RIVER_TILE_CAPACITY", RIVER_TILE_CAPACITY)?;
     module.add("RIVER_FIELDS", RIVER_FIELDS)?;
     module.add("META_OBSERVATION_WIDTH", META_OBSERVATION_WIDTH)?;
+    module.add("ORACLE_TILE_COUNT_PLANES", ORACLE_TILE_COUNT_PLANES)?;
     module.add("PLAYER_COUNT", PLAYER_COUNT)?;
     module.add("TILE_KIND_COUNT", TILE_KIND_COUNT)?;
     module.add("PHASE_EXCHANGE", phase_code(Phase::Exchange))?;
@@ -968,5 +1112,13 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add("PHASE_HU_RESPONSE", phase_code(Phase::HuResponse))?;
     module.add("PHASE_MELD_RESPONSE", phase_code(Phase::MeldResponse))?;
     module.add("PHASE_FINISHED", phase_code(Phase::Finished))?;
+    module.add(
+        "TERMINATION_WALL_EXHAUSTED",
+        TerminationReason::WallExhausted.code(),
+    )?;
+    module.add(
+        "TERMINATION_THREE_PLAYERS_BANKRUPT",
+        TerminationReason::ThreePlayersBankrupt.code(),
+    )?;
     Ok(())
 }

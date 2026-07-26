@@ -42,7 +42,9 @@ fn run() -> Result<(), GameError> {
 maturin develop --release --manifest-path engine/pybind/Cargo.toml
 ```
 
-训练热路径使用 `Batch.step_and_observe_history_into`：一次 Rayon 遍历完成动作、transition、下一状态观测、合法动作 mask 和 viewer-scoped 完整历史。`history_seat_masks[B]` 按绝对座位选择哪些下一行动者需要历史，因此 bootstrap 阶段通常只写 learner 的约四分之一行。终局由 `Batch.reset_and_observe_history_into` 只刷新实际 reset 的行，向听辅助标签由 `Batch.hand_analysis_indices_into` 只计算 learner 行；这些调用都释放 GIL 且不创建 Python 对象列表。
+训练热路径使用 `Batch.step_and_observe_history_into`：一次 Rayon 遍历完成动作、transition、下一状态观测、合法动作 mask 和 viewer-scoped 完整历史。完整轨迹采集为四个绝对座位都保留历史，终局后由 `Batch.reset_and_observe_history_into` 只重置完成的行；这些调用都释放 GIL 且不创建 Python 对象列表。
+
+紧凑 replay 只保存 seed、动作序列和策略元数据，采样时通过 `Game.observe_into` / `Batch.observe_into` 严格重建 observation 和 legal mask。训练期 Oracle Critic 可读取单独导出的全局牌计数；选择性 Monte Carlo 使用 `resample_information_set` / `resample_information_sets` 在保持行动者可见信息不变的前提下重采样暗手与牌墙。这些训练期接口不会改变 Actor 的部署输入。
 
 观测由当前行动者视角编码，不暴露其他玩家暗手、墙序以及尚未统一公开的换牌/定缺选择。事件记录为八个 `int32` 字段，摸牌牌面只对摸牌者可见，响应动作不向其他玩家泄露。完整数组布局见 [`engine/pybind/README.md`](engine/pybind/README.md)。
 
@@ -60,6 +62,6 @@ python engine/pybind/benchmarks/throughput.py --batch-size 1024 --iterations 409
 
 实现约定和验收矩阵见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)。
 
-无真人牌谱条件下的模型候选、冷启动、自博弈 PPO 和评测方案见 [`TRAINING.md`](TRAINING.md)。
+无真人牌谱条件下的完整轨迹合成、IQL/AWR、Oracle Critic、选择性信息集 Monte Carlo 和评测方案见 [`TRAINING.md`](TRAINING.md)。
 
-首版 Transformer 模型、静态状态编码器、事件 GPT 历史塔和 KV cache 位于 [`training`](training)，实现说明和 smoke test 见 [`training/README.md`](training/README.md)。
+Transformer Actor、独立 Q1/Q2/V、紧凑 replay 和 CUDA-only 训练入口位于 [`training`](training)，快速运行与恢复说明见 [`training/README.md`](training/README.md)。

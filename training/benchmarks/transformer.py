@@ -84,25 +84,6 @@ def main() -> None:
     def full_forward() -> object:
         return model(tile_obs, melds, meta, events, lengths, legal)
 
-    with torch.inference_mode(), torch.autocast(
-        device_type=device.type,
-        dtype=torch.bfloat16,
-        enabled=device.type == "cuda",
-    ):
-        prefix_cache = None
-        if args.history > 1:
-            _, prefix_cache = model.history_encoder.forward_cached(events[:, :-1])
-
-    def cached_forward() -> object:
-        return model.forward_cached(
-            tile_obs,
-            melds,
-            meta,
-            events[:, -1:],
-            prefix_cache,
-            legal,
-        )
-
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     full_rate = measure(
@@ -113,26 +94,13 @@ def main() -> None:
         if device.type == "cuda"
         else 0
     )
-    if device.type == "cuda":
-        torch.cuda.reset_peak_memory_stats(device)
-    cached_rate = measure(
-        cached_forward, args.iterations, args.warmup, args.batch_size, device
-    )
-    cached_memory = (
-        torch.cuda.max_memory_allocated(device) / 1024**2
-        if device.type == "cuda"
-        else 0
-    )
-
     parameters = sum(parameter.numel() for parameter in model.parameters())
     print(f"device:          {device}")
     print(f"parameters:      {parameters:,}")
     print(f"batch/history:   {args.batch_size}/{args.history}")
     print(f"full states/s:   {full_rate:,.0f}")
-    print(f"cached states/s: {cached_rate:,.0f}")
     if device.type == "cuda":
         print(f"full peak MiB:   {full_memory:,.0f}")
-        print(f"cache peak MiB:  {cached_memory:,.0f}")
 
 
 if __name__ == "__main__":

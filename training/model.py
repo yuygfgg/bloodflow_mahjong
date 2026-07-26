@@ -1,4 +1,4 @@
-"""Structured actor-critic with a static encoder and cached GPT history."""
+"""Actor-only Transformer for viewer-scoped Blood Flow Mahjong policy."""
 
 from __future__ import annotations
 
@@ -17,22 +17,20 @@ MELD_SLOTS = 4
 MELD_FIELDS = 3
 META_WIDTH = 34
 EVENT_RECORD_WIDTH = 8
-SHANTEN_CLASS_COUNT = 10  # -1 through 8
 
 
 @dataclass(frozen=True)
 class TransformerConfig:
-    d_model: int = 192
-    num_heads: int = 6
-    static_layers: int = 2
-    history_layers: int = 4
-    ffn_dim: int = 768
+    # 8.84M-parameter default Actor: 32-wide heads, deeper history, and a
+    # wider SwiGLU than the original 3.82M cold-start model.
+    d_model: int = 256
+    num_heads: int = 8
+    static_layers: int = 3
+    history_layers: int = 5
+    ffn_dim: int = 1024
     dropout: float = 0.0
     max_history: int = 192
     rope_theta: float = 10_000.0
-    value_atoms: int = 129
-    value_min: float = -4.0
-    value_max: float = 4.0
 
     def __post_init__(self) -> None:
         if self.d_model % self.num_heads != 0:
@@ -41,47 +39,16 @@ class TransformerConfig:
             raise ValueError("RoPE requires an even attention head dimension")
         if self.static_layers <= 0 or self.history_layers <= 0:
             raise ValueError("both encoders need at least one layer")
-        if self.max_history <= 0 or self.value_atoms < 2:
-            raise ValueError("max_history and value_atoms must be positive")
-        if self.value_min >= self.value_max:
-            raise ValueError("value_min must be less than value_max")
+        if self.max_history <= 0:
+            raise ValueError("max_history must be positive")
         if self.rope_theta <= 0:
             raise ValueError("rope_theta must be positive")
 
 
 @dataclass(frozen=True)
-class LayerKV:
-    key: Tensor
-    value: Tensor
-
-    def detach(self) -> LayerKV:
-        return LayerKV(self.key.detach(), self.value.detach())
-
-
-@dataclass(frozen=True)
-class HistoryKVCache:
-    layers: tuple[LayerKV, ...]
-    length: int
-    summary: Tensor
-
-    def detach(self) -> HistoryKVCache:
-        return HistoryKVCache(
-            tuple(layer.detach() for layer in self.layers),
-            self.length,
-            self.summary.detach(),
-        )
-
-
-@dataclass(frozen=True)
-class ActorCriticOutput:
+class PolicyOutput:
     logits: Tensor
     raw_logits: Tensor
-    value_logits: Tensor
-    value: Tensor
-    shanten_logits: Tensor
-    improving_logits: Tensor
-    static_embedding: Tensor
-    history_embedding: Tensor
 
 
 class RMSNorm(nn.Module):
@@ -147,9 +114,8 @@ class SelfAttention(nn.Module):
         *,
         causal: bool,
         key_valid: Tensor | None = None,
-        past: LayerKV | None = None,
         positions: Tensor | None = None,
-    ) -> tuple[Tensor, LayerKV]:
+    ) -> Tensor:
         query, key, value = self.qkv(inputs).chunk(3, dim=-1)
         query = self._split_heads(query)
         key = self._split_heads(key)
@@ -159,35 +125,17 @@ class SelfAttention(nn.Module):
             query = self._apply_rope(query, positions)
             key = self._apply_rope(key, positions)
 
-        past_length = 0
-        if past is not None:
-            if past.key.shape[:2] != key.shape[:2] or past.key.shape[3] != key.shape[3]:
-                raise ValueError("KV cache shape does not match the attention layer")
-            past_length = past.key.shape[2]
-            key = torch.cat((past.key, key), dim=2)
-            value = torch.cat((past.value, value), dim=2)
-
         query_length = query.shape[2]
         key_length = key.shape[2]
         attention_mask: Tensor | None = None
-        if causal:
-            new_causal = torch.ones(
-                (query_length, query_length), device=inputs.device, dtype=torch.bool
+        native_causal = causal and key_valid is None
+        if causal and not native_causal:
+            attention_mask = torch.ones(
+                (query_length, key_length), device=inputs.device, dtype=torch.bool
             ).tril()
-            if past_length:
-                prefix = torch.ones(
-                    (query_length, past_length), device=inputs.device, dtype=torch.bool
-                )
-                attention_mask = torch.cat((prefix, new_causal), dim=1)
-            else:
-                attention_mask = new_causal
             attention_mask = attention_mask.view(1, 1, query_length, key_length)
 
         if key_valid is not None:
-            if past is not None:
-                raise ValueError(
-                    "key_valid is only supported by full-sequence attention"
-                )
             if key_valid.shape != (inputs.shape[0], key_length):
                 raise ValueError("key_valid has the wrong shape")
             valid_mask = key_valid[:, None, None, :]
@@ -201,9 +149,10 @@ class SelfAttention(nn.Module):
             value,
             attn_mask=attention_mask,
             dropout_p=self.dropout if self.training else 0.0,
+            is_causal=native_causal,
         )
         attended = attended.transpose(1, 2).contiguous().view(inputs.shape)
-        return self.output(attended), LayerKV(key, value)
+        return self.output(attended)
 
 
 class TransformerBlock(nn.Module):
@@ -220,18 +169,16 @@ class TransformerBlock(nn.Module):
         *,
         causal: bool,
         key_valid: Tensor | None = None,
-        past: LayerKV | None = None,
         positions: Tensor | None = None,
-    ) -> tuple[Tensor, LayerKV]:
-        attended, present = self.attention(
+    ) -> Tensor:
+        attended = self.attention(
             self.attention_norm(inputs),
             causal=causal,
             key_valid=key_valid,
-            past=past,
             positions=positions,
         )
         hidden = inputs + attended
-        return hidden + self.ffn(self.ffn_norm(hidden)), present
+        return hidden + self.ffn(self.ffn_norm(hidden))
 
 
 def _optional_index(values: Tensor, missing_index: int, maximum: int) -> Tensor:
@@ -385,12 +332,12 @@ class StaticStateEncoder(nn.Module):
         )
         key_valid = torch.cat((prefix_valid, ~meld_padding), dim=1)
         for block in self.blocks:
-            hidden, _ = block(hidden, causal=False, key_valid=key_valid)
+            hidden = block(hidden, causal=False, key_valid=key_valid)
         return self.output_norm(hidden[:, 0])
 
 
 class HistoryEncoder(nn.Module):
-    """GPT-style viewer-scoped event encoder with an incremental KV cache."""
+    """Causal viewer-scoped event encoder."""
 
     EVENT_KIND_COUNT = 11
 
@@ -432,61 +379,13 @@ class HistoryEncoder(nn.Module):
         batch, length, _ = events.shape
         positions = torch.arange(length, device=events.device)
         hidden = self._embed(events)
-        key_valid = positions[None, :] < lengths[:, None]
-        if length:
-            empty_rows = lengths == 0
-            key_valid[:, 0] |= empty_rows
         for block in self.blocks:
-            hidden, _ = block(
-                hidden, causal=True, key_valid=key_valid, positions=positions
-            )
+            hidden = block(hidden, causal=True, positions=positions)
         hidden = self.output_norm(hidden)
         indices = (lengths.long() - 1).clamp_min(0)
         summary = hidden[torch.arange(batch, device=events.device), indices]
         empty = self.empty_summary.unsqueeze(0).expand(batch, -1)
         return torch.where((lengths > 0)[:, None], summary, empty)
-
-    def forward_cached(
-        self,
-        new_events: Tensor,
-        cache: HistoryKVCache | None = None,
-    ) -> tuple[Tensor, HistoryKVCache]:
-        if new_events.ndim != 3 or new_events.shape[2] != EVENT_RECORD_WIDTH:
-            raise ValueError("new_events must have shape [batch, time, 8]")
-        if new_events.shape[1] == 0:
-            if cache is None:
-                raise ValueError("an initial history cache needs at least one event")
-            return cache.summary, cache
-
-        past_length = 0 if cache is None else cache.length
-        if past_length + new_events.shape[1] > self.config.max_history:
-            raise ValueError(
-                "history cache would exceed max_history; rebuild the window"
-            )
-        if cache is not None:
-            if len(cache.layers) != len(self.blocks):
-                raise ValueError("history cache layer count does not match the model")
-            if cache.summary.shape[0] != new_events.shape[0]:
-                raise ValueError("history cache batch size does not match new_events")
-
-        positions = torch.arange(
-            past_length,
-            past_length + new_events.shape[1],
-            device=new_events.device,
-        )
-        hidden = self._embed(new_events)
-        present_layers: list[LayerKV] = []
-        for index, block in enumerate(self.blocks):
-            past = None if cache is None else cache.layers[index]
-            hidden, present = block(
-                hidden, causal=True, past=past, positions=positions
-            )
-            present_layers.append(present)
-        summary = self.output_norm(hidden[:, -1])
-        present_cache = HistoryKVCache(
-            tuple(present_layers), past_length + new_events.shape[1], summary
-        )
-        return summary, present_cache
 
 
 class BloodFlowTransformer(nn.Module):
@@ -503,23 +402,6 @@ class BloodFlowTransformer(nn.Module):
             nn.SiLU(),
             nn.Linear(fused, ACTION_SPACE_SIZE),
         )
-        self.critic = nn.Sequential(
-            RMSNorm(fused),
-            nn.Linear(fused, fused),
-            nn.SiLU(),
-            nn.Linear(fused, self.config.value_atoms),
-        )
-        self.shanten_head = nn.Linear(width, SHANTEN_CLASS_COUNT)
-        self.improving_head = nn.Linear(width, TILE_KIND_COUNT)
-        self.register_buffer(
-            "value_support",
-            torch.linspace(
-                self.config.value_min,
-                self.config.value_max,
-                self.config.value_atoms,
-            ),
-            persistent=True,
-        )
         self.apply(self._initialize)
 
     @staticmethod
@@ -531,12 +413,12 @@ class BloodFlowTransformer(nn.Module):
         elif isinstance(module, nn.Embedding):
             nn.init.normal_(module.weight, std=0.02)
 
-    def _heads(
+    def _policy(
         self,
         static: Tensor,
         history: Tensor,
         legal_mask: Tensor | None,
-    ) -> ActorCriticOutput:
+    ) -> PolicyOutput:
         fused = torch.cat((static, history), dim=-1)
         raw_logits = self.actor(fused)
         logits = raw_logits
@@ -547,19 +429,7 @@ class BloodFlowTransformer(nn.Module):
             logits = raw_logits.masked_fill(
                 ~legal_mask, torch.finfo(raw_logits.dtype).min
             )
-        value_logits = self.critic(fused)
-        probabilities = torch.softmax(value_logits.float(), dim=-1)
-        value = probabilities @ self.value_support.float()
-        return ActorCriticOutput(
-            logits=logits,
-            raw_logits=raw_logits,
-            value_logits=value_logits,
-            value=value,
-            shanten_logits=self.shanten_head(static),
-            improving_logits=self.improving_head(static),
-            static_embedding=static,
-            history_embedding=history,
-        )
+        return PolicyOutput(logits=logits, raw_logits=raw_logits)
 
     def forward(
         self,
@@ -569,23 +439,10 @@ class BloodFlowTransformer(nn.Module):
         events: Tensor,
         event_lengths: Tensor,
         legal_mask: Tensor | None = None,
-    ) -> ActorCriticOutput:
+    ) -> PolicyOutput:
         static = self.static_encoder(tile_obs, melds, meta)
         history = self.history_encoder(events, event_lengths)
-        return self._heads(static, history, legal_mask)
-
-    def forward_cached(
-        self,
-        tile_obs: Tensor,
-        melds: Tensor,
-        meta: Tensor,
-        new_events: Tensor,
-        cache: HistoryKVCache | None = None,
-        legal_mask: Tensor | None = None,
-    ) -> tuple[ActorCriticOutput, HistoryKVCache]:
-        static = self.static_encoder(tile_obs, melds, meta)
-        history, next_cache = self.history_encoder.forward_cached(new_events, cache)
-        return self._heads(static, history, legal_mask), next_cache
+        return self._policy(static, history, legal_mask)
 
 
 def _validate_static_inputs(tile_obs: Tensor, melds: Tensor, meta: Tensor) -> None:

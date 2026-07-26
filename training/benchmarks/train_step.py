@@ -22,12 +22,6 @@ def main() -> None:
         args.batch_size, args.history, device
     )
     target_actions = torch.zeros(args.batch_size, dtype=torch.long, device=device)
-    target_values = torch.full(
-        (args.batch_size,),
-        model.config.value_atoms // 2,
-        dtype=torch.long,
-        device=device,
-    )
     for _ in range(2):
         optimizer.zero_grad(set_to_none=True)
         with torch.autocast(
@@ -36,13 +30,9 @@ def main() -> None:
             enabled=device.type == "cuda",
         ):
             output = model(tile_obs, melds, meta, events, lengths, legal)
-            policy_loss = torch.nn.functional.cross_entropy(
+            loss = torch.nn.functional.cross_entropy(
                 output.raw_logits, target_actions
             )
-            value_loss = torch.nn.functional.cross_entropy(
-                output.value_logits, target_values
-            )
-            loss = policy_loss + 0.5 * value_loss
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
         optimizer.step()
@@ -56,9 +46,6 @@ def main() -> None:
     ):
         output = model(tile_obs, melds, meta, events, lengths, legal)
         loss = torch.nn.functional.cross_entropy(output.raw_logits, target_actions)
-        loss = loss + 0.5 * torch.nn.functional.cross_entropy(
-            output.value_logits, target_values
-        )
     loss.backward()
     torch.nn.utils.clip_grad_norm_(model.parameters(), 0.5)
     optimizer.step()

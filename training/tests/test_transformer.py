@@ -20,7 +20,6 @@ def config() -> TransformerConfig:
         history_layers=2,
         ffn_dim=96,
         max_history=32,
-        value_atoms=17,
     )
 
 
@@ -64,16 +63,18 @@ def test_mask_unpack_matches_fixed_action_space() -> None:
     assert not dense[0, 31]
 
 
-def test_default_model_stays_in_the_planned_size() -> None:
+def test_default_actor_stays_in_the_planned_size() -> None:
     parameters = sum(
         parameter.numel() for parameter in BloodFlowTransformer().parameters()
     )
-    assert 3_000_000 <= parameters <= 5_000_000
+    assert 8_000_000 <= parameters <= 10_000_000
 
 
-def test_history_uses_rope_and_requires_even_head_dimensions() -> None:
+def test_history_uses_rope_and_has_no_cache_api() -> None:
     model = BloodFlowTransformer(config())
     assert not hasattr(model.history_encoder, "position_embedding")
+    assert not hasattr(model.history_encoder, "forward_cached")
+    assert not hasattr(model, "forward_cached")
     assert all(
         hasattr(block.attention, "rope_inverse")
         for block in model.history_encoder.blocks
@@ -88,25 +89,18 @@ def test_history_uses_rope_and_requires_even_head_dimensions() -> None:
         )
 
 
-def test_transformer_forward_backward_and_masking() -> None:
-    model = BloodFlowTransformer(config())
-    model.train()
+def test_actor_forward_backward_and_masking() -> None:
+    model = BloodFlowTransformer(config()).train()
     inputs = state()
     output = model(*inputs)
     assert output.logits.shape == (3, 115)
-    assert output.value_logits.shape == (3, 17)
-    assert output.value.shape == (3,)
-    assert output.shanten_logits.shape == (3, 10)
-    assert output.improving_logits.shape == (3, 27)
-    assert torch.all(output.logits[~inputs[-1]] == torch.finfo(output.logits.dtype).min)
-
-    loss = (
-        output.logits[inputs[-1]].mean()
-        + output.value_logits.square().mean()
-        + output.shanten_logits.square().mean()
-        + output.improving_logits.square().mean()
+    assert output.raw_logits.shape == (3, 115)
+    assert set(output.__dataclass_fields__) == {"logits", "raw_logits"}
+    assert torch.all(
+        output.logits[~inputs[-1]] == torch.finfo(output.logits.dtype).min
     )
-    loss.backward()
+
+    output.logits[inputs[-1]].mean().backward()
     gradients = [
         parameter.grad for parameter in model.parameters() if parameter.grad is not None
     ]
@@ -114,30 +108,7 @@ def test_transformer_forward_backward_and_masking() -> None:
     assert all(torch.isfinite(gradient).all() for gradient in gradients)
 
 
-def test_cached_history_matches_full_history() -> None:
-    model = BloodFlowTransformer(config()).eval()
-    tile_obs, melds, meta, events, lengths, legal = state(batch=1, history=7)
-    with torch.no_grad():
-        full = model(tile_obs, melds, meta, events, lengths, legal)
-        first_history, cache = model.history_encoder.forward_cached(events[:, :3])
-        assert first_history.shape == (1, 48)
-        cached, cache = model.forward_cached(
-            tile_obs,
-            melds,
-            meta,
-            events[:, 3:7],
-            cache,
-            legal,
-        )
-    assert cache.length == 7
-    torch.testing.assert_close(
-        cached.history_embedding, full.history_embedding, atol=1e-5, rtol=1e-5
-    )
-    torch.testing.assert_close(cached.logits, full.logits, atol=1e-5, rtol=1e-5)
-    torch.testing.assert_close(cached.value, full.value, atol=1e-5, rtol=1e-5)
-
-
-def test_right_padding_can_be_safely_trimmed_before_forward() -> None:
+def test_right_padding_can_be_trimmed_before_forward() -> None:
     model = BloodFlowTransformer(config()).eval()
     tile_obs, melds, meta, events, lengths, legal = state(batch=2, history=7)
     padded = torch.zeros((2, 32, 8), dtype=torch.int32)
@@ -146,9 +117,40 @@ def test_right_padding_can_be_safely_trimmed_before_forward() -> None:
         trimmed = model(tile_obs, melds, meta, events, lengths, legal)
         masked_padding = model(tile_obs, melds, meta, padded, lengths, legal)
     torch.testing.assert_close(
-        trimmed.history_embedding, masked_padding.history_embedding, atol=1e-5, rtol=1e-5
+        trimmed.logits, masked_padding.logits, atol=1e-5, rtol=1e-5
     )
-    torch.testing.assert_close(trimmed.logits, masked_padding.logits, atol=1e-5, rtol=1e-5)
+
+
+def test_mixed_history_lengths_ignore_nonzero_right_padding() -> None:
+    model = BloodFlowTransformer(config()).eval()
+    tile_obs, melds, meta, events, _, legal = state(batch=3, history=12)
+    lengths = torch.tensor([0, 5, 12], dtype=torch.int64)
+    generator = torch.Generator().manual_seed(29)
+    padded = events.clone()
+    for row, length in enumerate(lengths.tolist()):
+        if length < padded.shape[1]:
+            padded[row, length:] = torch.randint(
+                -100,
+                100,
+                padded[row, length:].shape,
+                generator=generator,
+                dtype=torch.int32,
+            )
+    with torch.no_grad():
+        mixed = model(tile_obs, melds, meta, padded, lengths, legal)
+        for row, length in enumerate(lengths.tolist()):
+            width = max(length, 1)
+            trimmed = model(
+                tile_obs[row : row + 1],
+                melds[row : row + 1],
+                meta[row : row + 1],
+                events[row : row + 1, :width],
+                lengths[row : row + 1],
+                legal[row : row + 1],
+            )
+            torch.testing.assert_close(
+                mixed.logits[row], trimmed.logits[0], atol=1e-5, rtol=1e-5
+            )
 
 
 def test_empty_history_length_uses_finite_learned_summary() -> None:
@@ -156,14 +158,6 @@ def test_empty_history_length_uses_finite_learned_summary() -> None:
     events = torch.zeros((1, 4, 8), dtype=torch.int32)
     summary = encoder(events, torch.zeros(1, dtype=torch.int64))
     assert torch.isfinite(summary).all()
-
-
-def test_history_cache_rejects_overflow() -> None:
-    encoder = HistoryEncoder(config()).eval()
-    events = torch.zeros((1, 32, 8), dtype=torch.int32)
-    _, cache = encoder.forward_cached(events[:, :31])
-    with pytest.raises(ValueError, match="exceed"):
-        encoder.forward_cached(events[:, :2], cache)
 
 
 def test_engine_observation_smoke() -> None:
@@ -191,4 +185,4 @@ def test_engine_observation_smoke() -> None:
             torch.from_numpy(unpack_action_masks(masks)),
         )
     assert output.logits.shape == (batch_size, 115)
-    assert torch.isfinite(output.value).all()
+    assert torch.isfinite(output.logits).all()

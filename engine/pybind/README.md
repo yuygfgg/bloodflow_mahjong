@@ -145,6 +145,29 @@ views rather than copying them. The GIL is released while reset, mask, and step
 work runs in Rust; the Rust batch implementation uses Rayon for sufficiently
 large batches.
 
+## Deterministic replay and information-set sampling
+
+`ENGINE_RULES_VERSION` identifies the rule and initialization semantics used by
+a compact seed/action replay. A stored trajectory should reject a different
+version instead of attempting compatibility migration.
+
+`Game.resample_information_set(seed)` returns an independent determinization
+whose current actor observation and legal mask are byte-identical to the source
+state. `Batch.resample_information_sets(indices, seeds)` combines indexed clone
+and resampling for selective Monte Carlo queries; repeated indices with paired
+seeds let candidate actions share the same hidden worlds. On ordinary turns,
+opponents' non-locked concealed tiles and the live wall are shuffled together.
+Already-selected exchange hands are fixed, and response-window hands are fixed
+because the pending Hu/Pong/Kong candidate mask itself depends on those hands.
+Response states still receive an independently shuffled future wall.
+
+For optional training-only Oracle Critics, `Game.oracle_tile_counts_into` and
+`Batch.oracle_tile_counts_into` write `uint8[..., 9, 27]`: four absolute-seat
+concealed hands, four corresponding locked subsets, and one unordered live-wall
+histogram. This buffer is perfect information and must never enter the Actor's
+deployment input. Calling it does not alter or extend the ordinary viewer
+observation.
+
 Observations are rotated to the current actor: relative seat zero is the policy
 that acts next, followed by seats 1, 2, and 3 in turn order. A terminal game has
 no actor and uses the dealer as relative seat zero.

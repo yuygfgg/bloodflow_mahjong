@@ -300,6 +300,140 @@ def test_reset_many_rejects_shape_dtype_and_layout() -> None:
         )
 
 
+def test_clone_indices_repeats_states_and_is_independent() -> None:
+    batch = bm.Batch(4, seed=23)
+    clone = batch.clone_indices(np.asarray([2, 2, 0], dtype=np.uint32))
+    assert len(clone) == 3
+
+    original_masks = np.empty((4, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    clone_masks = np.empty((3, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    batch.legal_action_masks_into(original_masks)
+    clone.legal_action_masks_into(clone_masks)
+    np.testing.assert_array_equal(clone_masks[0], original_masks[2])
+    np.testing.assert_array_equal(clone_masks[1], original_masks[2])
+    np.testing.assert_array_equal(clone_masks[2], original_masks[0])
+
+    clone_actions = np.asarray(
+        [first_legal_action(words) for words in clone_masks], dtype=np.uint8
+    )
+    clone_records = np.empty((3, bm.STEP_RECORD_WIDTH), dtype=np.int64)
+    clone.step_into(clone_actions, clone_records)
+    unchanged_masks = np.empty_like(original_masks)
+    batch.legal_action_masks_into(unchanged_masks)
+    np.testing.assert_array_equal(unchanged_masks, original_masks)
+
+    with pytest.raises(ValueError, match="out of range"):
+        batch.clone_indices(np.asarray([0, 4], dtype=np.uint32))
+
+
+def test_information_set_resampling_preserves_viewer_observation() -> None:
+    game = bm.Game(seed=913)
+    while game.phase in (bm.PHASE_EXCHANGE, bm.PHASE_CHOOSE_MISSING):
+        action = game.simple_rule_action()
+        assert action is not None
+        game.step_id(action)
+    assert game.decision is not None
+    viewer = game.decision[0]
+
+    tile_obs = np.empty((bm.TILE_OBSERVATION_PLANES, 27), dtype=np.uint8)
+    melds = np.empty((4, bm.MELD_SLOTS, bm.MELD_FIELDS), dtype=np.uint8)
+    river = np.empty((bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8)
+    meta = np.empty(bm.META_OBSERVATION_WIDTH, dtype=np.int32)
+    game.observe_into(viewer, tile_obs, melds, river, meta)
+
+    sampled = game.resample_information_set(71)
+    sampled_tile_obs = np.empty_like(tile_obs)
+    sampled_melds = np.empty_like(melds)
+    sampled_river = np.empty_like(river)
+    sampled_meta = np.empty_like(meta)
+    sampled.observe_into(
+        viewer,
+        sampled_tile_obs,
+        sampled_melds,
+        sampled_river,
+        sampled_meta,
+    )
+    np.testing.assert_array_equal(sampled_tile_obs, tile_obs)
+    np.testing.assert_array_equal(sampled_melds, melds)
+    np.testing.assert_array_equal(sampled_river, river)
+    np.testing.assert_array_equal(sampled_meta, meta)
+
+    oracle = np.empty((bm.ORACLE_TILE_COUNT_PLANES, 27), dtype=np.uint8)
+    sampled_oracle = np.empty_like(oracle)
+    game.oracle_tile_counts_into(oracle)
+    sampled.oracle_tile_counts_into(sampled_oracle)
+    np.testing.assert_array_equal(
+        oracle[:4].sum(axis=0) + oracle[8],
+        sampled_oracle[:4].sum(axis=0) + sampled_oracle[8],
+    )
+    assert not np.array_equal(sampled_oracle, oracle)
+
+
+def test_explicit_viewer_observation_masks_another_players_draw() -> None:
+    game = bm.Game(seed=127)
+    for _ in range(256):
+        if game.current_draw is not None:
+            break
+        action = game.simple_rule_action()
+        assert action is not None
+        game.step_id(action)
+    assert game.current_draw is not None
+    drawer = game.current_draw[0]
+    other = (drawer + 1) % 4
+    drawer_tile = np.empty((bm.TILE_OBSERVATION_PLANES, 27), dtype=np.uint8)
+    other_tile = np.empty_like(drawer_tile)
+    drawer_melds = np.empty((4, bm.MELD_SLOTS, bm.MELD_FIELDS), dtype=np.uint8)
+    other_melds = np.empty_like(drawer_melds)
+    drawer_river = np.empty((bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np.uint8)
+    other_river = np.empty_like(drawer_river)
+    drawer_meta = np.empty(bm.META_OBSERVATION_WIDTH, dtype=np.int32)
+    other_meta = np.empty_like(drawer_meta)
+
+    game.observe_into(drawer, drawer_tile, drawer_melds, drawer_river, drawer_meta)
+    game.observe_into(other, other_tile, other_melds, other_river, other_meta)
+
+    assert drawer_meta[5] == game.current_draw[1]
+    assert other_meta[5] == -1
+    assert drawer_meta[1] == other_meta[1] == drawer
+
+
+def test_batch_information_set_sampling_and_oracle_buffers() -> None:
+    batch = bm.Batch(4, seed=23)
+    _, original_masks, original_tile, original_melds, original_river, original_meta = (
+        buffers(4)
+    )
+    batch.legal_action_masks_into(original_masks)
+    batch.observe_into(original_tile, original_melds, original_river, original_meta)
+    indices = np.asarray([2, 2, 0], dtype=np.uint32)
+    seeds = np.asarray([101, 101, 103], dtype=np.uint64)
+
+    sampled = batch.resample_information_sets(indices, seeds)
+    _, sampled_masks, sampled_tile, sampled_melds, sampled_river, sampled_meta = buffers(
+        len(indices)
+    )
+    sampled.legal_action_masks_into(sampled_masks)
+    sampled.observe_into(sampled_tile, sampled_melds, sampled_river, sampled_meta)
+    np.testing.assert_array_equal(sampled_masks, original_masks[indices])
+    np.testing.assert_array_equal(sampled_tile, original_tile[indices])
+    np.testing.assert_array_equal(sampled_melds, original_melds[indices])
+    np.testing.assert_array_equal(sampled_river, original_river[indices])
+    np.testing.assert_array_equal(sampled_meta, original_meta[indices])
+
+    oracle = np.empty((len(indices), bm.ORACLE_TILE_COUNT_PLANES, 27), dtype=np.uint8)
+    sampled.oracle_tile_counts_into(oracle)
+    np.testing.assert_array_equal(oracle[0], oracle[1])
+    assert np.all(oracle[:, 4:8] <= oracle[:, :4])
+
+    with pytest.raises(ValueError, match="shape"):
+        batch.resample_information_sets(indices, seeds[:2])
+    with pytest.raises(ValueError, match="out of range"):
+        batch.resample_information_sets(
+            np.asarray([4], dtype=np.uint32), np.asarray([1], dtype=np.uint64)
+        )
+    with pytest.raises(ValueError, match="shape"):
+        sampled.oracle_tile_counts_into(np.empty((3, 8, 27), dtype=np.uint8))
+
+
 def test_batch_rejects_wrong_shape_dtype_and_layout() -> None:
     batch = bm.Batch(8)
     with pytest.raises(ValueError, match="shape"):

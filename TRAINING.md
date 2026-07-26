@@ -1,237 +1,332 @@
-# 血流麻将 AI 训练设计
+# 无牌谱 IQL/AWR 训练方案
 
-本文定义无真人牌谱条件下的首版训练方案和冷启动规则策略。首个理想实验只用规则 AI 直接启动 Transformer；ResNet 不进入这条训练链路，等 Transformer 训练闭环稳定后再作为吞吐和样本效率对照。目标是在单张 RTX 5080 16GB、单次约 24 小时的预算内，建立可重复评测和持续迭代的训练闭环。
-
-## 原则与边界
-
-- 只使用当前行动者可见的策略观测。其他玩家暗手和牌墙只允许进入训练期 Critic 或辅助标签，不能进入 Actor。
-- Actor 从第一步就只优化实际分差；向听、有效牌等规则指标只作为很小、很短的结构辅助，不作为胡牌奖励。
-- 每局只训练一个座位，另外三个绝对座位分别从四种对手策略族中采样。learner 座位在牌局间轮换，保证四个座位都被训练。
-- 训练过程用固定种子、四座轮换的 1v3 对局评测候选，不以训练 loss 或单次自博弈胜率判断强度。
-- 首版只实现 Transformer 的 rollout、PPO 和评测器。ResNet 的输入和动作接口保留为未来对照，不为了它提前加入一套手工牌形特征。
-
-## 共享输入编码
-
-引擎观测是行动者视角，静态状态包含 `tile_obs[10,27]`、`melds[4,4,3]` 和 `meta[34]`；时间轴使用最近最多 192 条 `events[192,8]`。`river[108,2]` 保留给规则检查和消融，不再同时送入首版模型，避免和事件历史重复编码。模型侧按以下语义编码：
-
-- 27 个牌种特征：自己的暗手和换牌选择、四家锁牌、四家弃牌计数、公开副露汇总、当前摸牌和响应牌标记。
-- 最多 192 个历史事件：事件类型、相对行动者/目标、牌种、flags、数值字段和时间位置。
-- 16 个副露槽：牌种、类型、相对玩家和来源玩家。
-- 4 个玩家特征：相对庄家、当前分数、缺门、是否已经胡牌、暗手张数和历史最大胡牌倍率。
-- 全局特征：阶段、换牌方向、墙剩余、换牌进度、补牌和响应 flags。
-
-计数 `0..4`、花色、阶段、座位和副露类型使用 categorical embedding；分数除以 `10_000`，墙剩余除以 `55`，最大倍率使用 `log2(1+x)` 后归一化。`meta[1]` 的绝对行动座位不输入模型。
-
-花色置换是合理的后续增强，但不能只在 PPO minibatch 中改观测：那会让 rollout 保存的 old log-prob 与增强后的状态不匹配。首版实现暂不做增强；若加入，必须在 rollout 推理前为每局固定采样一种置换，并把观测、事件、合法动作、执行动作和辅助标签一起映射。座位不做镜像增强，因为行牌方向和响应次序不是任意置换对称。
-
-## 首版模型：静态编码器 + GPT 历史编码器
-
-首版模型明确拆成两条路径：一个小型双向 Transformer 编码“当下”，一个 GPT 式因果 Transformer 编码 viewer-scoped 事件时间轴。两边各自产生一个 192 维 embedding，拼成 384 维后由全连接 Actor 和分布式 Critic 输出。这里不加入 ResNet 或额外手工牌形通道。
-
-| 参数 | 配置 |
-|---|---|
-| `d_model` | 192 |
-| static blocks | 2，双向 full attention |
-| history blocks | 4，causal attention |
-| attention heads | 6 |
-| FFN | 768，SwiGLU |
-| history position encoding | standard RoPE on Q/K，`theta=10,000` |
-| normalization | Pre-RMSNorm |
-| dropout | 0 |
-| 计算精度 | BF16，FP32 optimizer state |
-
-静态序列是 `[GLOBAL] + 27 TILE + 4 PLAYER + 16 MELD`，共 48 个 token。双向 attention 可以完整比较三门牌、公开副露、锁牌、当前分数和缺门状态；`GLOBAL` 输出作为 static embedding。
-
-历史序列最多 192 个 event token，按时间顺序使用 causal mask，最后一个有效 token 的输出作为 history embedding。历史塔不再把可学习绝对位置向量加到 event embedding，而是在每层 attention 的 Q/K 上使用标准交错 RoPE（`theta=10,000`）。full forward 使用 `0..L-1` 位置；KV cache 追加时使用 `past_length..past_length+delta-1`，因此 cached/full 输出保持一致。rollout 为 learner 和冻结 Transformer 各维护一套 `(环境,绝对座位)` cache；viewer 变化、reset 或 192-token 滑动窗口变化时自动 full rebuild。少于 32 行的碎组并入一次 padded full forward，避免 cache 反而制造大量小 kernel；rollout 结束后释放全部 K/V，再进入 PPO。
-
-拼接后的 384 维表示经过两层 MLP 输出 115 维 Actor logits，再应用 Legal Action Mask。Critic 输出固定 `[-4,4]` support 上的 categorical value distribution，并由其期望得到标量 value；Actor advantage 始终对应未经裁剪的真实分差。
-
-预计参数量约 300 万到 400 万。这个拆分只包含一个明确的结构先验：当下状态允许双向比较，历史只能看过去。先验证规则 AI 直接冷启动能否学到分数策略，再决定是否需要更复杂的融合。
-
-## 后置对照：牌种 ResNet + 牌河塔
-
-牌种分支把 27 种牌 reshape 为 `[3,9]`，卷积只沿同花色的 rank 轴进行：
-
-| 参数 | 配置 |
-|---|---|
-| channels | 192 |
-| residual blocks | 20 |
-| convolution | 每块两个 `(1,3)` convolution |
-| normalization | GroupNorm 16 groups |
-| activation | SiLU |
-| river tower | 128 channels，4 个 dilation `1,2,4,8` temporal blocks |
-| fusion | 512 维全局上下文回注到 27 个牌位置 |
-| 计算精度 | BF16，FP32 optimizer state |
-
-牌种分支不做 pooling。三个花色共享卷积权重，牌种特征与全局上下文融合后使用结构化策略头。该模型只在 Transformer 基线跑通后作为吞吐对照，不参与首版冷启动，不把额外的人类牌形先验混入首个实验。
-
-预计参数量约 600 万到 800 万。它可能更快学会向听和普通胡，但不能据此推断后期总分上限；比较时按相同环境步数和 wall-clock 同时报告，不以最初两小时的胡牌率选型。
-
-## Actor、Critic 与辅助任务
-
-Actor 和首版 Critic 都只使用当前行动者可见的静态状态 embedding 与 viewer-scoped 历史 embedding。Critic 输出 `[-4,4]` support 上的 categorical 分布，并以期望值作为 PPO value；不对 Actor 暴露其他玩家暗手或牌墙。训练期 oracle Critic（四家暗手和剩余牌墙）作为后续消融，不是首版实现依赖。
-
-首版实际训练两个低权重辅助头：
-
-- 首次胡牌前的常规结构向听数，权重 `0.01..0.03`，前 10% 到 15% transitions 退火到零；
-- 首次胡牌前的 27 维有效牌标签，接在静态结构分支，不反向主导历史上下文；
-
-以下只保留为后续候选，不在当前 pipeline 中假装已经实现：
-
-- 当前可胡牌型的 `log2(multiplier)` 分类和未来胡牌概率；
-- 分数回报分布或 quantile value，而不是只预测“有没有胡”；
-- 三家暗手计数的 belief prediction；
-- 未来若干个同座位决策内的胡牌、点炮、杠收益、终局结算和分差。
-
-辅助标签不参与推理。向听辅助头只在目标有效时计算 loss，不把终局哨兵或胡后常规 `-1` 当作标签。Actor 不增加胡牌次数或倍率 bonus；真实 score delta 已经表达低价值多胡和高价值少胡的权衡。
-
-## 向听 API 与训练用法
-
-引擎提供常规结构向听 evaluator，同时考虑标准四组一对、血流规则下龙七对的“四张算两对”、公开副露和定缺约束：
-
-- Rust `analyze_shanten(counts, melds, missing_suit)` 返回 `ShantenAnalysis { shanten, improving_tiles }`；只需要数值时使用 `evaluate_shanten`。
-- Rust `Game::hand_analysis(seat)` 分析指定座位；`Batch::hand_analysis_into` 批量分析全部当前行动者，`Batch::hand_analysis_indices_into` 只分析所选行。
-- Python `Game.hand_analysis(seat) -> (shanten, improving_mask)`；训练使用 `Batch.hand_analysis_indices_into(uint32[N], int8[N], uint32[N])`，不会为约四分之一的 learner 行计算整个 batch。
-- `shanten=-1` 表示已经包含胡牌结构，`0` 表示听牌，普通结果上限为 `8`。批量终局槽使用 `SHANTEN_TERMINAL=127`。
-- `improving_tiles` 的低 27 bit 对应牌种；置位表示加入该牌会严格降低结构向听，不代表牌墙中一定还有该牌。
-
-这是“当前完整持牌中是否已有一个成牌子结构”的常规向听，不是血流玩家胡牌后“距下一次可结算胡牌还有几步”。胡后锁定的旧结构仍在持牌中，结果通常持续为 `-1`。首版训练中，向听势函数和有效牌辅助 loss 必须在 `has_won` 后关闭；下一胡距离需要另做 lock-aware evaluator，不能复用本接口。
-
-定缺牌不能组成面子或对子。势函数还应把当前缺门张数作为单独、较小的惩罚项；不要把它伪装成精确向听的一部分。有效牌剩余数由训练器用手牌和公开牌估算，隐藏牌墙不能进入 Actor 特征。
-
-## 逐玩家 transition 与奖励
-
-同一个玩家的一条 transition 从该玩家提交动作开始，到它下一次获得决策结束。收集器必须按绝对座位维护 pending transition：
-
-1. 玩家 `p` 行动时保存观测、动作、log-prob 和 value。
-2. 后续每个引擎 step 都把 `record[5+p] / 10_000` 累加到该 transition。
-3. 玩家 `p` 再次行动时，用新的行动者视角观测结束上一条 transition。
-4. 终局关闭四家的全部 pending transition。
-
-这保证弃牌后经过多人响应才发生的点炮损失仍归因给原弃牌者。不能把一个 step 的分差简单交给执行该 step 的行动者。
-
-基础奖励为真实分差：
+本文对应 `training/` 当前实现。主链路使用完整合成轨迹上的离线到在线策略迭代：
 
 ```text
-r_score = score_delta / 10_000
+冻结 SL / 规则 / 当前策略 / 历史策略生成完整对局
+    -> 紧凑轨迹和严格确定性重放
+    -> Monte-Carlo return-to-go
+    -> 独立 Double-Q + Expectile V
+    -> 通过校准门控后做 AWR Actor 提取
+    -> 立即生成新轨迹并继续训练
 ```
 
-首版不额外加入排名奖励；如果部署目标最终按名次结算，再单独做小权重的后期 rank fine-tune。已经逐步累计分差后不能再次加入最终总分。
+训练只支持 CUDA，默认无限运行，直到用户按 `Ctrl+C`。没有自动停止、强制解冻或按 update 数强行推进 Actor 的兜底。
 
-冷启动阶段曾考虑以下势函数：
+## 信息边界和奖励
+
+- Actor、Q1、Q2 和 V 只能读取当前行动者可见的手牌、公开状态和 viewer-scoped 事件历史。
+- Critic 与 Actor 完全不共享参数，Critic 梯度不能覆盖 SL Actor 已学到的表征。
+- 每一步的目标是该座位从当前动作到终局的真实累计分差，按 `10_000` 归一化。
+- 不加入排名奖励、胡牌 bonus、手工 shaping 或 reward clipping。
+- 四个座位和九类决策都进入 replay，不能只训练中后盘弃牌。
+- 非法动作在 Actor 和 Q 网络内都被 legal mask 排除。
+
+对于轨迹中第 `t` 个动作和座位 `i`：
 
 ```text
-r = r_score + beta * (potential(next_state) - potential(state))
+G_t(i) = sum_{k=t..terminal} score_delta_k(i) / 10_000
 ```
 
-首版实现默认令 `beta=0`，即从第一个 transition 起只使用真实分差。只有冷启动实测出现长时间零收益时才开启该消融；首次胡牌前的 `potential` 只能由常规向听数、公开估计有效牌剩余数和缺门张数组成，胡牌后必须关闭。不要用 reward clipping 或 log transform 抹平 1 倍和高倍率实际分差；Critic 使用分布式 value 处理长尾。
+开局的正确期望通常接近零，因此 Critic 是否学会不能只看全局 value loss。验证会按早、中、晚局和九类动作分别报告误差、相关性、常数基线改进和 Double-Q disagreement。
 
-## 冷启动规则对手
+## Actor 和 SL 引用
 
-对手池有四种真正接入 rollout 的策略族，不是四个同时上桌的额外玩家：
+默认 Actor 是约 8.84M 参数的双塔 Transformer：
 
-| 名称 | 行为 | 用途 |
-|---|---|---|
-| `random_hu` | 有胡必胡，否则均匀随机合法动作 | 保持探索和最低强度锚点 |
-| `rule_fast` | 引擎确定性 R2：弱门换牌/定缺，弃牌最小化精确向听并最大化公开估计有效张；积极碰杠 | 快速成牌冷启动 |
-| `rule_safe` | 以 `rule_fast` 为结构默认，拒绝可过的碰/直杠；有明显更安全的公开熟张时才覆盖原弃牌 | 制造不同攻守轨迹 |
-| `frozen_transformer` | 当前 learner 的冻结快照或保留的历史快照，只读取行动者观测 | 逐步转入自博弈 |
+- `d_model=256`、8 个 attention heads；
+- 静态状态塔 3 层双向 self-attention；
+- 历史塔 5 层 causal self-attention，最多 192 条事件并使用 RoPE；
+- FFN 宽度 1024，策略头输出 115 个动作 logits。
 
-`rule_fast` 只能读取当前行动者暗手、自己的换牌选择、合法动作及公开锁牌、副露和弃牌。它不评估番型收益，也不读取对手暗手或牌墙，因此是冷启动基线，不是专家教师。Python 可用 `Game.simple_rule_action()` 和 `Batch.simple_rule_actions_into(uint8[B])` 调用；批量终局槽写 `SIMPLE_RULE_ACTION_TERMINAL=255`。
+新训练器不执行 SL。它直接读取当前 Actor-only 格式的：
 
-首版不做规则动作模仿：随机初始化的 Transformer 直接对阵上述在线对手，规则策略不产生监督 loss。只有实测出现数值不稳定、几乎不胡或 entropy 崩溃时，才单独实验最多 1 epoch 的在线动作预热；进入 PPO 前移除 imitation loss。ResNet 不参与首版链路。
+```text
+runs/counterfactual-larger/sl_reference.pt
+```
 
-## PPO 与对手联赛
+该策略同时作为：
 
-首版 PPO 配置：
+1. 当前 Actor 的初始化；
+2. 永久冻结的参考策略；
+3. 合成数据行为策略和对手池成员；
+4. AWR 更新中的 KL 锚点。
 
-| 参数 | 初始值 |
-|---|---|
-| parallel environments | 2048 |
-| learner batch | 65,536 个完整逐玩家 transitions |
-| PPO epochs | 2 |
-| minibatch | 4096，microbatch 512 累积；按历史长度分桶并裁剪右侧 padding |
-| rollout KV cache 分组阈值 | 1024 行；小于阈值走一次合并的 full forward |
-| learning rate | `2e-4` cosine decay 到 `3e-5` |
-| gamma | 1.0 |
-| GAE lambda | 0.95 |
-| policy clip | 0.15 |
-| value coefficient | 0.5 |
-| max gradient norm | 0.5 |
-| target KL | 0.015 |
-| 规则混入门槛 | 首位率 `>= 0.70`，连续 3 次评测 |
-| league 门槛 | 首位率 `>= 0.80`，连续 3 次评测 |
-| entropy | `H/log(max(legal_count,2))`，系数 `0.01` 退火到 `0.002` |
+`--sl-checkpoint` 必须是只含 `model_config` 与 `model` 的 Actor-only 文件。训练目录不会生成或覆盖该参考策略。
 
-每局是 `1 learner + 3 opponent`。另外三个绝对座位独立采样策略类型，因此同桌可以同时出现 `rule_fast`、`rule_safe` 和冻结 Transformer；不会强行让三个 opponent 使用同一种策略。为保持 GPU 批量推理效率，每个 rollout 只激活一个 Transformer 快照，所有抽中 `frozen_transformer` 的座位共享该版本。PPO policy loss 不按高倍率结果重采样。
+## 完整轨迹数据
 
-对手 curriculum 不再按 learner transitions 的百分比切换，而由固定规则锚点评测门控。规则评测使用模型作为一方、另外三家使用 `simple_rule_actions_into`，以首位率作为“赢过三家规则对手”的定义。为避免 256 局噪声误触发，必须连续 3 次评测通过门槛；评测状态也会写入 checkpoint。
+### 采集
 
-| 阶段 | 默认范围 | `random_hu` | `rule_fast` | `rule_safe` | `frozen_transformer` |
-|---|---:|---:|---:|---:|---:|
-| bootstrap | 规则首位率 `< 70%`，或尚未连续通过 3 次 | 30% | 50% | 20% | 0% |
-| mixed | 规则首位率 `70%..<80%`，连续通过 70% 门槛 | 10% | 35% | 20% | 35% |
-| league | 规则首位率 `>= 80%`，连续通过 80% 门槛 | 5% | 15% | 15% | 65% |
+每局从初始 seed 开始完整运行到引擎终局，一局同时记录四个座位的所有决策。默认使用 512 个并行环境，先采集 8192 局永久 anchor 数据，之后每轮再采集 1024 局在线数据。
 
-上表是“每个非 learner 座位”的抽样概率，不是四家座位的占比。达到 70% 只代表开始引入 Transformer 对手，不代表已经可以纯自博弈；达到 80% 后仍保留 35% 的规则对手作为锚点。当前版本不根据规则胜率自动切换到纯 Transformer self-play，避免模型在尚未证明能稳定击败规则策略时脱离外部锚点。日志中的 `opponent_assignments` 统计的是三个 opponent seat 的策略抽样次数。
+CUDA 推理会把同策略行数 pad 到少量固定 batch bucket，并把有效历史长度 pad 到分桶宽度；重复行只用于计算填充，结果会在写回前截断，不改变动作分布。训练包还默认启用 PyTorch expandable allocator segments。这两项用于避免长时间混合策略采集时为大量不同 attention shape 保留碎片化显存；在 RTX 5080 16GB 上，完整默认启动阶段已通过压力测试。
 
-首次连续通过 70% 门槛时创建第一个冻结快照；之后默认每 10 次 PPO 更新刷新一次。最多保留最近 4 个版本。league 阶段每次刷新时有 25% 概率激活历史快照，否则用最新快照。这里的“历史快照”是训练轨迹样本，不冒充经过显著性检验的 champion。
+训练更新使用单批后台 replay 预取：CUDA 训练 batch N 时，独立 CPU 线程从 seed/action 轨迹重建 batch N+1。重建只为实际抽中的 `(trajectory, step)` 生成 observation、history 和 legal mask；此前未抽中的前缀只推进引擎，不生成会被丢弃的大数组。一个 optimizer batch 整体只搬到 CUDA 一次，microbatch 在设备上切 view。训练器刚刚由同一引擎生成的完整轨迹不再立即重复跑第二遍；外部轨迹入库仍执行严格确定性重放，持久化 shard 在加载时仍检查格式、规则版本和 CRC。
 
-当前 pipeline 默认每 10 次更新对固定 `rule_fast` 锚点做四座轮换评测，并记录平均分差、分差标准差、首位率和平均名次；`2h/6h/12h/24h` 自动保存完整 checkpoint。训练结束后再对这些候选做更大规模的配对重复种子评测，只有平均效用 95% bootstrap 置信区间下界大于零时才标为 champion。当前训练循环不会根据小样本点估计自动晋级并改变训练分布。
+### CUDA 吞吐和稳定性
 
-### 阈值与 cache 的预算依据
+训练对当前 Actor、采集策略、冻结 SL、历史 Actor、Q1/Q2/V 和 Oracle 全部使用 CUDA eager，不调用 `torch.compile`。本机的 `max-autotune` 曾触发 NVIDIA GSP `KernelChannelGroupApi alloc RPC` 失败；普通动态 compile 也在确定性复现中于历史长度 11 生成大量 NaN/Inf logits，而相同 checkpoint、seed 和 512 个环境的 eager 采集完整通过。因此所有编译路径已从代码中删除。
 
-- 2026-07-24 在本机 RTX 5080 的实测为 65,536 transitions/update 用 25.60 秒：rollout 4.80 秒，PPO 20.80 秒，总吞吐约 2,560 transitions/s。默认 200M 约 3,052 次 update，纯训练约 21.7 小时；加周期评测和 checkpoint 后对应约 22 到 24 小时。进入 mixed 或 league 的时间取决于规则胜率，不再由 wall-clock 或 transition 百分比保证。
-- 一条 192-token、4 层、6 头、`d_model=192` 的 BF16 K/V cache 是 `4 * 2 * 6 * 192 * 32 * 2 = 589,824` bytes，约 0.56 MiB/viewer。`history_seat_masks` 只为 learner/冻结 Transformer 的下一决策写历史；只有达到 `history_cache_min_batch=1024` 的大组才走 cache，小碎组改走合并 full forward。所有 rollout cache 在 PPO 前释放，因此不会和 microbatch 512 的训练激活峰值叠加。
-- 本机 full history 基准约 22.4k state/s，cached history 约 105.7k state/s；但端到端 rollout 还受 Python 分组、KV 拼接和 GPU launch 数量影响。RTX 5080、真实 `65,536` transitions 的 bootstrap rollout 为阈值 32/1024 分别约 4.90/3.77 秒；league 为约 10.47/8.18 秒。达到 192 条并发生环形窗口截断时自动 full rebuild，不能为了 cache 使用错误的旧前缀。
+启动和恢复不再有图编译或 autotune 等待。终端会明确打印 `CUDA eager mode; torch.compile disabled`。
 
-### 训练速度诊断与优化
+本机 RTX 5080 的真实 replay/CUDA 基准如下；这些结果用于选择默认值，不以占满显存为目标：
 
-此前一次约 5 小时的日志中，单个 update 平均约 25.6 秒，其中 rollout 约 11 秒、PPO 约 20.7 秒；因此瓶颈是 Python 侧重复的 Transformer forward 和过小的 GPU microbatch，而不是 Rayon 引擎 step。现有实现做了三项直接优化：
+| 项目 | 实测 |
+| --- | ---: |
+| eager 采集，`envs=512` | 约 9,800 states/s |
+| 采集，`envs=1024` | 约 8,195 states/s |
+| Critic，旧串行 replay + CUDA | 约 0.67 s/update |
+| Critic，按需 replay + 后台预取 | 约 0.45 s/update |
 
-- PPO 使用适合 16GB 卡的 microbatch 512，并提供 `--microbatch` 覆盖值；先确认显存余量后再尝试 768 或 1024。
-- rollout 数据不再整批常驻 GPU；每个 microbatch 只传输所需状态，避免 65,536 条历史记录额外占用数百 MB 显存。
-- PPO 每个 epoch 按历史长度分桶，每个 microbatch 只把事件序列裁到该批次的最大有效长度。rollout 的 full/cache-miss forward 也做同样裁剪，保留 192 的上限和绝对 RoPE 位置。KV cache 只对达到 1024 行的同形状组启用；小组的动态 cache bookkeeping 比省下的 attention 更贵，因此合并为 full forward。
-- RoPE 的 `sin/cos` 表按 `max_history` 预计算并在各层共享，避免每次 forward 重复三角函数计算。
-- `training` 包在导入模型前默认设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`，让变长 KV cache 使用可扩展 segment；不在每个 update 调用 `torch.cuda.empty_cache()`，避免强制每轮重新申请大块显存。
-- 辅助向听标签退火后不再调用引擎分析；修复了此前 `collect_auxiliary=False` 时没有写入 pending transition、第二个 update 永久等待的逻辑错误。
+因此默认保留 `envs=512` 和 `microbatch-size=256`：microbatch 384 没有吞吐收益，512 会使 Actor OOM；即使监控中仍有空闲显存，也不要仅为提高显存占用而放大它们。
 
-这些改动只减少 padding、分析和 kernel-launch 开销，不改变合法动作、奖励、GAE 或 PPO loss。GPU 机器上应比较日志的 `rollout_seconds`、`ppo_seconds` 和 `states_per_second`；如果提高 microbatch 后出现 OOM，退回 `--microbatch 512`。
+对手从离线阶段开始就是混合分布：
 
-## 24 小时单次预算
+| 成员 | 默认权重 |
+| --- | ---: |
+| `rule_fast` | 15% |
+| `rule_safe` | 15% |
+| 冻结 SL | 20% |
+| 当前 Actor | 30% |
+| 历史冻结 Actor | 20% |
 
-先运行 CPU smoke，再直接启动默认训练：
+历史池为空时，其 20% 权重暂时回到当前 Actor。每 50 次可信 Actor 更新冻结一个快照，最多保留 `max_history=16` 个；对应的 CUDA 策略也只保留这些有效快照，快照淘汰时同步释放其模型。历史权重在最近 4 个和更早快照之间分层分配。规则和冻结 SL 始终保留，训练不会退化为纯当前策略自博弈。每局保证一个轮换座位使用当前 Actor，避免当前策略在采集分布中消失。
+
+行为探索按决策类别设置，而不是统一做 15% 合法动作均匀随机：
+
+- 换牌和弃牌使用温度及 top-k，并保留少量全合法集探索；
+- 定缺探索更低；
+- 副露响应只保留很小探索；
+- 胡牌响应仍有非零探索，但默认仅 `0.1%`。
+
+轨迹保存每个实际动作的 behavior probability、采样温度、策略来源和版本。规则动作也经过同一合法采样层，因此记录的概率与真实执行分布一致。
+
+### 紧凑格式和重放
+
+轨迹不持久化每一步的大 observation。版本化格式保存：
+
+- 初始 seed、换牌方向和引擎规则版本；
+- 每步动作、绝对座位、阶段、九类决策类别；
+- 策略来源、策略版本、动作概率和温度；
+- 四家终局分数、名次和终止原因；
+- 格式版本与 CRC。
+
+动作和类别使用紧凑整数编码，每步固定记录约 15 字节。数据按 shard 落盘。采样时从 seed 和动作序列严格重建 observation、事件历史、legal mask、Oracle tile counts 和四座位 return-to-go。以下任一不一致都会直接报错：
+
+- 动作在对应状态非法；
+- actor、phase 或决策类别不同；
+- 提前终局或轨迹未到终局；
+- 终局分数、名次或终止原因不同；
+- 数据版本、规则版本或 CRC 不匹配。
+
+train/validation 按完整轨迹划分，默认 10% 对局进入 validation，同一局的状态不会泄漏到两边。
+
+### Replay 平衡
+
+Anchor 轨迹永久保留；在线 replay 是最多 2,000,000 transitions 的滑动窗口。抽样同时按来源和九类决策设置硬保底，并对重复状态及过度集中的策略版本降采样。默认每个 batch 至少包含：
+
+- 冻结 SL 12%；
+- `rule_fast` 8%；
+- `rule_safe` 8%；
+- 当前策略 10%；
+- 已存在时的历史策略 5%；
+- 每个决策类别至少 1%。
+
+若 replay 缺少必要来源或决策类别，训练会明确失败，不会静默用失衡 batch 继续。
+
+## 独立 Q1/Q2/V
+
+Q1、Q2、V 都有自己的可见状态编码器，不共享 Actor 或彼此的参数。默认每个 Critic 使用较小的 `d_model=128` Transformer；Q 网络一次输出全部 115 个动作值，非法动作被 mask。
+
+实际行为动作使用完整轨迹 return-to-go 做 Double-Q Huber 回归：
+
+```text
+L_Q = Huber(Q1(s, a), G_t) + Huber(Q2(s, a), G_t)
+```
+
+离线数据对两个 Q 分别加入只覆盖合法动作的 CQL：
+
+```text
+L_CQL = logsumexp(Q(s, legal_actions)) - Q(s, behavior_action)
+```
+
+CQL 不按 update 数机械归零。其系数随 replay 中当前策略数据覆盖率下降，并始终保留最小比例。
+
+V 使用保守 Double-Q 行为动作值做 expectile regression，默认 `tau=0.7`：
+
+```text
+q = min(Q1(s, a), Q2(s, a))
+residual = q - V(s)
+L_V = |tau - 1[residual < 0]| * residual^2
+```
+
+新 run 先执行默认 500 个 Critic warmup steps。之后每轮继续 64 个 Critic steps；Actor 是否更新由验证质量决定，而不是只看累计步数。
+
+普通 Critic 更新始终使用完整轨迹 replay：Q1、Q2 做绝对 return-to-go 回归，V 做 expectile 回归，CQL 只约束合法动作。C 的 MC 更新是额外的一步，只更新 Q1/Q2，不替换普通 Q 目标，也不更新 V；因此普通 Critic 仍负责绝对分数校准。
+
+## Critic 门控和 AWR
+
+所有实验先检查 partial Critic。Actor 只有同时满足以下基础条件才可能更新：
+
+- Critic 至少训练 500 steps；
+- 中盘和晚盘 Q 都优于对应目标均值的常数基线；
+- 中盘和晚盘 Q 与真实 return-to-go 有最低正相关；
+- Q1/Q2 平均 disagreement 不超过阈值；
+- validation 中存在对应阶段样本。
+
+若基础门控不通过，Actor 保持冻结，但系统仍继续训练 Critic 并采集新完整轨迹。B/C 还必须让各自教师独立通过验证并连续稳定 3 次。没有“最多等 20 次”、按 update 数强制解冻或 smoke 强行放行的逻辑。
+
+B 的 Oracle 必须独立满足早、中、晚盘 Q 校准，整体和早盘 Q MAE 都至少比 partial 低 2%，Q disagreement、中晚盘 V correlation 和 expectile balance 也必须达标。开局 V 接近零本来就可能正确，因此不拿早盘 V correlation 强行门控。Oracle 未通过时仍独立训练，但既不能给 Actor 计算 advantage，也不能向 partial Critic 蒸馏。
+
+C 在 partial 基础门控通过后就开始查询 MC，即使 Actor 仍冻结。训练与验证 MC 目标分别积累；只有目标数量、可靠验证状态组数、可靠动作 pair 数、这些 pair 上的 accuracy 和平均动作 regret 都达标并连续稳定 3 次，才允许 Actor 使用已经受 MC 校验的 partial Critic。MC teacher 不再重复门控 absolute-Q MAE、常数基线 improvement 或 correlation：普通 `critic_ready` 已负责绝对尺度，MC 数据只训练可靠动作差值，不直接作为 Actor 分类标签。
+
+通过门控后，Actor 每轮默认执行 8 个 AWR steps。只学习 replay 中真实执行过的合法动作：
+
+```text
+A(s, a) = min(Q1(s, a), Q2(s, a)) - V(s)
+w = min(exp(A / beta), w_max)
+L_actor = -w * log pi(a | s) + lambda_ref * KL(pi || frozen_SL)
+```
+
+默认 `beta=0.10`、`w_max=20`、`lambda_ref=0.05`。MC teacher 行不直接充当 Actor 分类标签。日志会报告相对 SL 的 KL、优势、权重、有效样本量及各动作类别分布。
+
+每次可信 Actor 提取后立即增加策略版本、同步采集器、生成新轨迹，并在到达快照间隔时将 Actor 加入历史对手池。
+
+## 三组递进实验
+
+通过 `--experiment` 选择实验，三者应按等 GPU 时间依次比较，不能把附加项全部堆叠后再猜测收益来源。
+
+### A：Partial-observation IQL/AWR
 
 ```bash
-python -m training.train --smoke --device cpu --output-dir /tmp/bloodflow-smoke
-python -m training.train --device cuda --hours 24 \
-  --total-transitions 200000000 --output-dir runs/transformer
+python -m training.train \
+  --experiment a \
+  --output-dir runs/iql-awr-a-v3
 ```
 
-- 前 1 小时：规则对手和 Transformer rollout smoke test，检查动作分布、KV cache 一致性和奖励归因。
-- 中间阶段：先持续规则 bootstrap，达到规则首位率门槛后逐步加入冻结 Transformer 对手。
-- 后段：保留规则锚点的 league 训练、固定快照、四座轮换评测和最终候选选择。
+这是默认基线，只使用部署时可见信息训练 Q1/Q2/V 和 Actor。先确认完整轨迹 Critic 确实能在中晚盘及少数动作类别上超过常数基线。
 
-首版重训从随机初始化开始，不恢复旧的 self-play checkpoint。先用短 smoke test 检查实现；只有规则首位率连续达到 70% 才开始混入 Transformer 对手，达到 80% 后仍保留规则锚点。保存 `2h/6h/12h/24h` 快照并比较平均分、每次胡牌收入、高倍率尾部、点炮损失和终局结算。后续若实现 ResNet，再按相同环境步数与 wall-clock 做独立对照。
+### B：Oracle Critic
 
-事件缓存必须绑定固定 viewer。若只训练一个 learner 座位，可以在该座位再次决策时追加其事件；若四个座位共享一个模型，则每个座位维护独立 cache，不能把相对座位已经旋转过的历史混用。
+```bash
+python -m training.train \
+  --experiment b \
+  --output-dir runs/iql-awr-b-v3
+```
 
-## 评测与“超过 90% 人类”
+Oracle Q1/Q2/V 只在训练期额外读取四家暗手与剩余牌墙的计数表示。只有 Oracle 连续通过独立教师门控后，Partial Critic 才蒸馏验证覆盖到的 logged-action Q，AWR 才能使用 Oracle advantage；未执行合法动作不做全动作蒸馏，因为这些输出没有 return 标签验证。Actor 的输入和部署图没有 Oracle 特征，Oracle 参数也不与 Actor 共享。
 
-离线评测以四局为一组：同一种子中 challenger 分别坐四个座位，其余三家为同一 champion。至少报告：
+该实验用于判断主要瓶颈是否来自部分可观测下的 Critic 方差，不是允许 Actor 偷看暗牌。
 
-- 平均分差及 bootstrap 95% CI；
-- 平均名次、首位率和末位率；
-- 胡牌、点炮、碰、杠、查花猪和查大叫频率；
-- 不同换牌方向、庄闲和牌局长度分桶结果；
-- 相对每个历史 champion 和规则锚点的结果。
+### C：选择性信息集 Monte Carlo
 
-“超过 90% 人类选手”指相同规则、相同时间限制下的 rating percentile，不能由自博弈胜率或行为预测准确率推出。最终声明需要授权真人对局或同规则天梯数据；离线联赛只负责选择和回归检测。
+```bash
+python -m training.train \
+  --experiment c \
+  --output-dir runs/iql-awr-c-v3
+```
 
-## 类似项目中可迁移的结论
+只有 Critic 门控通过后，C 才查询高不确定状态。候选来自当前 Actor、冻结 SL、规则动作和保守 Q；查询优先级综合 Q1/Q2 disagreement、Actor/SL 分歧、接近零优势和中晚盘风险。
 
-- [Suphx](https://arxiv.org/abs/2003.13590) 展示了麻将中的 oracle guiding、全局奖励预测和自博弈价值，但其真人牌谱监督预热与日麻规则不能直接搬用。本方案只借鉴训练期特权 Critic 和最终按对局收益评测。
-- [Mortal](https://github.com/Equim-chan/Mortal) 是开源日麻深度强化学习系统，说明规则引擎、合法动作约束和在线 RL 的工程闭环可以独立于闭源牌谱标签建立；动作和计分语义仍需以本血流引擎为准。
-- [Kanachan](https://github.com/Cryolite/kanachan) 同时保留无序状态 token、牌河序列和 Transformer，并提供专门向听实现，支持这里的结构化 Transformer 输入设计。它明确依赖大量雀魂牌谱，所以这里只参考表示与测试方法，不采用其监督 curriculum。
+每个查询默认最多 3 个候选动作、32 个信息集世界和 1 次 continuation。引擎固定行动者可见信息，重新分配其他玩家暗手与牌墙；同一组候选共享 world seed，以候选间逐 world 的回报差做 paired confidence interval。只有 `abs(mean_difference) - confidence_half_width >= 0.02` 且 half-width 不超过上限的动作边才算可靠。没有可靠边的动作会被裁掉；剩余完整 query 带持久化 query ID 和对称可靠边图整组接收，容量淘汰也按整组执行，不能混用不同查询的 world。响应窗口当前不做重采样查询，因为保留 pending legality 需要固定暗手。
 
-这些项目都不是血流规则下的现成教师。能迁移的是信息边界、序列表示、规则验证和训练稳定化方法，不是模型权重、动作标签或人类强度结论。
+MC 目标只作为 Critic 回归数据，训练和 validation 查询分开，不能直接生成硬 argmax Actor 标签。训练 MC 可以继续从在线状态积累；validation MC 每 2 个 iteration 从永久 anchor validation 轨迹查询，并排除已经存在的状态。validation corpus 只有同时达到 512 个 targets、128 个含可靠边的 query groups 和 128 条可靠 pair 后才将 `validation_frozen` 置为 true；只满足 target 数量不会停止补充查询。冻结后在线状态不再进入 validation teacher corpus，validation 目标也不参与 train MC Q 更新。validation 只在可靠边上报告 pairwise accuracy、top-action accuracy 和 regret；在这些动作级指标可信前 Actor 始终冻结。
+
+对一个已接收 query 的可靠边 `(j,k)`，令 paired-world MC 目标差为 `d_y = y_j-y_k`，Q 差为 `d_q = q_j-q_k`：
+
+```text
+L_difference = equal-query mean Huber(d_q, d_y)
+w_jk = min(abs(d_y) / 0.10, 1)
+L_ranking = equal-query mean w_jk * 0.10 * softplus(-sign(d_y) * d_q / 0.10)
+L_MC = 1.0 * L_difference + 0.25 * L_ranking
+```
+
+Q1 和 Q2 分别计算后取平均；每个 query 权重相等，可靠边较多的 query 不会支配 batch。`absolute_loss` 仅作为诊断指标，不进入 MC 优化目标；普通轨迹 Critic 负责把 Q 的绝对尺度校准到真实分差。
+
+## 评测和 best 选择
+
+默认每 5 轮在固定 seed panel 和独立 fresh seed panel 上各做一次确定性评测。每个 panel 都包含：
+
+- `rules`：当前 Actor 对交替的 `rule_fast` / `rule_safe`；
+- `sl`：当前 Actor 对三家冻结 SL；
+- `mixed`：当前 Actor 对完整混合池；
+- `history`：当前 Actor 对最近历史策略，无历史时回退冻结 SL。
+
+每组报告平均名次、首位率、末位率、平均分差、分差标准差以及跨 seed 波动。只有固定 seeds 和 fresh seeds 的规则评测都优于当前 best，才写入 `best.pt`；训练本身不会因此停止。
+
+同时应重点查看：
+
+- 中晚盘 Q MAE、相关性、校准误差和常数基线改进；
+- 各决策类别的 Q 误差及 Q1/Q2 disagreement；
+- Actor 相对冻结 SL 的 KL、AWR 权重和有效样本量；
+- replay 来源、九类决策覆盖和采集吞吐；
+- B 的 Oracle/partial 差距或 C 的 MC 方差、置信区间与 GPU 成本。
+- C 的 `mc_critic.mc_critic_loss`、`mc_absolute_loss`、`mc_centered_loss`、`mc_pairwise_loss`、`mc_train_pairwise_accuracy`、`mc_train_groups` 和 `mc_train_pairs`；
+- C 的 `mc.accepted_queries`、`accepted_targets`、`terminal_rollouts`、`rollout_states`、`train_targets`、`train_targets_after_trim`、`validation_targets`、`validation_reliable_targets`、`validation_reliable_groups`、`validation_reliable_pairs`、`validation_frozen`、`mean_variance`、`mean_confidence_half_width`；
+- C 的 train/validation pairwise accuracy，以及 `mc.validation_metrics.action_ranking` 下的可靠 `group_count`、`pair_count`、`all_pair_count`、`top_action_accuracy`、`mean_regret`、`maximum_regret` 和 `mean_action_gap`。MC Q MAE 仍可观察，但不参与 teacher gate。
+
+## 运行、恢复和输出
+
+安装 release Python 扩展后启动默认实验：
+
+```bash
+maturin develop --release --manifest-path engine/pybind/Cargo.toml
+python -m training.train \
+  --output-dir runs/iql-awr-v3 \
+  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
+```
+
+训练会一直运行。按一次 `Ctrl+C` 后，当前循环退出并原子写入 `latest.pt`。
+
+恢复时只需提供完整 IQL/AWR checkpoint：
+
+```bash
+python -m training.train --resume runs/iql-awr-v3/latest.pt
+```
+
+C 实验恢复示例：
+
+```bash
+python -m training.train --resume runs/iql-awr-c-v3/latest.pt
+```
+
+恢复会读取 checkpoint 中的实验、模型与训练配置、Actor、冻结 SL、Q1/Q2/V、可选 Oracle、全部优化器、教师连续就绪计数、策略池、采样器 RNG、replay cursor 和随机状态；replay shard/manifest 必须与 checkpoint 一致。恢复不会重新 SL，也不能改成另一实验类型。当前 checkpoint 格式为 v3；v1/v2 IQL/AWR checkpoint 会明确拒绝，不做默认字段填充或迁移。
+
+每个 run 目录包含：
+
+- `latest.pt`：最近完整 checkpoint；
+- `best.pt`：固定和 fresh seed 都提升时写出的 Actor-only 部署权重，不用于恢复训练；
+- `metrics.jsonl`：完整结构化训练记录；
+- `dashboard.html`：由 metrics 生成的本地摘要；
+- `config.json`：实验、模型、训练配置和评测 seeds；
+- `replay/manifest.json` 与 `replay/*.bfsh`：轨迹清单和紧凑 shard；
+- `snapshots/*.pt`：历史 Actor-only 策略。
+
+终端默认只打印 baseline、Critic、iteration、门控、KL、名次和分差摘要；`--verbose-console` 额外打印完整 JSON。
+
+先做一次 CUDA 端到端检查：
+
+```bash
+python -m training.train \
+  --smoke \
+  --output-dir /tmp/bloodflow-iql-smoke \
+  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
+```
+
+`--smoke` 会缩小环境、模型、replay 和评测规模，只运行一个 iteration 后保存退出。它通过显式的小样本配置和宽松阈值覆盖 Actor、Oracle 与 MC 路径，不会在控制流里强行覆盖失败门控。smoke checkpoint 不应用于长训。正式训练绝不回退 CPU；显存不足时优先降低 `--microbatch-size`，其次再调整 batch 或并行环境数。
+
+## 验证
+
+```bash
+cargo test --manifest-path engine/Cargo.toml --workspace --all-targets
+cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets -- -D warnings
+python -m pytest engine/pybind/tests training/tests
+```
+
+基准脚本：
+
+```bash
+python -m training.benchmarks.transformer --device cuda
+python -m training.benchmarks.train_step --device cuda
+```

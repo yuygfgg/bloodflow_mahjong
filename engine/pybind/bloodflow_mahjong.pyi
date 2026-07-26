@@ -17,6 +17,7 @@ LEGAL_ACTION_MASK_WORDS: Final[int]
 STEP_RECORD_WIDTH: Final[int]
 EVENT_RECORD_WIDTH: Final[int]
 EVENT_HISTORY_CAPACITY: Final[int]
+ENGINE_RULES_VERSION: Final[int]
 SHANTEN_COMPLETE: Final[int]
 SHANTEN_MAX: Final[int]
 SHANTEN_TERMINAL: Final[int]
@@ -54,6 +55,7 @@ RIVER_OBSERVATION_WIDTH: Final[int]
 RIVER_TILE_CAPACITY: Final[int]
 RIVER_FIELDS: Final[int]
 META_OBSERVATION_WIDTH: Final[int]
+ORACLE_TILE_COUNT_PLANES: Final[int]
 PLAYER_COUNT: Final[int]
 TILE_KIND_COUNT: Final[int]
 PHASE_EXCHANGE: Final[int]
@@ -62,12 +64,15 @@ PHASE_TURN: Final[int]
 PHASE_HU_RESPONSE: Final[int]
 PHASE_MELD_RESPONSE: Final[int]
 PHASE_FINISHED: Final[int]
+TERMINATION_WALL_EXHAUSTED: Final[int]
+TERMINATION_THREE_PLAYERS_BANKRUPT: Final[int]
 
 class Game:
     def __init__(self, seed: int = 0) -> None: ...
     @staticmethod
     def with_exchange_direction(seed: int, direction: int) -> Game: ...
     def reset(self, seed: int) -> None: ...
+    def resample_information_set(self, seed: int) -> Game: ...
     @property
     def phase(self) -> int: ...
     @property
@@ -91,6 +96,18 @@ class Game:
         viewer: int,
         output: npt.NDArray[np.int32],
     ) -> int: ...
+    def observe_into(
+        self,
+        viewer: int,
+        tile_obs: npt.NDArray[np.uint8],
+        melds: npt.NDArray[np.uint8],
+        river: npt.NDArray[np.uint8],
+        meta: npt.NDArray[np.int32],
+    ) -> None: ...
+    def oracle_tile_counts_into(
+        self,
+        output: npt.NDArray[np.uint8],
+    ) -> None: ...
     @property
     def dealer(self) -> int: ...
     @property
@@ -112,6 +129,8 @@ class Game:
     def melds(self, seat: int) -> list[tuple[int, int, int]]: ...
     def discards(self) -> list[tuple[int, int]]: ...
     def rankings(self) -> tuple[int, int, int, int]: ...
+    @property
+    def termination_reason(self) -> int | None: ...
 
 class Batch:
     def __init__(self, size: int, seed: int = 0) -> None: ...
@@ -125,6 +144,19 @@ class Batch:
         self,
         indices: npt.NDArray[np.uint32],
         seeds: npt.NDArray[np.uint64],
+    ) -> None: ...
+    def clone_indices(
+        self,
+        indices: npt.NDArray[np.uint32],
+    ) -> Batch: ...
+    def resample_information_sets(
+        self,
+        indices: npt.NDArray[np.uint32],
+        seeds: npt.NDArray[np.uint64],
+    ) -> Batch: ...
+    def oracle_tile_counts_into(
+        self,
+        output: npt.NDArray[np.uint8],
     ) -> None: ...
     def legal_action_masks_into(self, output: npt.NDArray[np.uint64]) -> None: ...
     def simple_rule_actions_into(self, output: npt.NDArray[np.uint8]) -> None: ...

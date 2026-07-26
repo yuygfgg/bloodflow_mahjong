@@ -8,6 +8,21 @@ ACTION_SPACE_SIZE = 115
 LEGAL_ACTION_MASK_WORDS = 2
 
 
+def bucket_history_width(lengths: np.ndarray, capacity: int) -> int:
+    """Bucket a padded history width to keep CUDA attention shapes stable."""
+
+    values = np.asarray(lengths)
+    if values.ndim != 1:
+        raise ValueError("history lengths must be one-dimensional")
+    if capacity <= 0:
+        raise ValueError("history capacity must be positive")
+    maximum = max(int(values.max(initial=0)), 1)
+    if maximum > capacity:
+        raise ValueError("history length exceeds its allocated capacity")
+    bucket = max(8, 1 << (maximum - 1).bit_length())
+    return min(bucket, capacity)
+
+
 def unpack_action_masks(
     mask_words: np.ndarray, *, out: np.ndarray | None = None
 ) -> np.ndarray:

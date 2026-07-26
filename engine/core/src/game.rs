@@ -16,6 +16,9 @@ use thiserror::Error;
 
 const STARTING_SCORE: i64 = 10_000;
 const SCORE_UNIT: i64 = 100;
+/// Increment whenever engine rule semantics or deterministic initialization
+/// change in a way that can invalidate a stored action-sequence replay.
+pub const ENGINE_RULES_VERSION: u32 = 1;
 pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
@@ -30,6 +33,10 @@ pub const MELD_OBSERVATION_WIDTH: usize = PLAYER_COUNT * 4 * 3;
 pub const RIVER_OBSERVATION_WIDTH: usize = WALL_TILE_COUNT * 2;
 /// Scalar state plus four relative-player feature groups.
 pub const META_OBSERVATION_WIDTH: usize = 34;
+/// Training-only perfect-information tile-count planes: four concealed hands,
+/// four locked subsets, and one unordered remaining-wall histogram.
+pub const ORACLE_TILE_COUNT_PLANES: usize = PLAYER_COUNT * 2 + 1;
+pub const ORACLE_TILE_COUNT_WIDTH: usize = ORACLE_TILE_COUNT_PLANES * TILE_KIND_COUNT;
 
 /// Event kinds written to the fixed-width event stream.
 ///
@@ -99,6 +106,19 @@ pub enum Phase {
     HuResponse = 3,
     MeldResponse = 4,
     Finished = 5,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TerminationReason {
+    WallExhausted = 0,
+    ThreePlayersBankrupt = 1,
+}
+
+impl TerminationReason {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
 }
 
 impl Phase {
@@ -264,6 +284,8 @@ pub enum GameError {
     BatchIndex,
     #[error("event output capacity is larger than the retained event history")]
     EventCapacity,
+    #[error("information-set sampling requires a non-terminal decision")]
+    InformationSetUnavailable,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -492,6 +514,78 @@ impl Game {
 
     pub fn reset(&mut self, seed: u64) {
         *self = Self::new(seed);
+    }
+
+    /// Samples a determinization from the current actor's information set.
+    ///
+    /// The current actor's complete visible observation is held fixed. Other
+    /// players' non-locked concealed tiles and the live wall are shuffled as a
+    /// single unknown pool while preserving concealed sizes. During exchange,
+    /// players with already-selected tiles are fixed so their pending exchange
+    /// remains valid. During response windows all hands are fixed because the
+    /// pending responder set encodes hand-dependent legality; the live wall is
+    /// still independently resampled.
+    pub fn resample_information_set(&self, seed: u64) -> Result<Self, GameError> {
+        let viewer = self
+            .decision()
+            .ok_or(GameError::InformationSetUnavailable)?
+            .actor;
+        let mut sampled = self.clone();
+        let mut fixed_players = seat_bit(viewer);
+        match self.stage {
+            Stage::Exchange { .. } => {
+                for seat in Seat::ALL {
+                    if self.exchange[seat.index()].iter().any(|&count| count != 0) {
+                        fixed_players |= seat_bit(seat);
+                    }
+                }
+            }
+            Stage::HuResponse { .. } | Stage::MeldResponse { .. } => {
+                // Candidate masks are derived from concealed hands. Keeping
+                // them fixed avoids constructing a state with impossible
+                // pending Hu/Pong/Kong responses.
+                fixed_players = ALL_PLAYER_MASK;
+            }
+            Stage::ChooseMissing { .. } | Stage::Turn { .. } => {}
+            Stage::Finished => return Err(GameError::InformationSetUnavailable),
+        }
+
+        let mut unknown = Vec::with_capacity(self.wall_remaining() + 42);
+        let mut movable_counts = [0_usize; PLAYER_COUNT];
+        for seat in Seat::ALL {
+            if fixed_players & seat_bit(seat) != 0 {
+                continue;
+            }
+            let player = &mut sampled.players[seat.index()];
+            for tile_index in 0..TILE_KIND_COUNT {
+                let movable =
+                    player.concealed[tile_index].saturating_sub(player.locked[tile_index]);
+                movable_counts[seat.index()] += movable as usize;
+                unknown.extend(core::iter::repeat_n(tile_index as u8, movable as usize));
+                player.concealed[tile_index] = player.locked[tile_index];
+            }
+        }
+        unknown.extend(
+            self.wall[self.wall_head as usize..self.wall_tail as usize]
+                .iter()
+                .copied(),
+        );
+
+        let mut rng = Rng::new(seed);
+        rng.shuffle(&mut unknown);
+        let mut cursor = 0;
+        for seat in Seat::ALL {
+            for _ in 0..movable_counts[seat.index()] {
+                let tile = unknown[cursor] as usize;
+                sampled.players[seat.index()].concealed[tile] += 1;
+                cursor += 1;
+            }
+        }
+        let wall_len = self.wall_remaining();
+        sampled.wall[self.wall_head as usize..self.wall_tail as usize]
+            .copy_from_slice(&unknown[cursor..cursor + wall_len]);
+        debug_assert_eq!(cursor + wall_len, unknown.len());
+        Ok(sampled)
     }
 
     pub fn decision(&self) -> Option<Decision> {
@@ -955,8 +1049,20 @@ impl Game {
         seats
     }
 
+    pub fn termination_reason(&self) -> Option<TerminationReason> {
+        if self.phase() != Phase::Finished {
+            return None;
+        }
+        Some(if self.wall_remaining() == 0 {
+            TerminationReason::WallExhausted
+        } else {
+            TerminationReason::ThreePlayersBankrupt
+        })
+    }
+
     fn write_observation(
         &self,
+        viewer: Seat,
         tile_obs: &mut [u8],
         melds: &mut [u8],
         river: &mut [u8],
@@ -968,7 +1074,6 @@ impl Game {
         debug_assert_eq!(meta.len(), META_OBSERVATION_WIDTH);
 
         let decision = self.decision();
-        let viewer = decision.map_or(self.dealer, |decision| decision.actor);
 
         tile_obs.fill(0);
         tile_obs[..TILE_KIND_COUNT].copy_from_slice(&self.players[viewer.index()].concealed);
@@ -1043,7 +1148,13 @@ impl Game {
         meta[2] = i32::from(relative_seat(viewer, self.dealer));
         meta[3] = i32::from(self.exchange_direction as u8);
         meta[4] = self.wall_remaining() as i32;
-        meta[5] = draw.map_or(-1, |draw| i32::from(draw.tile.as_u8()));
+        meta[5] = draw.map_or(-1, |draw| {
+            if draw.player == viewer {
+                i32::from(draw.tile.as_u8())
+            } else {
+                -1
+            }
+        });
         meta[6] = draw.map_or(0, |draw| i32::from(u8::from(draw.replacement)));
         meta[7] = pending_source;
         meta[8] = pending_tile;
@@ -1060,6 +1171,50 @@ impl Game {
         }
         meta[28] = i32::from(u8::from(self.phase() == Phase::Finished));
         meta[29] = reaction_flags;
+    }
+
+    /// Writes the ordinary partial-information observation for one viewer.
+    pub fn observation_into(
+        &self,
+        viewer: Seat,
+        tile_obs: &mut [u8],
+        melds: &mut [u8],
+        river: &mut [u8],
+        meta: &mut [i32],
+    ) -> Result<(), GameError> {
+        if tile_obs.len() != TILE_OBSERVATION_WIDTH
+            || melds.len() != MELD_OBSERVATION_WIDTH
+            || river.len() != RIVER_OBSERVATION_WIDTH
+            || meta.len() != META_OBSERVATION_WIDTH
+        {
+            return Err(GameError::BatchLength);
+        }
+        self.write_observation(viewer, tile_obs, melds, river, meta);
+        Ok(())
+    }
+
+    /// Writes perfect-information tile counts for Critic training only.
+    ///
+    /// Planes `0..4` are concealed hands, `4..8` are their locked subsets,
+    /// and plane `8` is an unordered histogram of the live wall.
+    pub fn oracle_tile_counts_into(&self, output: &mut [u8]) -> Result<(), GameError> {
+        if output.len() != ORACLE_TILE_COUNT_WIDTH {
+            return Err(GameError::BatchLength);
+        }
+        output.fill(0);
+        for seat in Seat::ALL {
+            let concealed_start = seat.index() * TILE_KIND_COUNT;
+            output[concealed_start..concealed_start + TILE_KIND_COUNT]
+                .copy_from_slice(&self.players[seat.index()].concealed);
+            let locked_start = (PLAYER_COUNT + seat.index()) * TILE_KIND_COUNT;
+            output[locked_start..locked_start + TILE_KIND_COUNT]
+                .copy_from_slice(&self.players[seat.index()].locked);
+        }
+        let wall = &mut output[(ORACLE_TILE_COUNT_PLANES - 1) * TILE_KIND_COUNT..];
+        for &tile in &self.wall[self.wall_head as usize..self.wall_tail as usize] {
+            wall[tile as usize] += 1;
+        }
+        Ok(())
     }
 
     fn step_exchange(
@@ -1935,6 +2090,76 @@ impl Batch {
         self.games.is_empty()
     }
 
+    /// Clones selected environments into an independent batch.
+    ///
+    /// Repeated indices intentionally create identical counterfactual states,
+    /// which is useful for branching several legal actions from one decision.
+    pub fn clone_indices(&self, indices: &[usize]) -> Result<Self, GameError> {
+        if indices.iter().any(|&index| index >= self.games.len()) {
+            return Err(GameError::BatchIndex);
+        }
+        let clone_game = |&index: &usize| self.games[index].clone();
+        let games = if indices.len() >= PARALLEL_BATCH_THRESHOLD {
+            indices.par_iter().map(clone_game).collect()
+        } else {
+            indices.iter().map(clone_game).collect()
+        };
+        Ok(Self { games })
+    }
+
+    /// Clones selected environments and independently resamples each clone
+    /// from its current actor's information set.
+    pub fn resample_information_sets(
+        &self,
+        indices: &[usize],
+        seeds: &[u64],
+    ) -> Result<Self, GameError> {
+        if indices.len() != seeds.len() {
+            return Err(GameError::BatchLength);
+        }
+        if indices.iter().any(|&index| index >= self.games.len()) {
+            return Err(GameError::BatchIndex);
+        }
+        let sample =
+            |(&index, &seed): (&usize, &u64)| self.games[index].resample_information_set(seed);
+        let games = if indices.len() >= PARALLEL_BATCH_THRESHOLD {
+            indices
+                .par_iter()
+                .zip(seeds.par_iter())
+                .map(sample)
+                .collect::<Result<Vec<_>, _>>()?
+        } else {
+            indices
+                .iter()
+                .zip(seeds.iter())
+                .map(sample)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Self { games })
+    }
+
+    /// Writes perfect-information Critic inputs as `[batch, 9, 27]` planes.
+    pub fn oracle_tile_counts_into(&self, output: &mut [u8]) -> Result<(), GameError> {
+        if self.games.len().checked_mul(ORACLE_TILE_COUNT_WIDTH) != Some(output.len()) {
+            return Err(GameError::BatchLength);
+        }
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(output.par_chunks_mut(ORACLE_TILE_COUNT_WIDTH))
+                .try_for_each(|(game, row)| game.oracle_tile_counts_into(row))?;
+        } else {
+            for (game, row) in self
+                .games
+                .iter()
+                .zip(output.chunks_mut(ORACLE_TILE_COUNT_WIDTH))
+            {
+                game.oracle_tile_counts_into(row)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Writes the number of overwritten events for each environment.
     pub fn event_dropped_into(&self, output: &mut [u64]) -> Result<(), GameError> {
         if output.len() != self.games.len() {
@@ -2186,7 +2411,10 @@ impl Batch {
                 .zip(river.par_chunks_mut(RIVER_OBSERVATION_WIDTH))
                 .zip(meta.par_chunks_mut(META_OBSERVATION_WIDTH))
                 .for_each(|((((game, tile_obs), melds), river), meta)| {
-                    game.write_observation(tile_obs, melds, river, meta);
+                    let viewer = game
+                        .decision()
+                        .map_or(game.dealer(), |decision| decision.actor);
+                    game.write_observation(viewer, tile_obs, melds, river, meta);
                 });
         } else {
             for ((((game, tile_obs), melds), river), meta) in self
@@ -2197,7 +2425,10 @@ impl Batch {
                 .zip(river.chunks_mut(RIVER_OBSERVATION_WIDTH))
                 .zip(meta.chunks_mut(META_OBSERVATION_WIDTH))
             {
-                game.write_observation(tile_obs, melds, river, meta);
+                let viewer = game
+                    .decision()
+                    .map_or(game.dealer(), |decision| decision.actor);
+                game.write_observation(viewer, tile_obs, melds, river, meta);
             }
         }
         Ok(())
@@ -2467,7 +2698,10 @@ impl Batch {
                 .action();
             let outcome = game.apply_legal_action(action)?;
             outcome.write_record(record.try_into().expect("record width was validated"));
-            game.write_observation(tile_obs, melds, river, meta);
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            game.write_observation(viewer, tile_obs, melds, river, meta);
             if let Some(mask) = game.legal_action_mask() {
                 words.copy_from_slice(mask.words());
             } else {
@@ -2636,7 +2870,10 @@ impl Batch {
                 return;
             }
             game.reset(seed);
-            game.write_observation(tile_obs, melds, river, meta);
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            game.write_observation(viewer, tile_obs, melds, river, meta);
             if let Some(mask) = game.legal_action_mask() {
                 words.copy_from_slice(mask.words());
             } else {
@@ -3506,6 +3743,141 @@ mod tests {
             assert_eq!(meta[29], expected_flags);
             assert!(river.iter().all(|&value| value == u8::MAX));
         }
+    }
+
+    #[test]
+    fn information_set_resampling_preserves_actor_observation_and_tile_inventory() {
+        let mut game = Game::new(913);
+        while matches!(game.phase(), Phase::Exchange | Phase::ChooseMissing) {
+            let action = game.simple_rule_action().expect("setup is non-terminal");
+            game.step_id(action).unwrap();
+        }
+        let viewer = game.decision().unwrap().actor;
+        let mut tile_obs = [0; TILE_OBSERVATION_WIDTH];
+        let mut melds = [0; MELD_OBSERVATION_WIDTH];
+        let mut river = [0; RIVER_OBSERVATION_WIDTH];
+        let mut meta = [0; META_OBSERVATION_WIDTH];
+        game.observation_into(viewer, &mut tile_obs, &mut melds, &mut river, &mut meta)
+            .unwrap();
+        let mut oracle = [0; ORACLE_TILE_COUNT_WIDTH];
+        game.oracle_tile_counts_into(&mut oracle).unwrap();
+
+        let mut sampled = game.resample_information_set(71).unwrap();
+        let mut sampled_tile_obs = [0; TILE_OBSERVATION_WIDTH];
+        let mut sampled_melds = [0; MELD_OBSERVATION_WIDTH];
+        let mut sampled_river = [0; RIVER_OBSERVATION_WIDTH];
+        let mut sampled_meta = [0; META_OBSERVATION_WIDTH];
+        sampled
+            .observation_into(
+                viewer,
+                &mut sampled_tile_obs,
+                &mut sampled_melds,
+                &mut sampled_river,
+                &mut sampled_meta,
+            )
+            .unwrap();
+        assert_eq!(sampled_tile_obs, tile_obs);
+        assert_eq!(sampled_melds, melds);
+        assert_eq!(sampled_river, river);
+        assert_eq!(sampled_meta, meta);
+
+        let mut sampled_oracle = [0; ORACLE_TILE_COUNT_WIDTH];
+        sampled
+            .oracle_tile_counts_into(&mut sampled_oracle)
+            .unwrap();
+        for tile in 0..TILE_KIND_COUNT {
+            let inventory = (0..PLAYER_COUNT)
+                .map(|seat| oracle[seat * TILE_KIND_COUNT + tile] as u16)
+                .sum::<u16>()
+                + oracle[(ORACLE_TILE_COUNT_PLANES - 1) * TILE_KIND_COUNT + tile] as u16;
+            let sampled_inventory = (0..PLAYER_COUNT)
+                .map(|seat| sampled_oracle[seat * TILE_KIND_COUNT + tile] as u16)
+                .sum::<u16>()
+                + sampled_oracle[(ORACLE_TILE_COUNT_PLANES - 1) * TILE_KIND_COUNT + tile] as u16;
+            assert_eq!(sampled_inventory, inventory);
+        }
+        assert_ne!(sampled_oracle, oracle);
+
+        for _ in 0..512 {
+            let Some(action) = sampled.simple_rule_action() else {
+                break;
+            };
+            sampled.step_id(action).unwrap();
+        }
+        assert_eq!(sampled.phase(), Phase::Finished);
+    }
+
+    #[test]
+    fn information_set_batch_sampling_is_deterministic_and_rejects_terminal_states() {
+        let batch = Batch::new(3, 101);
+        let indices = [2, 0, 2];
+        let seeds = [17, 19, 17];
+        let first = batch.resample_information_sets(&indices, &seeds).unwrap();
+        let second = batch.resample_information_sets(&indices, &seeds).unwrap();
+        let mut first_oracle = vec![0; first.len() * ORACLE_TILE_COUNT_WIDTH];
+        let mut second_oracle = vec![0; second.len() * ORACLE_TILE_COUNT_WIDTH];
+        first.oracle_tile_counts_into(&mut first_oracle).unwrap();
+        second.oracle_tile_counts_into(&mut second_oracle).unwrap();
+        assert_eq!(first_oracle, second_oracle);
+        assert!(matches!(
+            batch.resample_information_sets(&[3], &[1]),
+            Err(GameError::BatchIndex)
+        ));
+
+        let mut terminal = constructed_game();
+        terminal.stage = Stage::Finished;
+        assert!(matches!(
+            terminal.resample_information_set(1),
+            Err(GameError::InformationSetUnavailable)
+        ));
+    }
+
+    #[test]
+    fn oracle_accessor_does_not_mutate_partial_observation() {
+        let game = Game::new(31);
+        let viewer = game.decision().unwrap().actor;
+        let mut before_tile = [0; TILE_OBSERVATION_WIDTH];
+        let mut before_melds = [0; MELD_OBSERVATION_WIDTH];
+        let mut before_river = [0; RIVER_OBSERVATION_WIDTH];
+        let mut before_meta = [0; META_OBSERVATION_WIDTH];
+        game.observation_into(
+            viewer,
+            &mut before_tile,
+            &mut before_melds,
+            &mut before_river,
+            &mut before_meta,
+        )
+        .unwrap();
+        let mut oracle = [0; ORACLE_TILE_COUNT_WIDTH];
+        game.oracle_tile_counts_into(&mut oracle).unwrap();
+        assert_eq!(
+            oracle[..PLAYER_COUNT * TILE_KIND_COUNT]
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>()
+                + oracle[(ORACLE_TILE_COUNT_PLANES - 1) * TILE_KIND_COUNT..]
+                    .iter()
+                    .map(|&count| count as usize)
+                    .sum::<usize>(),
+            WALL_TILE_COUNT
+        );
+
+        let mut after_tile = [0; TILE_OBSERVATION_WIDTH];
+        let mut after_melds = [0; MELD_OBSERVATION_WIDTH];
+        let mut after_river = [0; RIVER_OBSERVATION_WIDTH];
+        let mut after_meta = [0; META_OBSERVATION_WIDTH];
+        game.observation_into(
+            viewer,
+            &mut after_tile,
+            &mut after_melds,
+            &mut after_river,
+            &mut after_meta,
+        )
+        .unwrap();
+        assert_eq!(after_tile, before_tile);
+        assert_eq!(after_melds, before_melds);
+        assert_eq!(after_river, before_river);
+        assert_eq!(after_meta, before_meta);
     }
 
     #[test]
