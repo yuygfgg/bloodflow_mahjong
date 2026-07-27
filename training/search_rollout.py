@@ -195,6 +195,7 @@ def _lineup_actions(
     lineup: np.ndarray,
     device: torch.device,
     *,
+    self_play_model: BloodFlowTransformer | None = None,
     inference_batch_size: int | None = None,
     stager: _PinnedPolicyStager | None = None,
 ) -> np.ndarray:
@@ -230,24 +231,57 @@ def _lineup_actions(
         ),
     ).all():
         raise ValueError("active rows use an unknown policy controller")
-    model_rows = np.flatnonzero(
-        np.isin(
-            sources,
-            (int(ReplaySource.CURRENT), int(ReplaySource.SELF_PLAY)),
+    self_play_model = model if self_play_model is None else self_play_model
+    if self_play_model.config != model.config:
+        raise ValueError("self-play model config must match the focal model")
+    current_rows = np.flatnonzero(sources == int(ReplaySource.CURRENT))
+    self_play_rows = np.flatnonzero(sources == int(ReplaySource.SELF_PLAY))
+    if self_play_model is model:
+        model_rows = np.flatnonzero(
+            np.isin(
+                sources,
+                (int(ReplaySource.CURRENT), int(ReplaySource.SELF_PLAY)),
+            )
         )
-    )
-    pending_model_actions = (
-        _launch_frozen_policy_actions(
-            model,
-            buffers,
-            model_rows,
-            device,
-            inference_batch_size=inference_batch_size,
-            stager=stager,
+        pending_model_actions = (
+            _launch_frozen_policy_actions(
+                model,
+                buffers,
+                model_rows,
+                device,
+                inference_batch_size=inference_batch_size,
+                stager=stager,
+            )
+            if len(model_rows)
+            else None
         )
-        if len(model_rows)
-        else None
-    )
+        pending_self_play_actions = None
+    else:
+        model_rows = current_rows
+        pending_model_actions = (
+            _launch_frozen_policy_actions(
+                model,
+                buffers,
+                current_rows,
+                device,
+                inference_batch_size=inference_batch_size,
+                stager=stager,
+            )
+            if len(current_rows)
+            else None
+        )
+        pending_self_play_actions = (
+            _launch_frozen_policy_actions(
+                self_play_model,
+                buffers,
+                self_play_rows,
+                device,
+                inference_batch_size=inference_batch_size,
+                stager=stager,
+            )
+            if len(self_play_rows)
+            else None
+        )
 
     actions = buffers.actions
     rule_enabled = np.isin(
@@ -268,6 +302,11 @@ def _lineup_actions(
         if np.any(model_actions == np.iinfo(np.uint8).max):
             raise RuntimeError("Actor produced non-finite logits during continuation")
         actions[model_rows] = model_actions
+    if pending_self_play_actions is not None:
+        model_actions = pending_self_play_actions.cpu().numpy()
+        if np.any(model_actions == np.iinfo(np.uint8).max):
+            raise RuntimeError("self-play Actor produced non-finite logits during continuation")
+        actions[self_play_rows] = model_actions
 
     rows = np.arange(len(actions))
     if not buffers.legal[rows, actions.astype(np.int64)].all():
@@ -296,6 +335,7 @@ def _rollout_query_group(
     *,
     focal_seats: np.ndarray,
     lineups: np.ndarray,
+    self_play_model: BloodFlowTransformer | None = None,
     inference_batch_size: int,
     maximum_steps: int,
     on_progress: RolloutProgress | None = None,
@@ -320,6 +360,8 @@ def _rollout_query_group(
         raise ValueError("lineups must have shape [queries, 4]")
     lineups, focal_seats = _validate_policy_lineups(lineups, focal_seats)
     model.eval()
+    if self_play_model is not None:
+        self_play_model.eval()
     query_history_masks = _lineup_history_seat_masks(lineups)
     if inference_batch_size <= 0 or maximum_steps <= 0:
         raise ValueError("rollout sizes must be positive")
@@ -423,6 +465,7 @@ def _rollout_query_group(
             focal_seats[active_queries],
             lineups[active_queries],
             device,
+            self_play_model=self_play_model,
             inference_batch_size=inference_batch_size,
             stager=inference_stager,
         )
@@ -514,6 +557,7 @@ def rollout_query_group_chunked(
     *,
     focal_seats: np.ndarray,
     lineups: np.ndarray,
+    self_play_model: BloodFlowTransformer | None = None,
     world_chunk: int,
     inference_batch_size: int,
     maximum_steps: int = 2048,
@@ -536,6 +580,7 @@ def rollout_query_group_chunked(
             device,
             focal_seats=focal_seats,
             lineups=lineups,
+            self_play_model=self_play_model,
             inference_batch_size=inference_batch_size,
             maximum_steps=maximum_steps,
             on_progress=on_progress,
@@ -581,6 +626,7 @@ def rollout_query_group_chunked(
                 device,
                 focal_seats=focal_seats,
                 lineups=lineups,
+                self_play_model=self_play_model,
                 inference_batch_size=inference_batch_size,
                 maximum_steps=maximum_steps,
                 on_progress=chunk_progress if on_progress is not None else None,
@@ -622,6 +668,7 @@ def rollout_all_actions(
     *,
     focal_seat: int,
     lineup: np.ndarray,
+    self_play_model: BloodFlowTransformer | None = None,
     maximum_steps: int = 2048,
 ) -> SearchRolloutResult:
     """Run every action on the same ordered worlds and preserve the source lineup."""
@@ -683,7 +730,12 @@ def rollout_all_actions(
             np.full(len(active_ids), history_mask, dtype=np.uint8)
         )
         next_actions = _lineup_actions(
-            buffers, model, focal_seat, lineup, device
+            buffers,
+            model,
+            focal_seat,
+            lineup,
+            device,
+            self_play_model=self_play_model,
         )
         next_records = np.empty(
             (len(active_ids), int(bm.STEP_RECORD_WIDTH)), dtype=np.int64
@@ -724,6 +776,7 @@ def rollout_all_actions_chunked(
     focal_seat: int,
     lineup: np.ndarray,
     world_chunk: int,
+    self_play_model: BloodFlowTransformer | None = None,
     maximum_steps: int = 2048,
 ) -> SearchRolloutResult:
     """Run an action sweep in world-axis chunks without changing alignment."""
@@ -738,6 +791,7 @@ def rollout_all_actions_chunked(
             device,
             focal_seat=focal_seat,
             lineup=lineup,
+            self_play_model=self_play_model,
             maximum_steps=maximum_steps,
         )
 
@@ -754,6 +808,7 @@ def rollout_all_actions_chunked(
                 device,
                 focal_seat=focal_seat,
                 lineup=lineup,
+                self_play_model=self_play_model,
                 maximum_steps=maximum_steps,
             )
         )

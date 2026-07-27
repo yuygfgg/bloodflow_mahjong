@@ -423,7 +423,7 @@ class CollectionResult:
 
 
 class TrajectoryCollector:
-    """Collect a rotating focal Actor against rules and frozen self-play."""
+    """Collect a rotating focal Actor against rules and a frozen opponent."""
 
     def __init__(
         self,
@@ -433,11 +433,17 @@ class TrajectoryCollector:
         *,
         seed: int,
         self_play_fraction: float = 0.0,
+        self_play_actor: BloodFlowTransformer | None = None,
     ) -> None:
         if not 0.0 <= self_play_fraction <= 2.0 / 3.0:
             raise ValueError("self_play_fraction must be in [0, 2/3]")
         self.config = config
         self.actor = actor.eval()
+        self.self_play_actor = (
+            self.actor if self_play_actor is None else self_play_actor.eval()
+        )
+        if self.self_play_actor.config != self.actor.config:
+            raise ValueError("self-play Actor config must match the focal Actor")
         self.device = device
         self.next_seed = int(seed)
         self.lineup_cursor = 0
@@ -488,12 +494,15 @@ class TrajectoryCollector:
         return PolicyLineups(sources, focal)
 
     def _launch_model_actions(
-        self, buffers: EngineBuffers, rows: np.ndarray
+        self,
+        model: BloodFlowTransformer,
+        buffers: EngineBuffers,
+        rows: np.ndarray,
     ) -> torch.Tensor:
         if not len(rows):
             return torch.empty(0, dtype=torch.uint8, device=self.device)
         return _launch_policy_actions(
-            self.actor,
+            model,
             buffers,
             rows,
             self.device,
@@ -509,17 +518,36 @@ class TrajectoryCollector:
             raise RuntimeError("collector encountered a terminal row before reset")
         rows = np.arange(len(actors))
         sources = lineups.sources[rows, actors].astype(np.uint8)
-        model_rows = np.flatnonzero(
-            np.isin(
-                sources,
-                (int(ReplaySource.CURRENT), int(ReplaySource.SELF_PLAY)),
+        current_rows = np.flatnonzero(sources == int(ReplaySource.CURRENT))
+        self_play_rows = np.flatnonzero(sources == int(ReplaySource.SELF_PLAY))
+        if self.self_play_actor is self.actor:
+            model_rows = np.flatnonzero(
+                np.isin(
+                    sources,
+                    (int(ReplaySource.CURRENT), int(ReplaySource.SELF_PLAY)),
+                )
             )
-        )
-        pending_model_actions = (
-            self._launch_model_actions(buffers, model_rows)
-            if len(model_rows)
-            else None
-        )
+            pending_model_actions = (
+                self._launch_model_actions(self.actor, buffers, model_rows)
+                if len(model_rows)
+                else None
+            )
+            pending_self_play_actions = None
+        else:
+            model_rows = current_rows
+            pending_model_actions = (
+                self._launch_model_actions(self.actor, buffers, current_rows)
+                if len(current_rows)
+                else None
+            )
+            pending_self_play_actions = (
+                self._launch_model_actions(
+                    self.self_play_actor, buffers, self_play_rows
+                )
+                if len(self_play_rows)
+                else None
+            )
+        model_count = len(current_rows) + len(self_play_rows)
 
         actions = buffers.actions
         rule_enabled = np.isin(
@@ -535,9 +563,14 @@ class TrajectoryCollector:
             if np.any(model_actions == np.iinfo(np.uint8).max):
                 raise RuntimeError("Actor produced non-finite logits during collection")
             actions[model_rows] = model_actions
+        if pending_self_play_actions is not None:
+            model_actions = pending_self_play_actions.cpu().numpy()
+            if np.any(model_actions == np.iinfo(np.uint8).max):
+                raise RuntimeError("self-play Actor produced non-finite logits")
+            actions[self_play_rows] = model_actions
         if not buffers.legal[rows, actions.astype(np.int64)].all():
             raise RuntimeError("collector selected an illegal action")
-        return actions, decision_categories(buffers.meta), sources, len(model_rows)
+        return actions, decision_categories(buffers.meta), sources, model_count
 
     @staticmethod
     def _finish(

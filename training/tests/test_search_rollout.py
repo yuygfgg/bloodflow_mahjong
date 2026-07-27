@@ -168,6 +168,55 @@ def test_lineup_actions_overlap_model_and_masked_rule_rows(monkeypatch) -> None:
     assert buffers.legal[np.arange(4), actions.astype(np.int64)].all()
 
 
+def test_lineup_actions_routes_self_play_to_a_separate_model(monkeypatch) -> None:
+    batch = bm.Batch(3, seed=29)
+    buffers = EngineBuffers.for_batch(batch, history=16)
+    buffers.observe()
+    actors = buffers.meta[:, 1].astype(np.int64)
+    focal_seats = (actors + 1) % 4
+    focal_seats[0] = actors[0]
+    lineups = np.full((3, 4), int(ReplaySource.RULE_FAST), dtype=np.int8)
+    lineups[np.arange(3), focal_seats] = int(ReplaySource.CURRENT)
+    lineups[1, actors[1]] = int(ReplaySource.SELF_PLAY)
+    lineups[2, actors[2]] = int(ReplaySource.SELF_PLAY)
+    calls: list[tuple[str, np.ndarray]] = []
+
+    actor = BloodFlowTransformer(
+        TransformerConfig(
+            d_model=16,
+            num_heads=4,
+            static_layers=1,
+            history_layers=1,
+            ffn_dim=32,
+            max_history=16,
+        )
+    ).eval()
+    opponent = BloodFlowTransformer(actor.config).eval()
+
+    def fake_model_actions(model, engine_buffers, rows, device, **kwargs):
+        calls.append(("focal" if model is actor else "opponent", rows.copy()))
+        return torch.as_tensor(
+            [np.flatnonzero(engine_buffers.legal[row])[0] for row in rows],
+            dtype=torch.uint8,
+        )
+
+    monkeypatch.setattr(
+        "training.search_rollout._launch_frozen_policy_actions", fake_model_actions
+    )
+    actions = _lineup_actions(
+        buffers,
+        actor,
+        focal_seats,
+        lineups,
+        torch.device("cpu"),
+        self_play_model=opponent,
+    )
+    assert [name for name, _rows in calls] == ["focal", "opponent"]
+    np.testing.assert_array_equal(calls[0][1], np.asarray([0]))
+    np.testing.assert_array_equal(calls[1][1], np.asarray([1, 2]))
+    assert buffers.legal[np.arange(3), actions.astype(np.int64)].all()
+
+
 def test_search_result_validates_action_major_alignment() -> None:
     result = SearchRolloutResult(
         actions=np.asarray([2, 3], dtype=np.uint8),

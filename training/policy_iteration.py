@@ -435,6 +435,7 @@ def estimate_counterfactual_batch(
     actor: BloodFlowTransformer,
     device: torch.device,
     *,
+    self_play_actor: BloodFlowTransformer | None = None,
     worlds: int,
     world_chunk: int,
     seed: int,
@@ -471,6 +472,10 @@ def estimate_counterfactual_batch(
     )
 
     actor.eval()
+    if self_play_actor is not None:
+        if self_play_actor.config != actor.config:
+            raise ValueError("self-play Actor config must match the focal Actor")
+        self_play_actor.eval()
     for group_start in range(0, len(queries), query_batch_size):
         group = queries[group_start : group_start + query_batch_size]
         source, states, group_legal = _capture_query_group(
@@ -517,6 +522,7 @@ def estimate_counterfactual_batch(
             device,
             focal_seats=focal_seats,
             lineups=lineups,
+            self_play_model=self_play_actor,
             world_chunk=world_chunk,
             inference_batch_size=inference_batch_size,
             on_progress=rollout_progress if on_progress is not None else None,
@@ -770,6 +776,7 @@ def cached_counterfactual_corpus(
     actor: BloodFlowTransformer,
     device: torch.device,
     *,
+    self_play_actor: BloodFlowTransformer | None = None,
     fingerprint: str,
     worlds: int,
     world_chunk: int,
@@ -834,6 +841,7 @@ def cached_counterfactual_corpus(
                 queries[start:stop],
                 actor,
                 device,
+                self_play_actor=self_play_actor,
                 worlds=worlds,
                 world_chunk=world_chunk,
                 seed=world_seed,

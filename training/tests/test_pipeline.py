@@ -4,10 +4,13 @@ import numpy as np
 import pytest
 import torch
 
+import bloodflow_mahjong as bm
+
 from training.model import BloodFlowTransformer, TransformerConfig
 from training.pipeline import (
     CollectionConfig,
     EngineBuffers,
+    PolicyLineups,
     TrajectoryCollector,
     _lineup_history_seat_masks,
     clone_policy,
@@ -148,6 +151,58 @@ def test_two_thirds_self_play_is_exact_and_seed_deterministic() -> None:
             axis=1,
         )
         == 1
+    )
+
+
+def test_collection_routes_current_and_self_play_to_separate_models(monkeypatch) -> None:
+    focal = tiny_actor()
+    opponent = tiny_actor()
+    collector = TrajectoryCollector(
+        CollectionConfig(envs=3, history=32),
+        focal,
+        torch.device("cpu"),
+        seed=23,
+        self_play_fraction=2.0 / 3.0,
+        self_play_actor=opponent,
+    )
+    batch = bm.Batch(3, seed=29)
+    buffers = EngineBuffers.for_batch(batch, history=32)
+    buffers.observe()
+    actors = buffers.meta[:, 1].astype(np.int64)
+    focal_seats = (actors + 1) % 4
+    focal_seats[0] = actors[0]
+    sources = np.full((3, 4), int(ReplaySource.RULE_FAST), dtype=np.uint8)
+    sources[np.arange(3), focal_seats] = int(ReplaySource.CURRENT)
+    sources[1, actors[1]] = int(ReplaySource.SELF_PLAY)
+    sources[2, actors[2]] = int(ReplaySource.SELF_PLAY)
+    calls: list[tuple[str, np.ndarray]] = []
+
+    def fake_actions(model, engine_buffers, rows, device, **kwargs):
+        calls.append(("focal" if model is focal else "opponent", rows.copy()))
+        return torch.as_tensor(
+            [np.flatnonzero(engine_buffers.legal[row])[0] for row in rows],
+            dtype=torch.uint8,
+        )
+
+    monkeypatch.setattr("training.pipeline._launch_policy_actions", fake_actions)
+    actions, _categories, sources, model_count = collector._actions(
+        buffers, PolicyLineups(sources, focal_seats)
+    )
+    assert [name for name, _rows in calls] == ["focal", "opponent"]
+    np.testing.assert_array_equal(calls[0][1], np.asarray([0]))
+    np.testing.assert_array_equal(calls[1][1], np.asarray([1, 2]))
+    assert model_count == 3
+    assert buffers.legal[np.arange(3), actions.astype(np.int64)].all()
+    assert np.array_equal(
+        sources,
+        np.asarray(
+            [
+                ReplaySource.CURRENT,
+                ReplaySource.SELF_PLAY,
+                ReplaySource.SELF_PLAY,
+            ],
+            dtype=np.uint8,
+        ),
     )
 
 

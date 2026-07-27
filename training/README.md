@@ -24,7 +24,7 @@ python -m training.train \
   --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
 ```
 
-训练无限运行，直到按 `Ctrl+C`。终端会持续显示阶段进度、吞吐、elapsed 和 ETA；每个完整 iteration 提交后打印固定规则配对评测摘要及当前/下一轮 self-play 比例。固定规则首位率达到 55% 后，训练会逐轮增加冻结 Actor 对手，最多占两个对手席位；固定评测本身始终保持规则对手。
+训练无限运行，直到按 `Ctrl+C`。终端会持续显示阶段进度、吞吐、elapsed 和 ETA；每个完整 iteration 提交后打印固定规则配对评测摘要及当前/下一轮 self-play 比例。固定规则评测确认相对 SL 的 paired `dRank` 显著改善且 score 没有显著伤害后启用 10% self-play；累计 `dRank` 每改善 `0.01` 提高一档，最多占两个对手席位。self-play 对手来自历史池，而非当前 learner：池以 SL 初始化，每 8 次提交加入刚完成的 Actor，保留最近 4 个快照并逐轮轮换。固定评测本身始终保持规则对手。
 
 恢复：
 
@@ -33,7 +33,7 @@ python -m training.train \
   --resume runs/policy-iteration-v3/latest.pt
 ```
 
-`latest.pt` 只包含完整提交的 iteration。中断时，未完成 iteration 的目标分片保留在 `pending/`；恢复会确定性重建同一批状态并补齐分片。恢复不接受 seed 或配置覆盖，也不支持旧 checkpoint 迁移。当前执行版本必须使用新的空输出目录，不能混用 batching 优化前的缓存。
+`latest.pt` 只包含完整提交的 iteration 和历史 opponent pool。中断时，未完成 iteration 的目标分片保留在 `pending/`；恢复会确定性重建同一批状态并补齐分片。恢复不接受 seed 或配置覆盖；生产 v3 checkpoint 可直接恢复，并先以原有同模型语义补齐当前 pending iteration，首次提交后升级为历史池 v4。早于 v3 的旧格式仍不迁移。当前执行版本必须使用新的空输出目录，不能混用 batching 优化前的缓存。
 
 ## Batch Size Sweep
 

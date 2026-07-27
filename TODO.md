@@ -6,7 +6,7 @@
 
 - [x] 将 `python -m training.train` 收敛为唯一正式训练入口，CUDA only，默认无限运行到 `Ctrl+C`。
 - [x] 直接加载 Actor-only SL checkpoint，不重新执行 SL，不提供旧 checkpoint 迁移或配置兼容。
-- [x] 每个策略版本冻结当前 Actor，并按固定规则首位率 curriculum 逐步加入冻结 Actor self-play，同时保留至少一个 fast/safe 规则对手。
+- [x] 每个策略版本冻结当前 Actor，并按相对 SL 的 paired `dRank` 置信门控和累计能力档位逐步加入历史池 self-play，以 score 非劣化为护栏，同时保留至少一个 fast/safe 规则对手；对手快照每 8 次提交刷新、保留最近 4 个并轮换。
 - [x] 覆盖全部九类决策；三 seed sweep 后默认每类选择 256 个状态，并强制一局最多贡献一个训练状态。
 - [x] 每轮从 source trajectories 估计自然访问频率，统一用于训练 row weights 和独立 KL 校准。
 - [x] 每个状态保留来源暗手并重洗 16 个未来 live wall；全部合法动作共享 paired futures，隐藏手差异由独立状态 batch 平均。

@@ -3,8 +3,8 @@
 `python -m training.train` 是当前唯一的正式训练入口。它从已有的 SL Actor 开始，在每个策略版本上重新采集独立状态、估计所有合法动作的配对反事实回报，然后只执行一次受 KL 约束的全批量更新。
 
 ```text
-冻结当前 Actor
-  -> 按 curriculum 对规则 / 冻结 Actor 对手采集全新完整对局
+冻结当前 Actor，并从历史池轮换一个独立 opponent snapshot
+  -> 按 curriculum 对规则 / 历史 opponent 采集全新完整对局
   -> 九类决策各选 256 个独立隐藏牌局
   -> 每个状态在 16 个配对 live-wall 续局中评估全部合法动作
   -> 累积完整 2304 状态的梯度并执行一次 AdamW.step()
@@ -28,11 +28,13 @@
 
 ## 对手和可见信息
 
-每局只有一个轮换座位由当前 Actor 控制。训练开始时另外三个座位由 `rule_fast` 和 `rule_safe` 交错控制；当固定规则评测中的 Actor 首位率达到 `55%` 后，下一轮开始加入本轮开始时冻结的 Actor 作为 `self_play` 对手。每次后续固定规则评测仍达到门槛，就把 self-play 对手席位比例增加 `10` 个百分点，最高为 `2/3`，因此始终至少保留一个规则对手。低于门槛时比例保持不变，不会回退。Actor 的座位在四家之间均匀轮换。
+每局只有一个轮换座位由当前 Actor 控制。训练开始时另外三个座位由 `rule_fast` 和 `rule_safe` 交错控制。固定规则评测确认 Actor 相对冻结 SL 的 paired `dRank` 95% 区间上界小于 `0`，且 paired score delta 的区间上界不小于 `0`、即没有显著分差伤害后，下一轮开始加入 `self_play` 对手。首档比例为 `0.10`；此后相对 SL 的平均 `dRank` 每累计改善 `0.01` 再提高一档：`-0.01 -> 0.20`、`-0.02 -> 0.30`，依此类推，最高为 `2/3`。比例由累计能力档位决定，同一档不会逐轮重复增加；已经启用的比例保持单调，不因一次评测波动自动回退。Actor 的座位在四家之间均匀轮换，且始终至少保留一个规则对手。
 
-训练 source、校准 source 和反事实续局使用完全相同的当前阵容比例；self-play 对手始终是该 iteration 开始时冻结的 Actor，candidate 只有在提交后才会进入下一轮阵容。固定规则 reference panel、candidate 评测和 batch-size sweep 始终显式使用 `self_play_fraction=0`，所以 curriculum 不会污染能力门控或 batch 比较。
+自博弈对手不是本轮 learner 的副本。历史池在新 run 时以冻结 SL 初始化；每 `8` 个完整提交追加刚提交的 Actor 快照，只保留最近 `4` 个不同 digest 的快照。每一轮只从池中轮换选取一个与本轮 learner digest 不同的 snapshot，所有标为 `self_play` 的席位都使用它；该 snapshot 在本轮 source、校准 source 和反事实续局中保持不变。这样 learner 每轮仍冻结为目标生成的 reference，但对手只按较长周期更新，并在多个历史策略间轮换。snapshot 权重、digest、轮换计数和最后刷新 iteration 都保存于 `latest.pt`；target cache 指纹也包含所选 opponent digest。
 
-Actor 始终只读取当前行动者可见的手牌、公开状态和事件历史。目标生成不会猜测或重采样对手当前暗手：每个 query 保留来源牌局的四家当前手牌和公开状态，只独立重洗尚未摸出的 live wall。对手暗手的不确定性由 batch 中大量独立来源牌局做经验积分，而不是由一个冷启动 belief 模型提供。后续续局中，焦点座位和该局标记为 self-play 的座位都调用冻结的当前 Actor，其余座位继续使用该局原有规则类型。
+训练 source、校准 source 和反事实续局使用完全相同的阵容比例和同一个历史 opponent snapshot；candidate 只有在提交后才有资格在后续池刷新时进入历史池。固定规则 reference panel、candidate 评测和 batch-size sweep 始终显式使用 `self_play_fraction=0`，所以 curriculum 不会污染能力门控或 batch 比较。
+
+Actor 始终只读取当前行动者可见的手牌、公开状态和事件历史。目标生成不会猜测或重采样对手当前暗手：每个 query 保留来源牌局的四家当前手牌和公开状态，只独立重洗尚未摸出的 live wall。对手暗手的不确定性由 batch 中大量独立来源牌局做经验积分，而不是由一个冷启动 belief 模型提供。后续续局中，焦点座位调用本轮冻结 learner，标记为 self-play 的座位调用本轮选中的历史 snapshot，其余座位继续使用该局原有规则类型。
 
 采集动作采用合法动作 mask 后的确定性 argmax。规则动作同样经过合法性检查。任何非有限 Actor logits、非法动作、轨迹重放不一致或引擎规则版本不匹配都会立即失败，不会静默跳过样本。
 
@@ -79,7 +81,7 @@ AdamW 得到的参数差只被当作一个方向。系统在完全独立的校�
 
 ## 固定规则评测
 
-新 run 首先让冻结 SL 在固定的 16384 个 seeds 上对规则对手完成 reference panel。之后每个 candidate 使用完全相同的 seeds、焦点座位和规则阵容进行评测。评测报告以下指标，其中固定规则首位率同时驱动训练 curriculum：
+新 run 首先让冻结 SL 在固定的 16384 个 seeds 上对规则对手完成 reference panel。之后每个 candidate 使用完全相同的 seeds、焦点座位和规则阵容进行评测。评测报告以下指标，其中 paired `dRank` 的累计改善和置信区间驱动训练 curriculum，paired score delta 作为非劣化护栏：
 
 - Actor 的平均名次、相对初始分的平均分差、首位率和末位率；
 - 相对 SL 的 paired `dRank` 和 score delta；
@@ -87,7 +89,7 @@ AdamW 得到的参数差只被当作一个方向。系统在完全独立的校�
 
 `dRank < 0` 表示 Actor 名次优于 SL，score delta `> 0` 表示 Actor 分数优于 SL。固定面板用于降低迭代曲线噪声，并不是泛化证明；长期结果仍应在全新 seeds 和其他对手分布上复验。
 
-checkpoint 额外保存当前 self-play 比例、最近一次固定规则首位率和首次启用的 iteration；恢复时不会重新计算或随机改变阵容。
+checkpoint 额外保存当前 self-play 比例、最近一次固定规则首位率、首次启用的 iteration 和历史 opponent pool；恢复时不会重新计算或随机改变当前 iteration 的阵容。现有 v3 checkpoint 可直接恢复：当前 pending iteration 保持旧的同模型语义和 target 指纹，第一次完整提交后原子升级为带历史池的 v4 checkpoint；后续 iteration 使用历史 opponent。
 
 ## 启动与恢复
 
@@ -114,7 +116,7 @@ python -m training.train \
   --resume runs/policy-iteration-v3/latest.pt
 ```
 
-恢复时配置、root seed、SL 路径及其 SHA-256、模型结构、引擎规则版本和策略执行版本都来自 checkpoint，并进行严格校验。不能在恢复命令中覆盖训练参数或 seed。旧训练格式没有迁移或兼容路径。本轮 batching 优化改变了极少数 BF16 近并列动作的执行顺序，因此必须使用新的空输出目录，不能复用优化前的 reference/target 缓存。
+恢复时配置、root seed、SL 路径及其 SHA-256、模型结构、引擎规则版本和策略执行版本都来自 checkpoint，并进行严格校验。不能在恢复命令中覆盖训练参数或 seed。生产 v3 checkpoint 是历史池 v4 的唯一兼容输入；更早格式没有迁移路径。本轮 batching 优化改变了极少数 BF16 近并列动作的执行顺序，因此必须使用新的空输出目录，不能复用优化前的 reference/target 缓存。
 
 `latest.pt` 是唯一权威的恢复点。它只在评测完成后原子替换，因此只代表完整提交的 iteration。若在目标生成期间中断，对应 `pending/iteration-*` 分片会保留；恢复后确定性重建同一批 query，并只补齐缺失分片。完整 iteration 提交后该 pending 目录会删除。
 
@@ -122,7 +124,7 @@ python -m training.train \
 
 一个正式 run 包含：
 
-- `latest.pt`：可恢复的完整状态，包括 Actor、配置、root seed、下一 iteration 和最后指标；
+- `latest.pt`：可恢复的完整状态，包括 Actor、历史 opponent pool、配置、root seed、下一 iteration 和最后指标；
 - `actor.pt`：Actor-only 部署权重；
 - `config.json`：不可变的 run 身份、训练配置、SL 摘要和引擎规则版本；
 - `metrics.jsonl`：每个已提交 iteration 的 source、目标、优化、校准和评测指标；
@@ -154,8 +156,8 @@ python -m training.train \
 | `--evaluation-games` | 16384 | 固定规则配对评测局数 |
 | `--evaluation-envs` | 512 | 评测并行环境数 |
 | `--bootstrap-samples` | 10000 | 配对区间的 bootstrap 次数 |
-| `--self-play-start-first-rate` | 0.55 | 开始加入 self-play 的固定规则首位率 |
-| `--self-play-increment` | 0.10 | 每次达标评测增加的 self-play 对手席位比例 |
+| `--self-play-start-first-rate` | 0.55 | 仅为现有 v3 checkpoint 身份兼容保留，新门控不读取此值 |
+| `--self-play-increment` | 0.10 | paired `dRank` 每改善 `0.01` 对应的 self-play 档位增量 |
 | `--maximum-self-play-fraction` | 2/3 | self-play 对手席位上限，至少保留一个规则对手 |
 
 新 run 可以覆盖这些参数；resume 不接受覆盖。不要仅为了提高显存占用而放大 `world_chunk`、microbatch 或 envs。三者控制的是不同阶段的瞬时工作集，应以端到端 iteration 时间和稳定性选择。
