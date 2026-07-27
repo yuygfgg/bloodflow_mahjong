@@ -404,6 +404,37 @@ impl PyBatch {
         Ok(Self { inner })
     }
 
+    fn remove_indices_swap<'py>(
+        &mut self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+    ) -> PyResult<Vec<u32>> {
+        require_c_contiguous(indices, "indices")?;
+        let indices = try_readonly(indices, "indices")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        if let Some(&index) = indices
+            .iter()
+            .find(|&&index| index as usize >= self.inner.len())
+        {
+            return Err(PyValueError::new_err(format!(
+                "batch index {index} is out of range for batch size {}",
+                self.inner.len()
+            )));
+        }
+        if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
+            return Err(PyValueError::new_err(
+                "removed indices must be strictly increasing",
+            ));
+        }
+        let indices = indices
+            .iter()
+            .map(|&index| index as usize)
+            .collect::<Vec<_>>();
+        py.detach(|| self.inner.remove_indices_swap(&indices))
+            .map(|rows| rows.into_iter().map(|row| row as u32).collect())
+            .map_err(game_error)
+    }
+
     fn resample_information_sets<'py>(
         &self,
         py: Python<'py>,
@@ -432,6 +463,38 @@ impl PyBatch {
             .collect::<Vec<_>>();
         let inner = py
             .detach(|| self.inner.resample_information_sets(&indices, seeds))
+            .map_err(game_error)?;
+        Ok(Self { inner })
+    }
+
+    fn resample_live_walls<'py>(
+        &self,
+        py: Python<'py>,
+        indices: &Bound<'py, PyArray1<u32>>,
+        seeds: &Bound<'py, PyArray1<u64>>,
+    ) -> PyResult<Self> {
+        require_c_contiguous(indices, "indices")?;
+        require_shape(seeds, &[indices.len()], "seeds")?;
+        require_c_contiguous(seeds, "seeds")?;
+        let indices = try_readonly(indices, "indices")?;
+        let seeds = try_readonly(seeds, "seeds")?;
+        let indices = readonly_slice(&indices, "indices")?;
+        let seeds = readonly_slice(&seeds, "seeds")?;
+        if let Some(&index) = indices
+            .iter()
+            .find(|&&index| index as usize >= self.inner.len())
+        {
+            return Err(PyValueError::new_err(format!(
+                "batch index {index} is out of range for batch size {}",
+                self.inner.len()
+            )));
+        }
+        let indices = indices
+            .iter()
+            .map(|&index| index as usize)
+            .collect::<Vec<_>>();
+        let inner = py
+            .detach(|| self.inner.resample_live_walls(&indices, seeds))
             .map_err(game_error)?;
         Ok(Self { inner })
     }
@@ -480,6 +543,24 @@ impl PyBatch {
         let mut output = try_readwrite(output, "output")?;
         let output = writable_slice(&mut output, "output")?;
         py.detach(|| self.inner.simple_rule_actions_into(output))
+            .map_err(game_error)
+    }
+
+    fn simple_rule_actions_masked_into<'py>(
+        &self,
+        py: Python<'py>,
+        enabled: &Bound<'py, PyArray1<u8>>,
+        output: &Bound<'py, PyArray1<u8>>,
+    ) -> PyResult<()> {
+        require_shape(enabled, &[self.inner.len()], "enabled")?;
+        require_c_contiguous(enabled, "enabled")?;
+        require_shape(output, &[self.inner.len()], "output")?;
+        require_c_contiguous(output, "output")?;
+        let enabled = try_readonly(enabled, "enabled")?;
+        let mut output = try_readwrite(output, "output")?;
+        let enabled = readonly_slice(&enabled, "enabled")?;
+        let output = writable_slice(&mut output, "output")?;
+        py.detach(|| self.inner.simple_rule_actions_masked_into(enabled, output))
             .map_err(game_error)
     }
 
@@ -547,6 +628,33 @@ impl PyBatch {
             .map_err(game_error)
     }
 
+    fn events_masked_into<'py>(
+        &self,
+        py: Python<'py>,
+        history_seat_masks: &Bound<'py, PyArray1<u8>>,
+        events: &Bound<'py, PyArray3<i32>>,
+        lengths: &Bound<'py, PyArray1<u16>>,
+    ) -> PyResult<()> {
+        let batch_size = self.inner.len();
+        require_shape(history_seat_masks, &[batch_size], "history_seat_masks")?;
+        require_c_contiguous(history_seat_masks, "history_seat_masks")?;
+        let capacity = validate_batch_event_array(batch_size, events, "events")?;
+        require_shape(lengths, &[batch_size], "lengths")?;
+        require_c_contiguous(lengths, "lengths")?;
+
+        let history_seat_masks = try_readonly(history_seat_masks, "history_seat_masks")?;
+        let mut events = try_readwrite(events, "events")?;
+        let mut lengths = try_readwrite(lengths, "lengths")?;
+        let history_seat_masks = readonly_slice(&history_seat_masks, "history_seat_masks")?;
+        let events = writable_slice(&mut events, "events")?;
+        let lengths = writable_slice(&mut lengths, "lengths")?;
+        py.detach(|| {
+            self.inner
+                .events_masked_into(history_seat_masks, capacity, events, lengths)
+        })
+        .map_err(game_error)
+    }
+
     fn step_events_into<'py>(
         &self,
         py: Python<'py>,
@@ -582,6 +690,33 @@ impl PyBatch {
         let records = writable_slice(&mut records, "records")?;
         py.detach(|| self.inner.step_indices_into(actions, records))
             .map_err(game_error)
+    }
+
+    fn step_masked_into<'py>(
+        &mut self,
+        py: Python<'py>,
+        enabled: &Bound<'py, PyArray1<u8>>,
+        actions: &Bound<'py, PyArray1<u8>>,
+        records: &Bound<'py, PyArray2<i64>>,
+    ) -> PyResult<()> {
+        require_shape(enabled, &[self.inner.len()], "enabled")?;
+        require_c_contiguous(enabled, "enabled")?;
+        require_shape(actions, &[self.inner.len()], "actions")?;
+        require_c_contiguous(actions, "actions")?;
+        require_shape(records, &[self.inner.len(), STEP_RECORD_WIDTH], "records")?;
+        require_c_contiguous(records, "records")?;
+
+        let enabled = try_readonly(enabled, "enabled")?;
+        let actions = try_readonly(actions, "actions")?;
+        let mut records = try_readwrite(records, "records")?;
+        let enabled = readonly_slice(&enabled, "enabled")?;
+        let actions = readonly_slice(&actions, "actions")?;
+        let records = writable_slice(&mut records, "records")?;
+        py.detach(|| {
+            self.inner
+                .step_masked_indices_into(enabled, actions, records)
+        })
+        .map_err(game_error)
     }
 
     fn observe_into<'py>(

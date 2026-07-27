@@ -34,9 +34,16 @@ def unpack_action_masks(
         raise ValueError(
             "mask_words must have shape [batch, 2], " f"got {tuple(words.shape)}"
         )
-    bits = np.arange(64, dtype=np.uint64)
-    dense = ((words[..., None] >> bits) & np.uint64(1)).reshape(words.shape[0], -1)
-    dense = dense[:, :ACTION_SPACE_SIZE]
+    # The engine stores bit zero as each word's least-significant bit.
+    # Byte-wise expansion avoids a temporary uint64 tensor eight times larger
+    # than the boolean result.
+    little_endian = words.astype("<u8", copy=False)
+    byte_rows = np.ascontiguousarray(little_endian).view(np.uint8).reshape(
+        words.shape[0], -1
+    )
+    dense = np.unpackbits(byte_rows, axis=1, bitorder="little")[
+        :, :ACTION_SPACE_SIZE
+    ]
     if out is None:
         return dense.astype(np.bool_)
     if out.dtype != np.bool_ or out.shape != (words.shape[0], ACTION_SPACE_SIZE):

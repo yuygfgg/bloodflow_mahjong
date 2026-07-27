@@ -1,332 +1,227 @@
-# 无牌谱 IQL/AWR 训练方案
+# 保守策略迭代训练
 
-本文对应 `training/` 当前实现。主链路使用完整合成轨迹上的离线到在线策略迭代：
-
-```text
-冻结 SL / 规则 / 当前策略 / 历史策略生成完整对局
-    -> 紧凑轨迹和严格确定性重放
-    -> Monte-Carlo return-to-go
-    -> 独立 Double-Q + Expectile V
-    -> 通过校准门控后做 AWR Actor 提取
-    -> 立即生成新轨迹并继续训练
-```
-
-训练只支持 CUDA，默认无限运行，直到用户按 `Ctrl+C`。没有自动停止、强制解冻或按 update 数强行推进 Actor 的兜底。
-
-## 信息边界和奖励
-
-- Actor、Q1、Q2 和 V 只能读取当前行动者可见的手牌、公开状态和 viewer-scoped 事件历史。
-- Critic 与 Actor 完全不共享参数，Critic 梯度不能覆盖 SL Actor 已学到的表征。
-- 每一步的目标是该座位从当前动作到终局的真实累计分差，按 `10_000` 归一化。
-- 不加入排名奖励、胡牌 bonus、手工 shaping 或 reward clipping。
-- 四个座位和九类决策都进入 replay，不能只训练中后盘弃牌。
-- 非法动作在 Actor 和 Q 网络内都被 legal mask 排除。
-
-对于轨迹中第 `t` 个动作和座位 `i`：
+`python -m training.train` 是当前唯一的正式训练入口。它从已有的 SL Actor 开始，在每个策略版本上重新采集独立状态、估计所有合法动作的配对反事实回报，然后只执行一次受 KL 约束的全批量更新。
 
 ```text
-G_t(i) = sum_{k=t..terminal} score_delta_k(i) / 10_000
+冻结当前 Actor
+  -> 按 curriculum 对规则 / 冻结 Actor 对手采集全新完整对局
+  -> 九类决策各选 256 个独立隐藏牌局
+  -> 每个状态在 16 个配对 live-wall 续局中评估全部合法动作
+  -> 累积完整 2304 状态的梯度并执行一次 AdamW.step()
+  -> 用独立状态把更新方向缩放到 visitation-weighted KL = 0.001
+  -> 在固定 16384 局规则面板上与 SL 做配对评测
+  -> 原子提交 checkpoint，进入下一个策略版本
 ```
 
-开局的正确期望通常接近零，因此 Critic 是否学会不能只看全局 value loss。验证会按早、中、晚局和九类动作分别报告误差、相关性、常数基线改进和 Double-Q disagreement。
+训练只支持 CUDA，使用 eager mode 和 BF16 autocast，不调用 `torch.compile`。正式运行没有最大 update 数，也没有自动停止条件，会一直运行到用户按 `Ctrl+C`。
 
-## Actor 和 SL 引用
+## 为什么采用这条路径
 
-默认 Actor 是约 8.84M 参数的双塔 Transformer：
+麻将单局终局回报的方差很大，同一个可见状态还对应许多不同的对手暗手和牌墙。小批量在线更新容易把隐藏状态偶然性当成动作优势。当前流程针对这个问题施加四个约束：
 
-- `d_model=256`、8 个 attention heads；
-- 静态状态塔 3 层双向 self-attention；
-- 历史塔 5 层 causal self-attention，最多 192 条事件并使用 RoPE；
-- FFN 宽度 1024，策略头输出 115 个动作 logits。
+- 一个训练状态至多来自一个完整隐藏牌局，避免把同一局的多个相关决策伪装成独立样本；
+- 九类决策都有硬覆盖，每轮默认 `9 x 256 = 2304` 个状态；
+- 同一状态的全部合法动作共享相同的 16 个未来牌墙排列，直接降低动作差值方差；
+- 完整批量只产生一个优化器方向，再在独立校准集上缩放到很小的 KL，不对同一批数据做多轮拟合。
 
-新训练器不执行 SL。它直接读取当前 Actor-only 格式的：
+这里固定的是每轮状态数量，不是状态内容。每个策略版本都会重新生成 source games、训练状态、世界 seed 和校准状态。完整 update 提交后，其训练目标缓存会删除。因此长期训练不会反复记忆一个 2304 状态的数据集；主要风险是有限批量的方向噪声、规则对手分布偏差和模拟回报的系统偏差。
+
+## 对手和可见信息
+
+每局只有一个轮换座位由当前 Actor 控制。训练开始时另外三个座位由 `rule_fast` 和 `rule_safe` 交错控制；当固定规则评测中的 Actor 首位率达到 `55%` 后，下一轮开始加入本轮开始时冻结的 Actor 作为 `self_play` 对手。每次后续固定规则评测仍达到门槛，就把 self-play 对手席位比例增加 `10` 个百分点，最高为 `2/3`，因此始终至少保留一个规则对手。低于门槛时比例保持不变，不会回退。Actor 的座位在四家之间均匀轮换。
+
+训练 source、校准 source 和反事实续局使用完全相同的当前阵容比例；self-play 对手始终是该 iteration 开始时冻结的 Actor，candidate 只有在提交后才会进入下一轮阵容。固定规则 reference panel、candidate 评测和 batch-size sweep 始终显式使用 `self_play_fraction=0`，所以 curriculum 不会污染能力门控或 batch 比较。
+
+Actor 始终只读取当前行动者可见的手牌、公开状态和事件历史。目标生成不会猜测或重采样对手当前暗手：每个 query 保留来源牌局的四家当前手牌和公开状态，只独立重洗尚未摸出的 live wall。对手暗手的不确定性由 batch 中大量独立来源牌局做经验积分，而不是由一个冷启动 belief 模型提供。后续续局中，焦点座位和该局标记为 self-play 的座位都调用冻结的当前 Actor，其余座位继续使用该局原有规则类型。
+
+采集动作采用合法动作 mask 后的确定性 argmax。规则动作同样经过合法性检查。任何非有限 Actor logits、非法动作、轨迹重放不一致或引擎规则版本不匹配都会立即失败，不会静默跳过样本。
+
+## 独立状态和九类决策
+
+训练只选择当前 Actor 实际控制、且至少有两个合法动作的状态。选择器按稀缺类别优先分配完整对局，并保证一局最多贡献一个状态。默认每类 256 个：
+
+1. 换三张第一张；
+2. 换三张第二张；
+3. 换三张第三张；
+4. 定缺；
+5. 早盘回合；
+6. 中盘回合；
+7. 晚盘回合；
+8. 胡牌响应；
+9. 碰杠响应。
+
+虽然训练 batch 对九类做等额采样，优化目标并非九类等权。系统会从本轮完整 source trajectories 估计当前 Actor 的自然访问频率，并将同一组 visitation weights 用于训练损失和 KL 校准。这样既保证稀有类别有样本，又保持目标接近真实决策分布。
+
+## 配对 Live-Wall 目标
+
+每个选中状态本身来自一个独立的完整隐藏牌局。系统保持该时刻的四家手牌不变，只将尚未摸出的 live wall 独立重洗 `worlds=16` 次。所有合法候选动作共享同一组未来牌墙排列，然后各自续局到终局。目标同时记录名次效用和归一化分差；Actor 更新使用合法动作上的中心化名次效用：
 
 ```text
-runs/counterfactual-larger/sl_reference.pt
+Q_rank(s, a) = mean rank utility over paired worlds
+Q_centered(s, a) = Q_rank(s, a) - mean_legal_actions Q_rank(s, .)
 ```
 
-该策略同时作为：
+同一来源暗手、同一未来牌墙上的候选动作配对比较，消除了它们的共同噪声；跨 2304 个独立来源牌局的全批量梯度再平均隐藏暗手差异。这个估计没有声称单个 query 已经积分完整信息集。`world_chunk` 只控制一次送入续局器的分支量，不改变统计目标。目标按 query shard 原子保存，缓存带 Actor 摘要、iteration、root seed、完整轨迹签名和 world count 指纹。
 
-1. 当前 Actor 的初始化；
-2. 永久冻结的参考策略；
-3. 合成数据行为策略和对手池成员；
-4. AWR 更新中的 KL 锚点。
+## 单步 Actor 更新
 
-`--sl-checkpoint` 必须是只含 `model_config` 与 `model` 的 Actor-only 文件。训练目录不会生成或覆盖该参考策略。
-
-## 完整轨迹数据
-
-### 采集
-
-每局从初始 seed 开始完整运行到引擎终局，一局同时记录四个座位的所有决策。默认使用 512 个并行环境，先采集 8192 局永久 anchor 数据，之后每轮再采集 1024 局在线数据。
-
-CUDA 推理会把同策略行数 pad 到少量固定 batch bucket，并把有效历史长度 pad 到分桶宽度；重复行只用于计算填充，结果会在写回前截断，不改变动作分布。训练包还默认启用 PyTorch expandable allocator segments。这两项用于避免长时间混合策略采集时为大量不同 attention shape 保留碎片化显存；在 RTX 5080 16GB 上，完整默认启动阶段已通过压力测试。
-
-训练更新使用单批后台 replay 预取：CUDA 训练 batch N 时，独立 CPU 线程从 seed/action 轨迹重建 batch N+1。重建只为实际抽中的 `(trajectory, step)` 生成 observation、history 和 legal mask；此前未抽中的前缀只推进引擎，不生成会被丢弃的大数组。一个 optimizer batch 整体只搬到 CUDA 一次，microbatch 在设备上切 view。训练器刚刚由同一引擎生成的完整轨迹不再立即重复跑第二遍；外部轨迹入库仍执行严格确定性重放，持久化 shard 在加载时仍检查格式、规则版本和 CRC。
-
-### CUDA 吞吐和稳定性
-
-训练对当前 Actor、采集策略、冻结 SL、历史 Actor、Q1/Q2/V 和 Oracle 全部使用 CUDA eager，不调用 `torch.compile`。本机的 `max-autotune` 曾触发 NVIDIA GSP `KernelChannelGroupApi alloc RPC` 失败；普通动态 compile 也在确定性复现中于历史长度 11 生成大量 NaN/Inf logits，而相同 checkpoint、seed 和 512 个环境的 eager 采集完整通过。因此所有编译路径已从代码中删除。
-
-启动和恢复不再有图编译或 autotune 等待。终端会明确打印 `CUDA eager mode; torch.compile disabled`。
-
-本机 RTX 5080 的真实 replay/CUDA 基准如下；这些结果用于选择默认值，不以占满显存为目标：
-
-| 项目 | 实测 |
-| --- | ---: |
-| eager 采集，`envs=512` | 约 9,800 states/s |
-| 采集，`envs=1024` | 约 8,195 states/s |
-| Critic，旧串行 replay + CUDA | 约 0.67 s/update |
-| Critic，按需 replay + 后台预取 | 约 0.45 s/update |
-
-因此默认保留 `envs=512` 和 `microbatch-size=256`：microbatch 384 没有吞吐收益，512 会使 Actor OOM；即使监控中仍有空闲显存，也不要仅为提高显存占用而放大它们。
-
-对手从离线阶段开始就是混合分布：
-
-| 成员 | 默认权重 |
-| --- | ---: |
-| `rule_fast` | 15% |
-| `rule_safe` | 15% |
-| 冻结 SL | 20% |
-| 当前 Actor | 30% |
-| 历史冻结 Actor | 20% |
-
-历史池为空时，其 20% 权重暂时回到当前 Actor。每 50 次可信 Actor 更新冻结一个快照，最多保留 `max_history=16` 个；对应的 CUDA 策略也只保留这些有效快照，快照淘汰时同步释放其模型。历史权重在最近 4 个和更早快照之间分层分配。规则和冻结 SL 始终保留，训练不会退化为纯当前策略自博弈。每局保证一个轮换座位使用当前 Actor，避免当前策略在采集分布中消失。
-
-行为探索按决策类别设置，而不是统一做 15% 合法动作均匀随机：
-
-- 换牌和弃牌使用温度及 top-k，并保留少量全合法集探索；
-- 定缺探索更低；
-- 副露响应只保留很小探索；
-- 胡牌响应仍有非零探索，但默认仅 `0.1%`。
-
-轨迹保存每个实际动作的 behavior probability、采样温度、策略来源和版本。规则动作也经过同一合法采样层，因此记录的概率与真实执行分布一致。
-
-### 紧凑格式和重放
-
-轨迹不持久化每一步的大 observation。版本化格式保存：
-
-- 初始 seed、换牌方向和引擎规则版本；
-- 每步动作、绝对座位、阶段、九类决策类别；
-- 策略来源、策略版本、动作概率和温度；
-- 四家终局分数、名次和终止原因；
-- 格式版本与 CRC。
-
-动作和类别使用紧凑整数编码，每步固定记录约 15 字节。数据按 shard 落盘。采样时从 seed 和动作序列严格重建 observation、事件历史、legal mask、Oracle tile counts 和四座位 return-to-go。以下任一不一致都会直接报错：
-
-- 动作在对应状态非法；
-- actor、phase 或决策类别不同；
-- 提前终局或轨迹未到终局；
-- 终局分数、名次或终止原因不同；
-- 数据版本、规则版本或 CRC 不匹配。
-
-train/validation 按完整轨迹划分，默认 10% 对局进入 validation，同一局的状态不会泄漏到两边。
-
-### Replay 平衡
-
-Anchor 轨迹永久保留；在线 replay 是最多 2,000,000 transitions 的滑动窗口。抽样同时按来源和九类决策设置硬保底，并对重复状态及过度集中的策略版本降采样。默认每个 batch 至少包含：
-
-- 冻结 SL 12%；
-- `rule_fast` 8%；
-- `rule_safe` 8%；
-- 当前策略 10%；
-- 已存在时的历史策略 5%；
-- 每个决策类别至少 1%。
-
-若 replay 缺少必要来源或决策类别，训练会明确失败，不会静默用失衡 batch 继续。
-
-## 独立 Q1/Q2/V
-
-Q1、Q2、V 都有自己的可见状态编码器，不共享 Actor 或彼此的参数。默认每个 Critic 使用较小的 `d_model=128` Transformer；Q 网络一次输出全部 115 个动作值，非法动作被 mask。
-
-实际行为动作使用完整轨迹 return-to-go 做 Double-Q Huber 回归：
+每轮先冻结当前 Actor 作为 reference，再复制出 candidate。完整 batch 的单步方向只在合法动作策略分布上最大化预期中心化名次效用：
 
 ```text
-L_Q = Huber(Q1(s, a), G_t) + Huber(Q2(s, a), G_t)
+L_row = -E_pi[Q_centered(s, a)]
 ```
 
-离线数据对两个 Q 分别加入只覆盖合法动作的 CQL：
+所有 microbatch 的梯度按 visitation row weight 累积；整批只 clip 一次梯度并执行一次 `AdamW.step()`。在这个 step 之前 candidate 与 reference 完全相同，因此把 reference KL 放进方向损失只会产生恒为零的梯度和一次多余前向；真正的 trust region 统一由后续独立 KL 校准实现。`microbatch_size` 只控制显存，不改变 batch、损失权重或优化器 step 数。
 
-```text
-L_CQL = logsumexp(Q(s, legal_actions)) - Q(s, behavior_action)
-```
+AdamW 得到的参数差只被当作一个方向。系统在完全独立的校准状态上做二分缩放，使 visitation-weighted reverse KL 接近但不超过默认 `0.001`。BF16 前向会让很小的校准集出现离散 KL 台阶，因此允许最多 5% 的保守 undershoot，并记录实际 `relative_shortfall`；无法进入这个区间、KL 非单调或方向为零都会直接报错。正式默认的 576 个校准状态通常比 smoke 的小面板平滑得多。
 
-CQL 不按 update 数机械归零。其系数随 replay 中当前策略数据覆盖率下降，并始终保留最小比例。
+环境实际执行 greedy argmax，而 KL 衡量 softmax 分布；接近并列的动作可能在很小 KL 下发生离散翻转。系统因此同时报告 calibration 上 visitation-weighted `greedy_flip_rate`，但不使用未经验证的固定阈值阻止更新。固定规则整局配对评测仍是判断真实行为变化的主要指标。
 
-V 使用保守 Double-Q 行为动作值做 expectile regression，默认 `tau=0.7`：
+## 固定规则评测
 
-```text
-q = min(Q1(s, a), Q2(s, a))
-residual = q - V(s)
-L_V = |tau - 1[residual < 0]| * residual^2
-```
+新 run 首先让冻结 SL 在固定的 16384 个 seeds 上对规则对手完成 reference panel。之后每个 candidate 使用完全相同的 seeds、焦点座位和规则阵容进行评测。评测报告以下指标，其中固定规则首位率同时驱动训练 curriculum：
 
-新 run 先执行默认 500 个 Critic warmup steps。之后每轮继续 64 个 Critic steps；Actor 是否更新由验证质量决定，而不是只看累计步数。
+- Actor 的平均名次、相对初始分的平均分差、首位率和末位率；
+- 相对 SL 的 paired `dRank` 和 score delta；
+- 以完整对局为单位的 95% bootstrap 区间。
 
-普通 Critic 更新始终使用完整轨迹 replay：Q1、Q2 做绝对 return-to-go 回归，V 做 expectile 回归，CQL 只约束合法动作。C 的 MC 更新是额外的一步，只更新 Q1/Q2，不替换普通 Q 目标，也不更新 V；因此普通 Critic 仍负责绝对分数校准。
+`dRank < 0` 表示 Actor 名次优于 SL，score delta `> 0` 表示 Actor 分数优于 SL。固定面板用于降低迭代曲线噪声，并不是泛化证明；长期结果仍应在全新 seeds 和其他对手分布上复验。
 
-## Critic 门控和 AWR
+checkpoint 额外保存当前 self-play 比例、最近一次固定规则首位率和首次启用的 iteration；恢复时不会重新计算或随机改变阵容。
 
-所有实验先检查 partial Critic。Actor 只有同时满足以下基础条件才可能更新：
+## 启动与恢复
 
-- Critic 至少训练 500 steps；
-- 中盘和晚盘 Q 都优于对应目标均值的常数基线；
-- 中盘和晚盘 Q 与真实 return-to-go 有最低正相关；
-- Q1/Q2 平均 disagreement 不超过阈值；
-- validation 中存在对应阶段样本。
-
-若基础门控不通过，Actor 保持冻结，但系统仍继续训练 Critic 并采集新完整轨迹。B/C 还必须让各自教师独立通过验证并连续稳定 3 次。没有“最多等 20 次”、按 update 数强制解冻或 smoke 强行放行的逻辑。
-
-B 的 Oracle 必须独立满足早、中、晚盘 Q 校准，整体和早盘 Q MAE 都至少比 partial 低 2%，Q disagreement、中晚盘 V correlation 和 expectile balance 也必须达标。开局 V 接近零本来就可能正确，因此不拿早盘 V correlation 强行门控。Oracle 未通过时仍独立训练，但既不能给 Actor 计算 advantage，也不能向 partial Critic 蒸馏。
-
-C 在 partial 基础门控通过后就开始查询 MC，即使 Actor 仍冻结。训练与验证 MC 目标分别积累；只有目标数量、可靠验证状态组数、可靠动作 pair 数、这些 pair 上的 accuracy 和平均动作 regret 都达标并连续稳定 3 次，才允许 Actor 使用已经受 MC 校验的 partial Critic。MC teacher 不再重复门控 absolute-Q MAE、常数基线 improvement 或 correlation：普通 `critic_ready` 已负责绝对尺度，MC 数据只训练可靠动作差值，不直接作为 Actor 分类标签。
-
-通过门控后，Actor 每轮默认执行 8 个 AWR steps。只学习 replay 中真实执行过的合法动作：
-
-```text
-A(s, a) = min(Q1(s, a), Q2(s, a)) - V(s)
-w = min(exp(A / beta), w_max)
-L_actor = -w * log pi(a | s) + lambda_ref * KL(pi || frozen_SL)
-```
-
-默认 `beta=0.10`、`w_max=20`、`lambda_ref=0.05`。MC teacher 行不直接充当 Actor 分类标签。日志会报告相对 SL 的 KL、优势、权重、有效样本量及各动作类别分布。
-
-每次可信 Actor 提取后立即增加策略版本、同步采集器、生成新轨迹，并在到达快照间隔时将 Actor 加入历史对手池。
-
-## 三组递进实验
-
-通过 `--experiment` 选择实验，三者应按等 GPU 时间依次比较，不能把附加项全部堆叠后再猜测收益来源。
-
-### A：Partial-observation IQL/AWR
-
-```bash
-python -m training.train \
-  --experiment a \
-  --output-dir runs/iql-awr-a-v3
-```
-
-这是默认基线，只使用部署时可见信息训练 Q1/Q2/V 和 Actor。先确认完整轨迹 Critic 确实能在中晚盘及少数动作类别上超过常数基线。
-
-### B：Oracle Critic
-
-```bash
-python -m training.train \
-  --experiment b \
-  --output-dir runs/iql-awr-b-v3
-```
-
-Oracle Q1/Q2/V 只在训练期额外读取四家暗手与剩余牌墙的计数表示。只有 Oracle 连续通过独立教师门控后，Partial Critic 才蒸馏验证覆盖到的 logged-action Q，AWR 才能使用 Oracle advantage；未执行合法动作不做全动作蒸馏，因为这些输出没有 return 标签验证。Actor 的输入和部署图没有 Oracle 特征，Oracle 参数也不与 Actor 共享。
-
-该实验用于判断主要瓶颈是否来自部分可观测下的 Critic 方差，不是允许 Actor 偷看暗牌。
-
-### C：选择性信息集 Monte Carlo
-
-```bash
-python -m training.train \
-  --experiment c \
-  --output-dir runs/iql-awr-c-v3
-```
-
-只有 Critic 门控通过后，C 才查询高不确定状态。候选来自当前 Actor、冻结 SL、规则动作和保守 Q；查询优先级综合 Q1/Q2 disagreement、Actor/SL 分歧、接近零优势和中晚盘风险。
-
-每个查询默认最多 3 个候选动作、32 个信息集世界和 1 次 continuation。引擎固定行动者可见信息，重新分配其他玩家暗手与牌墙；同一组候选共享 world seed，以候选间逐 world 的回报差做 paired confidence interval。只有 `abs(mean_difference) - confidence_half_width >= 0.02` 且 half-width 不超过上限的动作边才算可靠。没有可靠边的动作会被裁掉；剩余完整 query 带持久化 query ID 和对称可靠边图整组接收，容量淘汰也按整组执行，不能混用不同查询的 world。响应窗口当前不做重采样查询，因为保留 pending legality 需要固定暗手。
-
-MC 目标只作为 Critic 回归数据，训练和 validation 查询分开，不能直接生成硬 argmax Actor 标签。训练 MC 可以继续从在线状态积累；validation MC 每 2 个 iteration 从永久 anchor validation 轨迹查询，并排除已经存在的状态。validation corpus 只有同时达到 512 个 targets、128 个含可靠边的 query groups 和 128 条可靠 pair 后才将 `validation_frozen` 置为 true；只满足 target 数量不会停止补充查询。冻结后在线状态不再进入 validation teacher corpus，validation 目标也不参与 train MC Q 更新。validation 只在可靠边上报告 pairwise accuracy、top-action accuracy 和 regret；在这些动作级指标可信前 Actor 始终冻结。
-
-对一个已接收 query 的可靠边 `(j,k)`，令 paired-world MC 目标差为 `d_y = y_j-y_k`，Q 差为 `d_q = q_j-q_k`：
-
-```text
-L_difference = equal-query mean Huber(d_q, d_y)
-w_jk = min(abs(d_y) / 0.10, 1)
-L_ranking = equal-query mean w_jk * 0.10 * softplus(-sign(d_y) * d_q / 0.10)
-L_MC = 1.0 * L_difference + 0.25 * L_ranking
-```
-
-Q1 和 Q2 分别计算后取平均；每个 query 权重相等，可靠边较多的 query 不会支配 batch。`absolute_loss` 仅作为诊断指标，不进入 MC 优化目标；普通轨迹 Critic 负责把 Q 的绝对尺度校准到真实分差。
-
-## 评测和 best 选择
-
-默认每 5 轮在固定 seed panel 和独立 fresh seed panel 上各做一次确定性评测。每个 panel 都包含：
-
-- `rules`：当前 Actor 对交替的 `rule_fast` / `rule_safe`；
-- `sl`：当前 Actor 对三家冻结 SL；
-- `mixed`：当前 Actor 对完整混合池；
-- `history`：当前 Actor 对最近历史策略，无历史时回退冻结 SL。
-
-每组报告平均名次、首位率、末位率、平均分差、分差标准差以及跨 seed 波动。只有固定 seeds 和 fresh seeds 的规则评测都优于当前 best，才写入 `best.pt`；训练本身不会因此停止。
-
-同时应重点查看：
-
-- 中晚盘 Q MAE、相关性、校准误差和常数基线改进；
-- 各决策类别的 Q 误差及 Q1/Q2 disagreement；
-- Actor 相对冻结 SL 的 KL、AWR 权重和有效样本量；
-- replay 来源、九类决策覆盖和采集吞吐；
-- B 的 Oracle/partial 差距或 C 的 MC 方差、置信区间与 GPU 成本。
-- C 的 `mc_critic.mc_critic_loss`、`mc_absolute_loss`、`mc_centered_loss`、`mc_pairwise_loss`、`mc_train_pairwise_accuracy`、`mc_train_groups` 和 `mc_train_pairs`；
-- C 的 `mc.accepted_queries`、`accepted_targets`、`terminal_rollouts`、`rollout_states`、`train_targets`、`train_targets_after_trim`、`validation_targets`、`validation_reliable_targets`、`validation_reliable_groups`、`validation_reliable_pairs`、`validation_frozen`、`mean_variance`、`mean_confidence_half_width`；
-- C 的 train/validation pairwise accuracy，以及 `mc.validation_metrics.action_ranking` 下的可靠 `group_count`、`pair_count`、`all_pair_count`、`top_action_accuracy`、`mean_regret`、`maximum_regret` 和 `mean_action_gap`。MC Q MAE 仍可观察，但不参与 teacher gate。
-
-## 运行、恢复和输出
-
-安装 release Python 扩展后启动默认实验：
+准备 release 版引擎扩展：
 
 ```bash
 maturin develop --release --manifest-path engine/pybind/Cargo.toml
-python -m training.train \
-  --output-dir runs/iql-awr-v3 \
-  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
 ```
 
-训练会一直运行。按一次 `Ctrl+C` 后，当前循环退出并原子写入 `latest.pt`。
-
-恢复时只需提供完整 IQL/AWR checkpoint：
-
-```bash
-python -m training.train --resume runs/iql-awr-v3/latest.pt
-```
-
-C 实验恢复示例：
-
-```bash
-python -m training.train --resume runs/iql-awr-c-v3/latest.pt
-```
-
-恢复会读取 checkpoint 中的实验、模型与训练配置、Actor、冻结 SL、Q1/Q2/V、可选 Oracle、全部优化器、教师连续就绪计数、策略池、采样器 RNG、replay cursor 和随机状态；replay shard/manifest 必须与 checkpoint 一致。恢复不会重新 SL，也不能改成另一实验类型。当前 checkpoint 格式为 v3；v1/v2 IQL/AWR checkpoint 会明确拒绝，不做默认字段填充或迁移。
-
-每个 run 目录包含：
-
-- `latest.pt`：最近完整 checkpoint；
-- `best.pt`：固定和 fresh seed 都提升时写出的 Actor-only 部署权重，不用于恢复训练；
-- `metrics.jsonl`：完整结构化训练记录；
-- `dashboard.html`：由 metrics 生成的本地摘要；
-- `config.json`：实验、模型、训练配置和评测 seeds；
-- `replay/manifest.json` 与 `replay/*.bfsh`：轨迹清单和紧凑 shard；
-- `snapshots/*.pt`：历史 Actor-only 策略。
-
-终端默认只打印 baseline、Critic、iteration、门控、KL、名次和分差摘要；`--verbose-console` 额外打印完整 JSON。
-
-先做一次 CUDA 端到端检查：
+启动正式训练：
 
 ```bash
 python -m training.train \
-  --smoke \
-  --output-dir /tmp/bloodflow-iql-smoke \
+  --output-dir runs/policy-iteration-v3 \
   --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
 ```
 
-`--smoke` 会缩小环境、模型、replay 和评测规模，只运行一个 iteration 后保存退出。它通过显式的小样本配置和宽松阈值覆盖 Actor、Oracle 与 MC 路径，不会在控制流里强行覆盖失败门控。smoke checkpoint 不应用于长训。正式训练绝不回退 CPU；显存不足时优先降低 `--microbatch-size`，其次再调整 batch 或并行环境数。
+`--sl-checkpoint` 必须是 Actor-only 文件，顶层严格包含 `model_config` 和 `model`。训练器不会重新执行 SL，也不会修改这份文件。省略参数时使用上面两个路径对应的默认值。
+
+恢复：
+
+```bash
+python -m training.train \
+  --resume runs/policy-iteration-v3/latest.pt
+```
+
+恢复时配置、root seed、SL 路径及其 SHA-256、模型结构、引擎规则版本和策略执行版本都来自 checkpoint，并进行严格校验。不能在恢复命令中覆盖训练参数或 seed。旧训练格式没有迁移或兼容路径。本轮 batching 优化改变了极少数 BF16 近并列动作的执行顺序，因此必须使用新的空输出目录，不能复用优化前的 reference/target 缓存。
+
+`latest.pt` 是唯一权威的恢复点。它只在评测完成后原子替换，因此只代表完整提交的 iteration。若在目标生成期间中断，对应 `pending/iteration-*` 分片会保留；恢复后确定性重建同一批 query，并只补齐缺失分片。完整 iteration 提交后该 pending 目录会删除。
+
+## 输出目录
+
+一个正式 run 包含：
+
+- `latest.pt`：可恢复的完整状态，包括 Actor、配置、root seed、下一 iteration 和最后指标；
+- `actor.pt`：Actor-only 部署权重；
+- `config.json`：不可变的 run 身份、训练配置、SL 摘要和引擎规则版本；
+- `metrics.jsonl`：每个已提交 iteration 的 source、目标、优化、校准和评测指标；
+- `reference_panel.npz`：冻结 SL 的固定规则评测结果；
+- `pending/iteration-*/targets/`：仅在 iteration 未完成时存在的可恢复目标分片。
+
+正式默认的 Actor 梯度 batch 是 `9 x 256 = 2304`；独立 KL 校准集是 `9 x 64 = 576`。后者只测量策略距离，不产生训练目标或梯度，不能与训练 batch 混为一谈。
+
+终端进度会显示当前阶段、完成量、速率、elapsed 和 ETA。每轮提交后打印一行 `dRank`、置信区间、score、KL 和总耗时摘要。
+
+## 主要参数
+
+| 参数 | 默认值 | 含义 |
+| --- | ---: | --- |
+| `--source-games` | 4096 | 每轮训练状态的全新来源对局 |
+| `--calibration-source-games` | 4096 | 每轮独立 KL 校准来源对局 |
+| `--envs` | 512 | CUDA 采集并行环境数 |
+| `--queries-per-category` | 256 | 每类训练状态数，总状态数为其 9 倍 |
+| `--calibration-queries-per-category` | 64 | 每类独立校准状态数 |
+| `--worlds` | 16 | 每个训练状态的配对未来牌墙数 |
+| `--world-chunk` | 64 | 每组续局中每个 query 的 world 上限 |
+| `--target-shard-size` | 64 | 每个可恢复目标 shard 的 query 数 |
+| `--target-query-batch-size` | 64 | 合并到同一个引擎续局 batch 的 query 数 |
+| `--rollout-inference-batch-size` | 128 | 续局 Actor 单次 CUDA 前向的最大行数 |
+| `--direction-learning-rate` | `1e-5` | 产生单步参数方向的学习率 |
+| `--microbatch-size` | 64 | 梯度累积块大小 |
+| `--inference-batch-size` | 128 | KL 校准前向块大小 |
+| `--target-kl` | `0.001` | 每个策略版本的目标 KL |
+| `--evaluation-games` | 16384 | 固定规则配对评测局数 |
+| `--evaluation-envs` | 512 | 评测并行环境数 |
+| `--bootstrap-samples` | 10000 | 配对区间的 bootstrap 次数 |
+| `--self-play-start-first-rate` | 0.55 | 开始加入 self-play 的固定规则首位率 |
+| `--self-play-increment` | 0.10 | 每次达标评测增加的 self-play 对手席位比例 |
+| `--maximum-self-play-fraction` | 2/3 | self-play 对手席位上限，至少保留一个规则对手 |
+
+新 run 可以覆盖这些参数；resume 不接受覆盖。不要仅为了提高显存占用而放大 `world_chunk`、microbatch 或 envs。三者控制的是不同阶段的瞬时工作集，应以端到端 iteration 时间和稳定性选择。
+
+目标生成在单个 CUDA 进程内把 64 个 query 的全部 `(action, world)` 分支合并。这样 Rust `Batch` 会跨 CPU 核执行重放、观测与规则动作，Actor 则按最多 128 行连续送入 GPU；不会为同一张 GPU 启动多个会复制模型和 CUDA context 的 seed 进程。组内长续局会持续更新 step、active branches 和吞吐心跳。RTX 5080 的真实续局对照中，128 行推理块比 512 行快约 18%；更大的块虽占用更多显存，但该模型的长历史注意力吞吐反而下降。
+
+## Batch Size Sweep
+
+`training.batch_sweep` 用同一个最大训练 corpus 构造嵌套 batch，比较每类 `64/128/256/512`，即总计 `576/1152/2304/4608` 个状态。Sweep 的独立 KL calibration 固定为每类 128、总计 1152 个状态。所有候选共享：
+
+- 最大训练 corpus 的分类别前缀；
+- 独立 calibration corpus；
+- 带 64 个配对世界的独立 heldout Q corpus；
+- 同一个 16384 局固定规则 seed panel。
+
+因此 batch 之间的差异主要来自状态数，而不是不同采样运气。每个候选仍然只执行一个 AdamW step，并校准到相同 KL。输出比较与最大 batch 的方向 cosine、有效样本量、heldout policy value、paired `dRank`、score、耗时和吞吐。
+
+运行完整 sweep：
+
+```bash
+python -m training.batch_sweep \
+  --output-dir runs/batch-sweep-v3 \
+  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt
+```
+
+正式比较建议直接使用三个独立 seed；每个 seed 会在 `seed-<N>/` 下独立缓存，全部完成后根目录写入 pooled `aggregate.json`：
+
+```bash
+python -m training.batch_sweep \
+  --output-dir runs/batch-sweep-v3-multiseed \
+  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt \
+  --seeds 20260727 20260728 20260729
+```
+
+中断后重复完全相同的命令即可恢复；已完成的 seed 不会重新采集。若最大 QPC 的稀缺类别配额不足，可在命令中增加 `--source-games 16384`。
+
+同一命令可恢复。sweep 会分别原子缓存共享 train/calibration/heldout corpus、每个 QPC 的单步参数方向，以及每个 candidate 的原始固定规则评测面板；中断后只补缺失阶段。`summary.json` 已完整时会在加载模型和采集数据前直接返回。目录配置或 SL 文件发生变化时会拒绝混用结果。
+
+CUDA smoke：
+
+```bash
+python -m training.batch_sweep \
+  --output-dir /tmp/batch-sweep-smoke \
+  --sl-checkpoint runs/counterfactual-larger/sl_reference.pt \
+  --smoke
+```
+
+Smoke 只验证端到端控制流、缓存、单步更新、校准、评测和输出文件，不用于判断策略强度。
+
+## 如何选择 batch
+
+不要只看单次固定面板的均值。优先顺序是：
+
+1. heldout rank value 为正，且没有明显以 score value 为代价；
+2. 较小 batch 的方向与最大 batch 高度一致；
+3. 配对规则评测的 `dRank` 和 score 区间不显示伤害；
+4. 增大 batch 带来的稳定性收益足以覆盖更低的策略版本更新频率。
+
+三 seed sweep 表明 576 和 1152 状态仍会出现反向 seed；2304 是第一档三个 seed 的名次方向全部改善、且独立 heldout 均值转正的规模。4608 的 pooled 单步证据最强，但相对 2304 的直接差异不显著，目标生成成本接近两倍。因此正式训练默认采用 2304 状态，4608 保留为质量优先实验配置。
 
 ## 验证
 
-```bash
-cargo test --manifest-path engine/Cargo.toml --workspace --all-targets
-cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets -- -D warnings
-python -m pytest engine/pybind/tests training/tests
-```
-
-基准脚本：
+CPU 单元测试只验证算法不变量和数据管线；正式训练及端到端 smoke 必须使用 CUDA：
 
 ```bash
+python -m py_compile training/*.py training/tests/*.py
+python -m pytest training/tests -q
 python -m training.benchmarks.transformer --device cuda
-python -m training.benchmarks.train_step --device cuda
 ```

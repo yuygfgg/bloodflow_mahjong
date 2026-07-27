@@ -588,6 +588,18 @@ impl Game {
         Ok(sampled)
     }
 
+    /// Clones the state and independently shuffles only the unseen live wall.
+    ///
+    /// Every hand, public event, pending decision, score, and the consumed
+    /// part of the wall remains unchanged. This makes the operation suitable
+    /// for rejuvenating future draws after particle-filter resampling.
+    pub fn resample_live_wall(&self, seed: u64) -> Self {
+        let mut sampled = self.clone();
+        let mut rng = Rng::new(seed);
+        rng.shuffle(&mut sampled.wall[sampled.wall_head as usize..sampled.wall_tail as usize]);
+        sampled
+    }
+
     pub fn decision(&self) -> Option<Decision> {
         let phase = self.phase();
         let actor = match self.stage {
@@ -928,26 +940,29 @@ impl Game {
         debug_assert_eq!(output.len() % EVENT_RECORD_WIDTH, 0);
         let capacity = output.len() / EVENT_RECORD_WIDTH;
         output.fill(-1);
+        if capacity == 0 {
+            return Ok(0);
+        }
 
         let oldest = self.event_total.saturating_sub(self.event_len as u64);
         let start = requested_start.max(oldest).min(self.event_total);
         let end = requested_end.max(start).min(self.event_total);
-        let mut visible: usize = 0;
-        for sequence in start..end {
-            if self.event_at(sequence).visible_to & seat_bit(viewer) != 0 {
-                visible += 1;
-            }
-        }
-        let skip = visible.saturating_sub(capacity);
-        let mut seen = 0;
-        let mut written = 0;
-        for sequence in start..end {
-            let event = self.event_at(sequence);
-            if event.visible_to & seat_bit(viewer) == 0 {
+        let mut retained_start = start;
+        let mut retained = 0;
+        for sequence in (start..end).rev() {
+            if self.event_at(sequence).visible_to & seat_bit(viewer) == 0 {
                 continue;
             }
-            if seen < skip {
-                seen += 1;
+            retained += 1;
+            retained_start = sequence;
+            if retained == capacity {
+                break;
+            }
+        }
+        let mut written = 0;
+        for sequence in retained_start..end {
+            let event = self.event_at(sequence);
+            if event.visible_to & seat_bit(viewer) == 0 {
                 continue;
             }
             if written >= capacity {
@@ -970,7 +985,6 @@ impl Game {
             let offset = written * EVENT_RECORD_WIDTH;
             output[offset..offset + EVENT_RECORD_WIDTH].copy_from_slice(&record);
             written += 1;
-            seen += 1;
         }
         Ok(written)
     }
@@ -2107,6 +2121,22 @@ impl Batch {
         Ok(Self { games })
     }
 
+    /// Removes a strictly increasing set of rows with at most one game move
+    /// per removal and returns each survivor's original row index.
+    pub fn remove_indices_swap(&mut self, indices: &[usize]) -> Result<Vec<usize>, GameError> {
+        if indices.iter().any(|&index| index >= self.games.len())
+            || indices.windows(2).any(|pair| pair[0] >= pair[1])
+        {
+            return Err(GameError::BatchIndex);
+        }
+        let mut original_rows = (0..self.games.len()).collect::<Vec<_>>();
+        for &index in indices.iter().rev() {
+            self.games.swap_remove(index);
+            original_rows.swap_remove(index);
+        }
+        Ok(original_rows)
+    }
+
     /// Clones selected environments and independently resamples each clone
     /// from its current actor's information set.
     pub fn resample_information_sets(
@@ -2134,6 +2164,27 @@ impl Batch {
                 .zip(seeds.iter())
                 .map(sample)
                 .collect::<Result<Vec<_>, _>>()?
+        };
+        Ok(Self { games })
+    }
+
+    /// Clones selected environments and independently shuffles their live walls.
+    pub fn resample_live_walls(&self, indices: &[usize], seeds: &[u64]) -> Result<Self, GameError> {
+        if indices.len() != seeds.len() {
+            return Err(GameError::BatchLength);
+        }
+        if indices.iter().any(|&index| index >= self.games.len()) {
+            return Err(GameError::BatchIndex);
+        }
+        let sample = |(&index, &seed): (&usize, &u64)| self.games[index].resample_live_wall(seed);
+        let games = if indices.len() >= PARALLEL_BATCH_THRESHOLD {
+            indices
+                .par_iter()
+                .zip(seeds.par_iter())
+                .map(sample)
+                .collect()
+        } else {
+            indices.iter().zip(seeds.iter()).map(sample).collect()
         };
         Ok(Self { games })
     }
@@ -2488,6 +2539,68 @@ impl Batch {
         Ok(())
     }
 
+    /// Writes viewer-scoped event history only for selected current viewers.
+    ///
+    /// Each byte in `history_seat_masks` is a seat bitset. An environment's
+    /// history is written only when its current viewer's bit is set. Otherwise
+    /// its event row is untouched and its returned length is zero.
+    pub fn events_masked_into(
+        &self,
+        history_seat_masks: &[u8],
+        capacity: usize,
+        output: &mut [i32],
+        lengths: &mut [u16],
+    ) -> Result<(), GameError> {
+        if capacity > EVENT_HISTORY_CAPACITY
+            || history_seat_masks.len() != self.games.len()
+            || self.games.len().checked_mul(capacity * EVENT_RECORD_WIDTH) != Some(output.len())
+            || lengths.len() != self.games.len()
+        {
+            return if capacity > EVENT_HISTORY_CAPACITY {
+                Err(GameError::EventCapacity)
+            } else {
+                Err(GameError::BatchLength)
+            };
+        }
+        if capacity == 0 {
+            lengths.fill(0);
+            return Ok(());
+        }
+        let write = |game: &Game, history_seat_mask: u8, records: &mut [i32], length: &mut u16| {
+            let viewer = game
+                .decision()
+                .map_or(game.dealer(), |decision| decision.actor);
+            if history_seat_mask & seat_bit(viewer) == 0 {
+                *length = 0;
+                return;
+            }
+            *length = game
+                .write_events(viewer, records)
+                .expect("batch event buffers were validated") as u16;
+        };
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(history_seat_masks.par_iter().copied())
+                .zip(output.par_chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.par_iter_mut())
+                .for_each(|(((game, history_seat_mask), records), length)| {
+                    write(game, history_seat_mask, records, length);
+                });
+        } else {
+            for (((game, &history_seat_mask), records), length) in self
+                .games
+                .iter()
+                .zip(history_seat_masks.iter())
+                .zip(output.chunks_mut(capacity * EVENT_RECORD_WIDTH))
+                .zip(lengths.iter_mut())
+            {
+                write(game, history_seat_mask, records, length);
+            }
+        }
+        Ok(())
+    }
+
     /// Writes only the events emitted by each environment's most recent step.
     pub fn step_events_into(
         &self,
@@ -2611,6 +2724,93 @@ impl Batch {
                 .zip(actions.iter().copied())
                 .zip(records.chunks_mut(STEP_RECORD_WIDTH))
             {
+                let action = ActionId::new(index as usize)
+                    .expect("action index was validated")
+                    .action();
+                let outcome = game.apply_legal_action(action)?;
+                outcome.write_record(record.try_into().expect("record width was validated"));
+            }
+        }
+        Ok(())
+    }
+
+    /// Applies raw policy-head indices only where the byte mask is one.
+    ///
+    /// Disabled rows are left unchanged and receive an all-`-1` record. The
+    /// whole operation is atomic with respect to invalid masks or actions.
+    pub fn step_masked_indices_into(
+        &mut self,
+        enabled: &[u8],
+        actions: &[u8],
+        records: &mut [i64],
+    ) -> Result<(), GameError> {
+        if enabled.len() != self.games.len()
+            || actions.len() != self.games.len()
+            || self.games.len().checked_mul(STEP_RECORD_WIDTH) != Some(records.len())
+        {
+            return Err(GameError::BatchLength);
+        }
+        if enabled.iter().any(|&value| value > 1) {
+            return Err(GameError::InvalidAction);
+        }
+        let all_legal = if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter()
+                .zip(enabled.par_iter().copied())
+                .zip(actions.par_iter().copied())
+                .all(|((game, enabled), index)| {
+                    enabled == 0
+                        || ActionId::new(index as usize)
+                            .is_some_and(|id| game.is_legal_action(id.action()))
+                })
+        } else {
+            self.games
+                .iter()
+                .zip(enabled.iter().copied())
+                .zip(actions.iter().copied())
+                .all(|((game, enabled), index)| {
+                    enabled == 0
+                        || ActionId::new(index as usize)
+                            .is_some_and(|id| game.is_legal_action(id.action()))
+                })
+        };
+        if !all_legal {
+            return Err(GameError::InvalidAction);
+        }
+
+        if self.games.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games
+                .par_iter_mut()
+                .zip(enabled.par_iter().copied())
+                .zip(actions.par_iter().copied())
+                .zip(records.par_chunks_mut(STEP_RECORD_WIDTH))
+                .try_for_each(
+                    |(((game, enabled), index), record)| -> Result<(), GameError> {
+                        if enabled == 0 {
+                            record.fill(-1);
+                            return Ok(());
+                        }
+                        let action = ActionId::new(index as usize)
+                            .expect("action index was validated")
+                            .action();
+                        let outcome = game.apply_legal_action(action)?;
+                        outcome
+                            .write_record(record.try_into().expect("record width was validated"));
+                        Ok(())
+                    },
+                )?;
+        } else {
+            for (((game, enabled), index), record) in self
+                .games
+                .iter_mut()
+                .zip(enabled.iter().copied())
+                .zip(actions.iter().copied())
+                .zip(records.chunks_mut(STEP_RECORD_WIDTH))
+            {
+                if enabled == 0 {
+                    record.fill(-1);
+                    continue;
+                }
                 let action = ActionId::new(index as usize)
                     .expect("action index was validated")
                     .action();
@@ -3830,6 +4030,76 @@ mod tests {
             terminal.resample_information_set(1),
             Err(GameError::InformationSetUnavailable)
         ));
+    }
+
+    #[test]
+    fn live_wall_resampling_preserves_state_and_is_deterministic() {
+        let mut game = Game::new(211);
+        for _ in 0..24 {
+            let action = game.simple_rule_action().expect("game remains active");
+            game.step_id(action).unwrap();
+        }
+        let first = game.resample_live_wall(17);
+        let repeated = game.resample_live_wall(17);
+        let different = game.resample_live_wall(19);
+        assert_eq!(first.wall, repeated.wall);
+        assert_ne!(first.wall, different.wall);
+        assert_eq!(first.wall_head, game.wall_head);
+        assert_eq!(first.wall_tail, game.wall_tail);
+        assert_eq!(
+            first.wall[..first.wall_head as usize],
+            game.wall[..game.wall_head as usize]
+        );
+        let mut original_live =
+            game.wall[game.wall_head as usize..game.wall_tail as usize].to_vec();
+        let mut sampled_live =
+            first.wall[first.wall_head as usize..first.wall_tail as usize].to_vec();
+        original_live.sort_unstable();
+        sampled_live.sort_unstable();
+        assert_eq!(sampled_live, original_live);
+
+        let mut original_oracle = [0; ORACLE_TILE_COUNT_WIDTH];
+        let mut sampled_oracle = [0; ORACLE_TILE_COUNT_WIDTH];
+        game.oracle_tile_counts_into(&mut original_oracle).unwrap();
+        first.oracle_tile_counts_into(&mut sampled_oracle).unwrap();
+        assert_eq!(sampled_oracle, original_oracle);
+
+        let batch = Batch::new(2, 313);
+        let sampled = batch.resample_live_walls(&[1, 1], &[23, 23]).unwrap();
+        assert_eq!(sampled.games[0].wall, sampled.games[1].wall);
+        assert!(matches!(
+            batch.resample_live_walls(&[2], &[1]),
+            Err(GameError::BatchIndex)
+        ));
+        assert!(matches!(
+            batch.resample_live_walls(&[0], &[1, 2]),
+            Err(GameError::BatchLength)
+        ));
+    }
+
+    #[test]
+    fn swap_removing_indices_returns_the_survivor_order_atomically() {
+        let mut batch = Batch::new(4, 317);
+        let original = batch.games.iter().map(|game| game.wall).collect::<Vec<_>>();
+        let order = batch.remove_indices_swap(&[0, 2]).unwrap();
+        assert_eq!(order, vec![3, 1]);
+        assert_eq!(batch.len(), 2);
+        for (game, &original_row) in batch.games.iter().zip(&order) {
+            assert_eq!(game.wall, original[original_row]);
+        }
+
+        let before = batch.games[0].wall;
+        assert_eq!(
+            batch.remove_indices_swap(&[1, 0]),
+            Err(GameError::BatchIndex)
+        );
+        assert_eq!(
+            batch.remove_indices_swap(&[0, 0]),
+            Err(GameError::BatchIndex)
+        );
+        assert_eq!(batch.remove_indices_swap(&[2]), Err(GameError::BatchIndex));
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch.games[0].wall, before);
     }
 
     #[test]

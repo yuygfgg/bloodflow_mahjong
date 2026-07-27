@@ -111,6 +111,14 @@ def test_rule_and_hand_analysis_buffers_validate_shape_and_dtype() -> None:
     with pytest.raises(TypeError):
         batch.simple_rule_actions_into(np.empty(8, dtype=np.int8))
 
+    enabled = np.ones(8, dtype=np.uint8)
+    with pytest.raises(ValueError, match="shape"):
+        batch.simple_rule_actions_masked_into(enabled[:-1], np.empty(8, dtype=np.uint8))
+    with pytest.raises(TypeError):
+        batch.simple_rule_actions_masked_into(
+            enabled.astype(np.int8), np.empty(8, dtype=np.uint8)
+        )
+
     shanten = np.empty(8, dtype=np.int8)
     improving_tiles = np.empty(8, dtype=np.uint32)
     with pytest.raises(ValueError, match="shape"):
@@ -132,6 +140,24 @@ def test_indexed_hand_analysis_matches_full_batch() -> None:
 
     np.testing.assert_array_equal(shanten, full_shanten[indices])
     np.testing.assert_array_equal(improving, full_improving[indices])
+
+
+def test_masked_rule_actions_touch_only_enabled_rows() -> None:
+    batch = bm.Batch(128, seed=37)
+    expected = np.empty(128, dtype=np.uint8)
+    batch.simple_rule_actions_into(expected)
+    enabled = (np.arange(128) % 3 == 0).astype(np.uint8)
+    actions = np.full(128, 0xA5, dtype=np.uint8)
+
+    batch.simple_rule_actions_masked_into(enabled, actions)
+
+    np.testing.assert_array_equal(actions[enabled == 1], expected[enabled == 1])
+    assert np.all(actions[enabled == 0] == 0xA5)
+    before = actions.copy()
+    enabled[1] = 2
+    with pytest.raises(ValueError, match="action"):
+        batch.simple_rule_actions_masked_into(enabled, actions)
+    np.testing.assert_array_equal(actions, before)
 
 
 def test_observe_and_combined_step_fill_caller_buffers() -> None:
@@ -326,6 +352,26 @@ def test_clone_indices_repeats_states_and_is_independent() -> None:
         batch.clone_indices(np.asarray([0, 4], dtype=np.uint32))
 
 
+def test_remove_indices_swap_returns_the_survivor_order() -> None:
+    batch = bm.Batch(4, seed=23)
+    masks = np.empty((4, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    batch.legal_action_masks_into(masks)
+
+    order = batch.remove_indices_swap(np.asarray([0, 2], dtype=np.uint32))
+    assert order == [3, 1]
+    retained = np.empty((2, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    batch.legal_action_masks_into(retained)
+    np.testing.assert_array_equal(retained, masks[order])
+
+    with pytest.raises(ValueError, match="strictly increasing"):
+        batch.remove_indices_swap(np.asarray([1, 0], dtype=np.uint32))
+    with pytest.raises(ValueError, match="strictly increasing"):
+        batch.remove_indices_swap(np.asarray([0, 0], dtype=np.uint32))
+    with pytest.raises(ValueError, match="out of range"):
+        batch.remove_indices_swap(np.asarray([2], dtype=np.uint32))
+    assert len(batch) == 2
+
+
 def test_information_set_resampling_preserves_viewer_observation() -> None:
     game = bm.Game(seed=913)
     while game.phase in (bm.PHASE_EXCHANGE, bm.PHASE_CHOOSE_MISSING):
@@ -434,6 +480,32 @@ def test_batch_information_set_sampling_and_oracle_buffers() -> None:
         sampled.oracle_tile_counts_into(np.empty((3, 8, 27), dtype=np.uint8))
 
 
+def test_batch_live_wall_resampling_preserves_current_oracle() -> None:
+    batch = bm.Batch(4, seed=37)
+    actions = np.empty(4, dtype=np.uint8)
+    records = np.empty((4, bm.STEP_RECORD_WIDTH), dtype=np.int64)
+    for _ in range(20):
+        batch.simple_rule_actions_into(actions)
+        batch.step_into(actions, records)
+
+    indices = np.asarray([2, 2, 0], dtype=np.uint32)
+    seeds = np.asarray([101, 101, 103], dtype=np.uint64)
+    sampled = batch.resample_live_walls(indices, seeds)
+    original = np.empty((4, bm.ORACLE_TILE_COUNT_PLANES, 27), dtype=np.uint8)
+    oracle = np.empty((3, bm.ORACLE_TILE_COUNT_PLANES, 27), dtype=np.uint8)
+    batch.oracle_tile_counts_into(original)
+    sampled.oracle_tile_counts_into(oracle)
+    np.testing.assert_array_equal(oracle, original[indices])
+    np.testing.assert_array_equal(oracle[0], oracle[1])
+
+    with pytest.raises(ValueError, match="shape"):
+        batch.resample_live_walls(indices, seeds[:2])
+    with pytest.raises(ValueError, match="out of range"):
+        batch.resample_live_walls(
+            np.asarray([4], dtype=np.uint32), np.asarray([1], dtype=np.uint64)
+        )
+
+
 def test_batch_rejects_wrong_shape_dtype_and_layout() -> None:
     batch = bm.Batch(8)
     with pytest.raises(ValueError, match="shape"):
@@ -464,6 +536,31 @@ def test_batch_rejects_illegal_actions_atomically() -> None:
         batch.step_into(actions, records)
     batch.legal_action_masks_into(after)
     np.testing.assert_array_equal(after, before)
+
+
+def test_batch_masked_step_leaves_disabled_rows_unchanged() -> None:
+    batch = bm.Batch(8, seed=211)
+    actions = np.empty(8, dtype=np.uint8)
+    batch.simple_rule_actions_into(actions)
+    enabled = np.asarray([1, 0, 1, 0, 1, 0, 1, 0], dtype=np.uint8)
+    records = np.empty((8, bm.STEP_RECORD_WIDTH), dtype=np.int64)
+    before = np.empty((8, bm.ORACLE_TILE_COUNT_PLANES, 27), dtype=np.uint8)
+    after = np.empty_like(before)
+    batch.oracle_tile_counts_into(before)
+
+    batch.step_masked_into(enabled, actions, records)
+
+    batch.oracle_tile_counts_into(after)
+    np.testing.assert_array_equal(after[enabled == 0], before[enabled == 0])
+    assert np.all(records[enabled == 0] == -1)
+    assert np.all(records[enabled == 1, 9] >= 0)
+
+    with pytest.raises(ValueError, match="shape"):
+        batch.step_masked_into(enabled[:7], actions, records)
+    invalid = enabled.copy()
+    invalid[0] = 2
+    with pytest.raises(ValueError, match="action"):
+        batch.step_masked_into(invalid, actions, records)
 
 
 def test_game_event_history_and_step_delta_are_zero_copy_buffers() -> None:
@@ -517,6 +614,36 @@ def test_batch_event_history_and_combined_step_history() -> None:
     assert np.all(event_lengths >= 2)
     assert np.all(events[:, 0, 0] == bm.EventKind.GAME_START)
     assert np.all(events[np.arange(size), event_lengths - 1, 0] == bm.EventKind.ACTION)
+
+
+def test_batch_masked_event_history_uses_current_viewer_bits() -> None:
+    size = 128
+    capacity = 8
+    batch = bm.Batch(size, seed=83)
+    _, _, tile_obs, melds, river, meta = buffers(size)
+    batch.observe_into(tile_obs, melds, river, meta)
+    viewers = meta[:, 1].astype(np.uint8)
+    history_seat_masks = np.left_shift(np.uint8(1), viewers)
+    history_seat_masks[1::2] = np.left_shift(
+        np.uint8(1), (viewers[1::2] + 1) % 4
+    )
+    sentinel = np.int32(-777)
+    events = np.full(
+        (size, capacity, bm.EVENT_RECORD_WIDTH), sentinel, dtype=np.int32
+    )
+    lengths = np.full(size, np.iinfo(np.uint16).max, dtype=np.uint16)
+
+    batch.events_masked_into(history_seat_masks, events, lengths)
+
+    assert np.all(lengths[::2] == 1)
+    assert np.all(events[::2, 0, 0] == bm.EventKind.GAME_START)
+    assert np.all(lengths[1::2] == 0)
+    assert np.all(events[1::2] == sentinel)
+
+    with pytest.raises(ValueError, match="shape"):
+        batch.events_masked_into(history_seat_masks[:-1], events, lengths)
+    with pytest.raises(TypeError):
+        batch.events_masked_into(history_seat_masks.astype(np.int8), events, lengths)
 
 
 def test_event_buffers_validate_shape_dtype_and_capacity() -> None:

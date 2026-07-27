@@ -155,3 +155,50 @@ fn batch_step_event_delta_matches_each_game() {
         );
     }
 }
+
+#[test]
+fn batch_masked_history_writes_only_matching_viewers() {
+    const SIZE: usize = 128;
+    const CAPACITY: usize = 8;
+    let batch = Batch::new(SIZE, 31);
+    let mut history_seat_masks = vec![0_u8; SIZE];
+    for (index, game) in batch.games().iter().enumerate() {
+        let viewer = game
+            .decision()
+            .map_or(game.dealer(), |decision| decision.actor);
+        let seat = if index % 2 == 0 {
+            viewer.as_u8()
+        } else {
+            (viewer.as_u8() + 1) % 4
+        };
+        history_seat_masks[index] = 1 << seat;
+    }
+    let sentinel = -777_i32;
+    let mut events = vec![sentinel; SIZE * CAPACITY * EVENT_RECORD_WIDTH];
+    let mut lengths = vec![u16::MAX; SIZE];
+    batch
+        .events_masked_into(&history_seat_masks, CAPACITY, &mut events, &mut lengths)
+        .expect("masked event output is valid");
+
+    for index in 0..SIZE {
+        let row = &events
+            [index * CAPACITY * EVENT_RECORD_WIDTH..(index + 1) * CAPACITY * EVENT_RECORD_WIDTH];
+        if index % 2 == 0 {
+            assert_eq!(lengths[index], 1);
+            assert_eq!(row[0], i32::from(EventKind::GameStart.code()));
+        } else {
+            assert_eq!(lengths[index], 0);
+            assert!(row.iter().all(|&value| value == sentinel));
+        }
+    }
+
+    assert!(matches!(
+        batch.events_masked_into(
+            &history_seat_masks[..SIZE - 1],
+            CAPACITY,
+            &mut events,
+            &mut lengths,
+        ),
+        Err(bloodflow_mahjong::GameError::BatchLength)
+    ));
+}

@@ -67,6 +67,48 @@ impl Batch {
         }
         Ok(())
     }
+
+    /// Writes simple-rule actions only where the byte mask is one.
+    ///
+    /// Disabled output rows are left untouched. The mask is validated before
+    /// any action is computed or written.
+    pub fn simple_rule_actions_masked_into(
+        &self,
+        enabled: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        if enabled.len() != self.len() || output.len() != self.len() {
+            return Err(GameError::BatchLength);
+        }
+        if enabled.iter().any(|&value| value > 1) {
+            return Err(GameError::InvalidAction);
+        }
+        let write = |game: &Game, enabled: u8, action: &mut u8| {
+            if enabled == 0 {
+                return;
+            }
+            *action = game
+                .simple_rule_action()
+                .map_or(SIMPLE_RULE_ACTION_TERMINAL, |id| id.index() as u8);
+        };
+        if self.len() >= PARALLEL_BATCH_THRESHOLD {
+            self.games()
+                .par_iter()
+                .zip(enabled.par_iter().copied())
+                .zip(output.par_iter_mut())
+                .for_each(|((game, enabled), action)| write(game, enabled, action));
+        } else {
+            for ((game, enabled), action) in self
+                .games()
+                .iter()
+                .zip(enabled.iter().copied())
+                .zip(output.iter_mut())
+            {
+                write(game, enabled, action);
+            }
+        }
+        Ok(())
+    }
 }
 
 fn choose_exchange(game: &Game, actor: Seat, legal_mask: u32) -> ActionId {
@@ -344,5 +386,41 @@ mod tests {
                     .index()
             );
         }
+    }
+
+    #[test]
+    fn masked_batch_actions_touch_only_enabled_rows() {
+        let batch = Batch::new(128, 29);
+        let mut expected = [0; 128];
+        batch
+            .simple_rule_actions_into(&mut expected)
+            .expect("batch output has the right length");
+        let mut enabled = [0; 128];
+        for (index, value) in enabled.iter_mut().enumerate() {
+            *value = u8::from(index % 3 == 0);
+        }
+        let mut actions = [0xA5; 128];
+        batch
+            .simple_rule_actions_masked_into(&enabled, &mut actions)
+            .expect("masked batch output is valid");
+        for index in 0..128 {
+            if enabled[index] == 1 {
+                assert_eq!(actions[index], expected[index]);
+            } else {
+                assert_eq!(actions[index], 0xA5);
+            }
+        }
+
+        let before = actions;
+        enabled[1] = 2;
+        assert!(matches!(
+            batch.simple_rule_actions_masked_into(&enabled, &mut actions),
+            Err(GameError::InvalidAction)
+        ));
+        assert_eq!(actions, before);
+        assert!(matches!(
+            batch.simple_rule_actions_masked_into(&enabled[..127], &mut actions),
+            Err(GameError::BatchLength)
+        ));
     }
 }

@@ -1,1392 +1,937 @@
-"""CUDA-only synthetic trajectory IQL/AWR training."""
+"""Infinite CUDA conservative policy iteration for Blood Flow Mahjong."""
 
 from __future__ import annotations
 
 import argparse
-from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, fields
+import hashlib
 import json
-import random
-import time
-from dataclasses import asdict, dataclass, replace
+import math
 from pathlib import Path
-from typing import Any
+import pickle
+import re
+import shutil
+import time
+from typing import Any, Sequence
 
 import numpy as np
 import torch
 
-from .dashboard import render_dashboard
-from .iql import CriticConfig, IndependentCritics
-from .learner import (
-    LearningConfig,
-    actor_update,
-    cql_scale_from_coverage,
-    critic_ready,
-    critic_update_deferred,
-    make_optimizers,
-    mc_critic_update_deferred,
-    mc_teacher_ready,
-    oracle_teacher_ready,
-    resolve_actor_gate,
-    resolve_critic_statistics,
-    resolve_mc_critic_statistics,
-    validate_critics,
+import bloodflow_mahjong as bm
+
+from .evaluation import (
+    collect_fixed_panel,
+    evaluation_seeds,
+    load_reference_panel,
+    outcomes,
+    save_reference_panel,
+    summarize_paired,
 )
-from .mc_teacher import MonteCarloConfig, collect_mc_targets
 from .model import BloodFlowTransformer, TransformerConfig
-from .oracle import OracleCritics
 from .pipeline import (
     CollectionConfig,
-    ExecutablePolicyPool,
-    FullTrajectoryCollector,
-    better_on_both_panels,
+    POLICY_EXECUTION_VERSION,
+    TrajectoryCollector,
     clone_policy,
-    evaluate_panel,
     load_policy,
     save_policy,
 )
-from .policy_pool import (
-    BalancedReplaySampler,
-    BehaviorSampler,
-    OpponentMixtureConfig,
-    PolicyPool,
-    ReplaySource,
+from .policy_iteration import (
+    build_state_batch,
+    cached_counterfactual_corpus,
+    calibrate_direction,
+    cpu_model_state,
+    domain_seed,
+    one_step_direction,
+    require_cuda,
+    require_deterministic_actor,
+    select_independent_queries,
+    source_visit_frequencies,
 )
-from .replay import ReplayConfig, TrajectoryReplay
+from .progress import Progress
 
 
 CHECKPOINT_VERSION = 3
+SOURCE_DOMAIN = 0x7100_0001
+SOURCE_QUERY_DOMAIN = 0x7100_0002
+SOURCE_WORLD_DOMAIN = 0x7100_0003
+CALIBRATION_DOMAIN = 0x7200_0001
+CALIBRATION_QUERY_DOMAIN = 0x7200_0002
+EVALUATION_DOMAIN = 0x7300_0001
 
 
 @dataclass(frozen=True)
 class RunConfig:
-    collection: CollectionConfig = CollectionConfig()
-    replay: ReplayConfig = ReplayConfig()
-    learning: LearningConfig = LearningConfig()
-    critics: CriticConfig = CriticConfig()
-    opponents: OpponentMixtureConfig = OpponentMixtureConfig()
-    mc: MonteCarloConfig = MonteCarloConfig()
-    anchor_games: int = 8192
-    games_per_iteration: int = 1024
-    validation_states: int = 8192
-    evaluation_every: int = 5
-    evaluation_games: int = 256
-    evaluation_seed_count: int = 2
-    checkpoint_every: int = 5
-    mc_validation_every: int = 2
+    source_games: int = 4096
+    calibration_source_games: int = 4096
+    envs: int = 512
+    queries_per_category: int = 256
+    calibration_queries_per_category: int = 64
+    worlds: int = 16
+    world_chunk: int = 64
+    target_shard_size: int = 64
+    target_query_batch_size: int = 64
+    rollout_inference_batch_size: int = 128
+    direction_learning_rate: float = 1e-5
+    microbatch_size: int = 64
+    inference_batch_size: int = 128
+    target_kl: float = 1e-3
+    kl_search_steps: int = 18
+    maximum_scale: float = 64.0
+    evaluation_games: int = 16_384
+    evaluation_envs: int = 512
+    bootstrap_samples: int = 10_000
+    self_play_start_first_rate: float = 0.55
+    self_play_increment: float = 0.10
+    maximum_self_play_fraction: float = 2.0 / 3.0
 
     def __post_init__(self) -> None:
         positive = (
-            self.anchor_games,
-            self.games_per_iteration,
-            self.validation_states,
-            self.evaluation_every,
+            self.source_games,
+            self.calibration_source_games,
+            self.envs,
+            self.queries_per_category,
+            self.calibration_queries_per_category,
+            self.worlds,
+            self.world_chunk,
+            self.target_shard_size,
+            self.target_query_batch_size,
+            self.rollout_inference_batch_size,
+            self.direction_learning_rate,
+            self.microbatch_size,
+            self.inference_batch_size,
+            self.target_kl,
+            self.kl_search_steps,
+            self.maximum_scale,
             self.evaluation_games,
-            self.evaluation_seed_count,
-            self.checkpoint_every,
-            self.mc_validation_every,
+            self.evaluation_envs,
+            self.bootstrap_samples,
+            self.self_play_increment,
+            self.maximum_self_play_fraction,
         )
         if any(value <= 0 for value in positive):
-            raise ValueError("run sizes and intervals must be positive")
+            raise ValueError("all training sizes and rates must be positive")
+        required = 9 * self.queries_per_category
+        calibration_required = 9 * self.calibration_queries_per_category
+        if self.source_games < required:
+            raise ValueError("source_games cannot cover independent train queries")
+        if self.calibration_source_games < calibration_required:
+            raise ValueError("calibration games cannot cover independent queries")
+        if self.worlds < 2:
+            raise ValueError("counterfactual targets need at least two worlds")
+        if self.maximum_scale < 1:
+            raise ValueError("maximum_scale must be at least one")
+        if not 0.0 <= self.self_play_start_first_rate <= 1.0:
+            raise ValueError("self-play start first rate must be in [0, 1]")
+        if self.self_play_increment > self.maximum_self_play_fraction:
+            raise ValueError("self-play increment cannot exceed its maximum fraction")
+        if self.maximum_self_play_fraction > 2.0 / 3.0:
+            raise ValueError("self-play must always leave at least one rule opponent")
 
-    def state_dict(self) -> dict[str, object]:
-        return {
-            "collection": asdict(self.collection),
-            "replay": asdict(self.replay),
-            "learning": asdict(self.learning),
-            "critics": asdict(self.critics),
-            "opponents": asdict(self.opponents),
-            "mc": asdict(self.mc),
-            "anchor_games": self.anchor_games,
-            "games_per_iteration": self.games_per_iteration,
-            "validation_states": self.validation_states,
-            "evaluation_every": self.evaluation_every,
-            "evaluation_games": self.evaluation_games,
-            "evaluation_seed_count": self.evaluation_seed_count,
-            "checkpoint_every": self.checkpoint_every,
-            "mc_validation_every": self.mc_validation_every,
-        }
 
-    @classmethod
-    def from_state_dict(cls, state: dict[str, object]) -> RunConfig:
-        learning_state = dict(state["learning"])  # type: ignore[arg-type]
-        expected_learning_fields = set(asdict(LearningConfig()))
-        actual_learning_fields = set(learning_state)
-        if actual_learning_fields != expected_learning_fields:
-            missing = sorted(expected_learning_fields - actual_learning_fields)
-            unexpected = sorted(actual_learning_fields - expected_learning_fields)
-            raise ValueError(
-                f"checkpoint LearningConfig does not match v{CHECKPOINT_VERSION}; "
-                f"missing fields: {missing}, unexpected fields: {unexpected}"
-            )
-        return cls(
-            collection=CollectionConfig(**state["collection"]),  # type: ignore[arg-type]
-            replay=ReplayConfig(**state["replay"]),  # type: ignore[arg-type]
-            learning=LearningConfig(**learning_state),
-            critics=CriticConfig(**state["critics"]),  # type: ignore[arg-type]
-            opponents=OpponentMixtureConfig(**state["opponents"]),  # type: ignore[arg-type]
-            mc=MonteCarloConfig(**state["mc"]),  # type: ignore[arg-type]
-            anchor_games=int(state["anchor_games"]),
-            games_per_iteration=int(state["games_per_iteration"]),
-            validation_states=int(state["validation_states"]),
-            evaluation_every=int(state["evaluation_every"]),
-            evaluation_games=int(state["evaluation_games"]),
-            evaluation_seed_count=int(state["evaluation_seed_count"]),
-            checkpoint_every=int(state["checkpoint_every"]),
-            mc_validation_every=int(state["mc_validation_every"]),
+@dataclass(frozen=True)
+class SelfPlayCurriculum:
+    fraction: float = 0.0
+    last_fixed_first_rate: float | None = None
+    activation_iteration: int | None = None
+
+    def __post_init__(self) -> None:
+        if not 0.0 <= self.fraction <= 2.0 / 3.0:
+            raise ValueError("self-play fraction must be in [0, 2/3]")
+        if self.last_fixed_first_rate is not None and not (
+            0.0 <= self.last_fixed_first_rate <= 1.0
+        ):
+            raise ValueError("fixed-rule first rate must be in [0, 1]")
+        if self.activation_iteration is not None and self.activation_iteration < 1:
+            raise ValueError("self-play activation iteration must be positive")
+        if (self.fraction > 0.0) != (self.activation_iteration is not None):
+            raise ValueError("self-play fraction and activation iteration disagree")
+
+
+def _advance_self_play(
+    state: SelfPlayCurriculum,
+    fixed_first_rate: float,
+    *,
+    next_iteration: int,
+    config: RunConfig,
+) -> SelfPlayCurriculum:
+    if not 0.0 <= fixed_first_rate <= 1.0:
+        raise ValueError("fixed-rule first rate must be in [0, 1]")
+    if next_iteration < 1:
+        raise ValueError("next iteration must be positive")
+    fraction = state.fraction
+    activation = state.activation_iteration
+    if fixed_first_rate >= config.self_play_start_first_rate:
+        fraction = min(
+            config.maximum_self_play_fraction,
+            round(fraction + config.self_play_increment, 12),
         )
+        if state.fraction == 0.0 and fraction > 0.0:
+            activation = next_iteration
+    return SelfPlayCurriculum(
+        fraction=fraction,
+        last_fixed_first_rate=fixed_first_rate,
+        activation_iteration=activation,
+    )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _model_digest(model: BloodFlowTransformer) -> str:
+    digest = hashlib.sha256()
+    for name, value in model.state_dict().items():
+        digest.update(name.encode())
+        digest.update(value.detach().cpu().contiguous().numpy().tobytes())
+    return digest.hexdigest()
+
+
+def _json_fingerprint(value: object) -> str:
+    return hashlib.sha256(
+        json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _atomic_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    temporary.replace(path)
+
+
+def _append_metric(path: Path, value: dict[str, object]) -> None:
+    existing: list[dict[str, object]] = []
+    if path.exists():
+        for line_number, line in enumerate(path.read_text().splitlines(), start=1):
+            if not line.strip():
+                continue
+            try:
+                existing.append(json.loads(line))
+            except json.JSONDecodeError as error:
+                raise ValueError(f"invalid metrics line {line_number}") from error
+    iteration = int(value["iteration"])
+    existing = [row for row in existing if int(row["iteration"]) < iteration]
+    existing.append(value)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(
+        "".join(json.dumps(row, sort_keys=True) + "\n" for row in existing)
+    )
+    temporary.replace(path)
+
+
+def _run_identity(
+    *,
+    config: RunConfig,
+    root_seed: int,
+    sl_checkpoint: Path,
+    sl_sha256: str,
+) -> dict[str, object]:
+    return {
+        "version": CHECKPOINT_VERSION,
+        "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
+        "policy_execution_version": POLICY_EXECUTION_VERSION,
+        "config": asdict(config),
+        "root_seed": int(root_seed),
+        "sl_checkpoint": str(sl_checkpoint.resolve()),
+        "sl_sha256": sl_sha256,
+    }
+
+
+def _ensure_run_identity(path: Path, identity: dict[str, object]) -> None:
+    if path.exists() and json.loads(path.read_text()) != identity:
+        raise ValueError("run config.json does not match the checkpoint")
+    _atomic_json(path, identity)
+
+
+_PENDING_ITERATION = re.compile(r"iteration-(\d{6,})")
+
+
+def _cleanup_committed_pending(output_dir: Path, next_iteration: int) -> None:
+    root = output_dir / "pending"
+    if not root.exists():
+        return
+    for path in root.iterdir():
+        match = _PENDING_ITERATION.fullmatch(path.name)
+        if path.is_dir() and match and int(match.group(1)) < next_iteration:
+            shutil.rmtree(path)
+    try:
+        root.rmdir()
+    except OSError:
+        pass
+
+
+def _committed_iteration(path: Path, fallback: int) -> int:
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=False)
+        if (
+            isinstance(payload, dict)
+            and int(payload.get("version", -1)) == CHECKPOINT_VERSION
+            and "next_iteration" in payload
+        ):
+            return int(payload["next_iteration"]) - 1
+    except (EOFError, OSError, RuntimeError, TypeError, ValueError, pickle.UnpicklingError):
+        pass
+    return fallback
+
+
+def _checkpoint_payload(
+    actor: BloodFlowTransformer,
+    *,
+    config: RunConfig,
+    root_seed: int,
+    next_iteration: int,
+    sl_checkpoint: Path,
+    sl_sha256: str,
+    self_play: SelfPlayCurriculum,
+    last_metrics: dict[str, object] | None,
+) -> dict[str, object]:
+    return {
+        "version": CHECKPOINT_VERSION,
+        "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
+        "policy_execution_version": POLICY_EXECUTION_VERSION,
+        "config": asdict(config),
+        "root_seed": int(root_seed),
+        "next_iteration": int(next_iteration),
+        "sl_checkpoint": str(sl_checkpoint.resolve()),
+        "sl_sha256": sl_sha256,
+        "self_play": asdict(self_play),
+        "model_config": actor.config.__dict__,
+        "actor": cpu_model_state(actor),
+        "last_metrics": last_metrics,
+    }
+
+
+def _save_checkpoint(path: Path, payload: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(payload, temporary)
+    temporary.replace(path)
+
+
+def _load_checkpoint(
+    path: Path, device: torch.device
+) -> tuple[BloodFlowTransformer, RunConfig, dict[str, object]]:
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    expected = {
+        "version",
+        "engine_rules_version",
+        "policy_execution_version",
+        "config",
+        "root_seed",
+        "next_iteration",
+        "sl_checkpoint",
+        "sl_sha256",
+        "self_play",
+        "model_config",
+        "actor",
+        "last_metrics",
+    }
+    if set(payload) != expected or int(payload["version"]) != CHECKPOINT_VERSION:
+        raise ValueError(
+            f"checkpoint is not current production format v{CHECKPOINT_VERSION}"
+        )
+    if int(payload["engine_rules_version"]) != int(bm.ENGINE_RULES_VERSION):
+        raise ValueError("checkpoint engine rules version does not match")
+    if int(payload["policy_execution_version"]) != POLICY_EXECUTION_VERSION:
+        raise ValueError("checkpoint policy execution version does not match")
+    if int(payload["next_iteration"]) < 1:
+        raise ValueError("checkpoint next_iteration must be positive")
+    last_metrics = payload["last_metrics"]
+    if last_metrics is not None:
+        if (
+            not isinstance(last_metrics, dict)
+            or int(last_metrics.get("iteration", -1))
+            != int(payload["next_iteration"]) - 1
+        ):
+            raise ValueError("checkpoint last_metrics does not match next_iteration")
+    config_state = dict(payload["config"])
+    if set(config_state) != {field.name for field in fields(RunConfig)}:
+        raise ValueError("checkpoint RunConfig fields do not match this trainer")
+    config = RunConfig(**config_state)
+    self_play_state = dict(payload["self_play"])
+    if set(self_play_state) != {field.name for field in fields(SelfPlayCurriculum)}:
+        raise ValueError("checkpoint self-play state fields do not match this trainer")
+    self_play = SelfPlayCurriculum(**self_play_state)
+    if self_play.fraction > config.maximum_self_play_fraction:
+        raise ValueError("checkpoint self-play fraction exceeds the configured maximum")
+    payload["self_play"] = self_play
+    actor = BloodFlowTransformer(TransformerConfig(**payload["model_config"])).to(
+        device
+    )
+    actor.load_state_dict(payload["actor"], strict=True)
+    actor.eval()
+    for parameter in actor.parameters():
+        parameter.requires_grad_(True)
+    return actor, config, payload
+
+
+def _collection_progress(progress: Progress):
+    def update(completed: int, states: int, elapsed: float) -> None:
+        progress.update(
+            completed,
+            fields={
+                "env_states": states,
+                "env_states/s": states / max(elapsed, 1e-9),
+            },
+        )
+
+    return update
+
+
+def _collect_queries(
+    actor: BloodFlowTransformer,
+    device: torch.device,
+    progress: Progress,
+    *,
+    games: int,
+    envs: int,
+    qpc: int,
+    source_seed: int,
+    query_seed: int,
+    phase: str,
+    self_play_fraction: float,
+) -> tuple[list[Any], tuple[Any, ...], dict[str, object]]:
+    progress.start(phase, total=games, unit="games")
+    collector = TrajectoryCollector(
+        CollectionConfig(envs=min(envs, games), history=actor.config.max_history),
+        actor,
+        device,
+        seed=source_seed,
+        self_play_fraction=self_play_fraction,
+    )
+    collection = collector.collect(
+        games, on_progress=_collection_progress(progress)
+    )
+    progress.complete(
+        fields={
+            "env_states/s": collection.environment_steps
+            / max(collection.elapsed_seconds, 1e-9)
+        }
+    )
+    progress.start(f"{phase}_SELECT", total=9 * qpc, unit="states")
+    queries = select_independent_queries(
+        collection.trajectories,
+        queries_per_category=qpc,
+        seed=query_seed,
+    )
+    progress.complete(len(queries))
+    return (
+        queries,
+        collection.trajectories,
+        {
+            "games": games,
+            "environment_steps": collection.environment_steps,
+            "elapsed_seconds": collection.elapsed_seconds,
+            "environment_states_per_second": collection.environment_steps
+            / max(collection.elapsed_seconds, 1e-9),
+            "configured_self_play_fraction": self_play_fraction,
+            "source_counts": collection.source_counts,
+            "opponent_seat_counts": collection.opponent_seat_counts,
+            "actual_self_play_opponent_fraction": collection.opponent_seat_counts[
+                "self_play"
+            ]
+            / max(sum(collection.opponent_seat_counts.values()), 1),
+        },
+    )
+
+
+def _reference_panel(
+    reference: BloodFlowTransformer | None,
+    device: torch.device,
+    output_dir: Path,
+    progress: Progress,
+    *,
+    root_seed: int,
+    config: RunConfig,
+    sl_sha256: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    seeds = evaluation_seeds(
+        domain_seed(root_seed, EVALUATION_DOMAIN), config.evaluation_games
+    )
+    fingerprint = _json_fingerprint(
+        {
+            "sl_sha256": sl_sha256,
+            "policy_execution_version": POLICY_EXECUTION_VERSION,
+            "seed_root": int(domain_seed(root_seed, EVALUATION_DOMAIN)),
+            "games": config.evaluation_games,
+        }
+    )
+    path = output_dir / "reference_panel.npz"
+    if path.exists():
+        loaded_seeds, ranks, scores = load_reference_panel(
+            path, fingerprint=fingerprint
+        )
+        if not np.array_equal(loaded_seeds, seeds):
+            raise ValueError("reference panel seeds do not match")
+        print(
+            f"BASE  rank {ranks.mean():.4f}  score {scores.mean():+.0f}  "
+            f"games {len(ranks):,}  cached",
+            flush=True,
+        )
+        return seeds, ranks, scores
+
+    if reference is None:
+        raise RuntimeError("the SL reference model is required to rebuild its panel")
+
+    progress.start("BASE_EVAL", total=len(seeds), unit="games")
+    result = collect_fixed_panel(
+        reference,
+        device,
+        seeds,
+        envs=config.evaluation_envs,
+        on_progress=lambda done, values: progress.update(done, fields=values),
+    )
+    progress.complete()
+    ranks, scores = outcomes(result)
+    save_reference_panel(
+        path,
+        seeds=seeds,
+        ranks=ranks,
+        scores=scores,
+        fingerprint=fingerprint,
+    )
+    print(
+        f"BASE  rank {ranks.mean():.4f}  score {scores.mean():+.0f}  "
+        f"games {len(ranks):,}",
+        flush=True,
+    )
+    return seeds, ranks, scores
+
+
+def _run_iteration(
+    actor: BloodFlowTransformer,
+    device: torch.device,
+    output_dir: Path,
+    progress: Progress,
+    *,
+    iteration: int,
+    root_seed: int,
+    config: RunConfig,
+    evaluation_panel: tuple[np.ndarray, np.ndarray, np.ndarray],
+    self_play: SelfPlayCurriculum,
+) -> tuple[
+    BloodFlowTransformer, dict[str, object], Path, SelfPlayCurriculum
+]:
+    started = time.perf_counter()
+    frozen = clone_policy(actor, device)
+    version_digest = _model_digest(frozen)
+    source_seed = domain_seed(root_seed, SOURCE_DOMAIN, iteration)
+    queries, trajectories, source_metrics = _collect_queries(
+        frozen,
+        device,
+        progress,
+        games=config.source_games,
+        envs=config.envs,
+        qpc=config.queries_per_category,
+        source_seed=source_seed,
+        query_seed=domain_seed(root_seed, SOURCE_QUERY_DOMAIN, iteration),
+        phase=f"U{iteration}_SOURCE",
+        self_play_fraction=self_play.fraction,
+    )
+    visit_stats = source_visit_frequencies(trajectories)
+    visit_weights = np.asarray(visit_stats["vector"], dtype=np.float64)
+
+    pending = output_dir / "pending" / f"iteration-{iteration:06d}"
+    target_fingerprint = _json_fingerprint(
+        {
+            "actor": version_digest,
+            "policy_execution_version": POLICY_EXECUTION_VERSION,
+            "iteration": iteration,
+            "root_seed": root_seed,
+            "worlds": config.worlds,
+            "self_play_fraction": self_play.fraction,
+        }
+    )
+    progress.start(
+        f"U{iteration}_TARGETS",
+        total=len(queries),
+        unit="queries",
+        fields={"worlds": config.worlds},
+    )
+    targets, target_metrics = cached_counterfactual_corpus(
+        pending / "targets",
+        queries,
+        frozen,
+        device,
+        fingerprint=target_fingerprint,
+        worlds=config.worlds,
+        world_chunk=config.world_chunk,
+        world_seed=domain_seed(root_seed, SOURCE_WORLD_DOMAIN, iteration),
+        shard_size=config.target_shard_size,
+        query_batch_size=config.target_query_batch_size,
+        inference_batch_size=config.rollout_inference_batch_size,
+        on_progress=lambda done, values: progress.update(done, fields=values),
+    )
+    progress.complete()
+
+    calibration_queries, calibration_trajectories, calibration_source_metrics = (
+        _collect_queries(
+            frozen,
+            device,
+            progress,
+            games=config.calibration_source_games,
+            envs=config.envs,
+            qpc=config.calibration_queries_per_category,
+            source_seed=domain_seed(root_seed, CALIBRATION_DOMAIN, iteration),
+            query_seed=domain_seed(
+                root_seed, CALIBRATION_QUERY_DOMAIN, iteration
+            ),
+            phase=f"U{iteration}_CAL_SOURCE",
+            self_play_fraction=self_play.fraction,
+        )
+    )
+    if {trajectory.seed for trajectory in trajectories} & {
+        trajectory.seed for trajectory in calibration_trajectories
+    }:
+        raise RuntimeError("training and calibration source games overlap")
+    calibration = build_state_batch(
+        calibration_queries, history=frozen.config.max_history
+    )
+
+    microbatches = math.ceil(len(targets) / config.microbatch_size)
+    progress.start(
+        f"U{iteration}_ACTOR",
+        total=microbatches,
+        unit="microbatches",
+    )
+    candidate, initial_state, candidate_state, optimizer_metrics = one_step_direction(
+        frozen,
+        targets,
+        device,
+        category_weights=visit_weights,
+        learning_rate=config.direction_learning_rate,
+        microbatch_size=config.microbatch_size,
+        on_progress=lambda done, values: progress.update(done, fields=values),
+    )
+    progress.complete()
+
+    maximum_kl_evaluations = (
+        config.kl_search_steps
+        + 2
+        + int(math.ceil(math.log2(config.maximum_scale)))
+    )
+    progress.start(
+        f"U{iteration}_KL",
+        total=maximum_kl_evaluations,
+        unit="evaluations",
+    )
+    calibration_metrics = calibrate_direction(
+        candidate,
+        frozen,
+        initial_state,
+        candidate_state,
+        calibration,
+        device,
+        category_weights=visit_weights,
+        target_kl=config.target_kl,
+        batch_size=config.inference_batch_size,
+        search_steps=config.kl_search_steps,
+        maximum_scale=config.maximum_scale,
+        on_progress=lambda done, values: progress.update(done, fields=values),
+    )
+    progress.complete(
+        int(calibration_metrics["evaluations"]),
+        fields={
+            "scale": calibration_metrics["scale"],
+            "kl": calibration_metrics["final_kl"],
+        },
+    )
+
+    seeds, reference_ranks, reference_scores = evaluation_panel
+    progress.start(
+        f"U{iteration}_EVAL", total=len(seeds), unit="games"
+    )
+    evaluation_result = collect_fixed_panel(
+        candidate,
+        device,
+        seeds,
+        envs=config.evaluation_envs,
+        on_progress=lambda done, values: progress.update(done, fields=values),
+    )
+    progress.complete()
+    actor_ranks, actor_scores = outcomes(evaluation_result)
+    evaluation = summarize_paired(
+        actor_ranks,
+        actor_scores,
+        reference_ranks,
+        reference_scores,
+        seed=domain_seed(root_seed, 0x7400_0001, iteration),
+        bootstrap_samples=config.bootstrap_samples,
+    )
+    if evaluation_result.opponent_seat_counts.get("self_play", 0) != 0:
+        raise RuntimeError("fixed-rule evaluation unexpectedly used self-play")
+    evaluation["opponent_seat_counts"] = evaluation_result.opponent_seat_counts
+    next_self_play = _advance_self_play(
+        self_play,
+        float(evaluation["actor"]["first_rate"]),
+        next_iteration=iteration + 1,
+        config=config,
+    )
+    metrics: dict[str, object] = {
+        "iteration": iteration,
+        "policy_version_before": iteration - 1,
+        "policy_version_after": iteration,
+        "elapsed_seconds": time.perf_counter() - started,
+        "source": source_metrics,
+        "source_visit_frequencies": visit_stats,
+        "targets": target_metrics,
+        "calibration_source": calibration_source_metrics,
+        "optimizer": optimizer_metrics,
+        "calibration": calibration_metrics,
+        "evaluation": evaluation,
+        "self_play": {
+            "fraction": self_play.fraction,
+            "next_fraction": next_self_play.fraction,
+            "last_fixed_first_rate": next_self_play.last_fixed_first_rate,
+            "activation_iteration": next_self_play.activation_iteration,
+        },
+    }
+    return candidate, metrics, pending, next_self_play
+
+
+def run(args: argparse.Namespace) -> None:
+    device = require_cuda(args.device)
+    torch.set_float32_matmul_precision("high")
+    torch.backends.cuda.matmul.allow_tf32 = True
+    progress = Progress()
+    output_dir: Path | None = None
+    iteration = 1
+
+    config_overrides = {
+        name: getattr(args, name)
+        for name in (field.name for field in fields(RunConfig))
+        if getattr(args, name) is not None
+    }
+    if args.resume is not None:
+        if config_overrides or args.seed is not None:
+            raise ValueError("resume does not accept seed or config overrides")
+        if args.resume.name != "latest.pt":
+            raise ValueError("resume accepts only the canonical latest.pt checkpoint")
+        actor, config, checkpoint = _load_checkpoint(args.resume, device)
+        require_deterministic_actor(actor)
+        output_dir = args.resume.resolve().parent
+        if args.output_dir is not None and args.output_dir.resolve() != output_dir:
+            raise ValueError("resume output directory does not match checkpoint")
+        root_seed = int(checkpoint["root_seed"])
+        next_iteration = int(checkpoint["next_iteration"])
+        self_play = checkpoint["self_play"]
+        sl_checkpoint = Path(str(checkpoint["sl_checkpoint"]))
+        sl_sha256 = str(checkpoint["sl_sha256"])
+        if not sl_checkpoint.exists() or _sha256(sl_checkpoint) != sl_sha256:
+            raise ValueError("the frozen SL checkpoint changed or is missing")
+        if args.sl_checkpoint is not None and args.sl_checkpoint.resolve() != sl_checkpoint:
+            raise ValueError("resume SL checkpoint path does not match")
+        last_metrics = checkpoint["last_metrics"]
+        _ensure_run_identity(
+            output_dir / "config.json",
+            _run_identity(
+                config=config,
+                root_seed=root_seed,
+                sl_checkpoint=sl_checkpoint,
+                sl_sha256=sl_sha256,
+            ),
+        )
+        if last_metrics is not None:
+            _append_metric(output_dir / "metrics.jsonl", last_metrics)
+        save_policy(output_dir / "actor.pt", actor)
+        _cleanup_committed_pending(output_dir, next_iteration)
+    else:
+        config = RunConfig(**config_overrides)
+        root_seed = 20260727 if args.seed is None else int(args.seed)
+        output_dir = args.output_dir or Path("runs/policy-iteration-v3")
+        initial_temporary = output_dir / "latest.pt.tmp"
+        if output_dir.exists():
+            entries = list(output_dir.iterdir())
+            if entries == [initial_temporary]:
+                initial_temporary.unlink()
+            elif entries:
+                raise ValueError("new output directory must be empty")
+        sl_checkpoint = args.sl_checkpoint or Path(
+            "runs/counterfactual-larger/sl_reference.pt"
+        )
+        if not sl_checkpoint.exists():
+            raise FileNotFoundError(sl_checkpoint)
+        sl_checkpoint = sl_checkpoint.resolve()
+        sl_sha256 = _sha256(sl_checkpoint)
+        actor = load_policy(sl_checkpoint, device, frozen=False)
+        require_deterministic_actor(actor)
+        next_iteration = 1
+        self_play = SelfPlayCurriculum()
+        last_metrics = None
+        output_dir.mkdir(parents=True, exist_ok=True)
+        _save_checkpoint(
+            output_dir / "latest.pt",
+            _checkpoint_payload(
+                actor,
+                config=config,
+                root_seed=root_seed,
+                next_iteration=next_iteration,
+                sl_checkpoint=sl_checkpoint,
+                sl_sha256=sl_sha256,
+                self_play=self_play,
+                last_metrics=None,
+            ),
+        )
+        _ensure_run_identity(
+            output_dir / "config.json",
+            _run_identity(
+                config=config,
+                root_seed=root_seed,
+                sl_checkpoint=sl_checkpoint,
+                sl_sha256=sl_sha256,
+            ),
+        )
+        save_policy(output_dir / "actor.pt", actor)
+
+    torch.manual_seed(root_seed)
+    torch.cuda.manual_seed_all(root_seed)
+    np.random.seed(root_seed & 0xFFFF_FFFF)
+    print(
+        f"CUDA {torch.cuda.get_device_name(device)}  eager mode  "
+        f"states/update {9 * config.queries_per_category:,}  "
+        f"worlds {config.worlds}  target_KL {config.target_kl:g}",
+        flush=True,
+    )
+    iteration = next_iteration
+    try:
+        panel_reference: BloodFlowTransformer | None
+        temporary_reference = False
+        if args.resume is None:
+            panel_reference = actor
+        elif (output_dir / "reference_panel.npz").exists():
+            panel_reference = None
+        else:
+            panel_reference = load_policy(sl_checkpoint, device, frozen=True)
+            require_deterministic_actor(panel_reference)
+            temporary_reference = True
+        panel = _reference_panel(
+            panel_reference,
+            device,
+            output_dir,
+            progress,
+            root_seed=root_seed,
+            config=config,
+            sl_sha256=sl_sha256,
+        )
+        if self_play.last_fixed_first_rate is None:
+            if next_iteration != 1 or last_metrics is not None:
+                raise RuntimeError("initialized run is missing its self-play baseline")
+            self_play = _advance_self_play(
+                self_play,
+                float(np.mean(panel[1] == 1)),
+                next_iteration=1,
+                config=config,
+            )
+            _save_checkpoint(
+                output_dir / "latest.pt",
+                _checkpoint_payload(
+                    actor,
+                    config=config,
+                    root_seed=root_seed,
+                    next_iteration=next_iteration,
+                    sl_checkpoint=sl_checkpoint,
+                    sl_sha256=sl_sha256,
+                    self_play=self_play,
+                    last_metrics=None,
+                ),
+            )
+        print(
+            f"OPPONENTS self {100 * self_play.fraction:.0f}%  "
+            f"fixed-first {100 * self_play.last_fixed_first_rate:.1f}%  "
+            f"gate {100 * config.self_play_start_first_rate:.0f}%  "
+            f"max {100 * config.maximum_self_play_fraction:.0f}%",
+            flush=True,
+        )
+        if temporary_reference:
+            del panel_reference
+            torch.cuda.empty_cache()
+        while True:
+            candidate, metrics, pending, next_self_play = _run_iteration(
+                actor,
+                device,
+                output_dir,
+                progress,
+                iteration=iteration,
+                root_seed=root_seed,
+                config=config,
+                evaluation_panel=panel,
+                self_play=self_play,
+            )
+            payload = _checkpoint_payload(
+                candidate,
+                config=config,
+                root_seed=root_seed,
+                next_iteration=iteration + 1,
+                sl_checkpoint=sl_checkpoint,
+                sl_sha256=sl_sha256,
+                self_play=next_self_play,
+                last_metrics=metrics,
+            )
+            progress.start(
+                f"U{iteration}_CHECKPOINT", total=1, unit="commits"
+            )
+            _save_checkpoint(output_dir / "latest.pt", payload)
+            actor = candidate
+            self_play = next_self_play
+            committed_iteration = iteration
+            iteration += 1
+            save_policy(output_dir / "actor.pt", candidate)
+            _append_metric(output_dir / "metrics.jsonl", metrics)
+            if pending.exists():
+                shutil.rmtree(pending)
+            progress.complete(1)
+            evaluation = metrics["evaluation"]
+            rank = evaluation["paired_rank_delta"]
+            score = evaluation["paired_score_delta"]
+            print(
+                f"u {committed_iteration:4d}  rank {evaluation['actor']['mean_rank']:.4f}  "
+                f"dRank {rank['mean']:+.4f} "
+                f"[{rank['ci95_low']:+.4f},{rank['ci95_high']:+.4f}]  "
+                f"score {score['mean']:+.0f}  "
+                f"KL {metrics['calibration']['final_kl']:.6f}  "
+                f"flip {100 * metrics['calibration']['greedy_flip_rate']:.1f}%  "
+                f"self {100 * metrics['self_play']['fraction']:.0f}%"
+                f"->{100 * metrics['self_play']['next_fraction']:.0f}%  "
+                f"time {metrics['elapsed_seconds'] / 60:.1f}m",
+                flush=True,
+            )
+    except KeyboardInterrupt:
+        if progress.active:
+            snapshot = progress.snapshot()
+            progress.complete(snapshot.current, fields={"interrupted": True})
+        if output_dir is not None and (output_dir / "latest.pt").exists():
+            committed = _committed_iteration(
+                output_dir / "latest.pt", iteration - 1
+            )
+            print(
+                f"Stopped. latest.pt contains complete iteration {committed}; "
+                f"resume with --resume {output_dir / 'latest.pt'}",
+                flush=True,
+            )
+        else:
+            print("Stopped before the initial checkpoint was committed.", flush=True)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--output-dir", type=Path, default=Path("runs/iql-awr-v3"))
-    parser.add_argument(
-        "--sl-checkpoint",
-        type=Path,
-        default=Path("runs/counterfactual-larger/sl_reference.pt"),
-    )
+    parser.add_argument("--output-dir", type=Path)
+    parser.add_argument("--sl-checkpoint", type=Path)
     parser.add_argument("--resume", type=Path)
-    parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument(
-        "--experiment",
-        choices=("a", "b", "c"),
-        default=None,
-        help="a=partial IQL/AWR, b=oracle critic, c=selective information-set MC",
-    )
-    parser.add_argument("--envs", type=int)
-    parser.add_argument("--anchor-games", type=int)
-    parser.add_argument("--games-per-iteration", type=int)
-    parser.add_argument("--critic-batch-size", type=int)
-    parser.add_argument("--actor-batch-size", type=int)
-    parser.add_argument("--microbatch-size", type=int)
-    parser.add_argument("--initial-critic-steps", type=int)
-    parser.add_argument("--critic-steps", type=int)
-    parser.add_argument("--actor-steps", type=int)
-    parser.add_argument("--eval-every", type=int)
-    parser.add_argument("--eval-games", type=int)
-    parser.add_argument("--checkpoint-every", type=int)
-    parser.add_argument("--smoke", action="store_true")
-    parser.add_argument("--verbose-console", action="store_true")
+    parser.add_argument("--seed", type=int)
+    parser.add_argument("--device", choices=("cuda",), default="cuda")
+    for field in fields(RunConfig):
+        option = "--" + field.name.replace("_", "-")
+        parser.add_argument(option, dest=field.name, type=type(field.default))
     return parser
 
 
-def _config_from_args(args: argparse.Namespace) -> RunConfig:
-    config = RunConfig()
-    collection_changes = {
-        key: value
-        for key, value in (("envs", args.envs),)
-        if value is not None
-    }
-    learning_changes = {
-        key: value
-        for key, value in (
-            ("critic_batch_size", args.critic_batch_size),
-            ("actor_batch_size", args.actor_batch_size),
-            ("microbatch_size", args.microbatch_size),
-            ("initial_critic_steps", args.initial_critic_steps),
-            ("critic_steps_per_iteration", args.critic_steps),
-            ("actor_steps_per_iteration", args.actor_steps),
-        )
-        if value is not None
-    }
-    top_changes = {
-        key: value
-        for key, value in (
-            ("anchor_games", args.anchor_games),
-            ("games_per_iteration", args.games_per_iteration),
-            ("evaluation_every", args.eval_every),
-            ("evaluation_games", args.eval_games),
-            ("checkpoint_every", args.checkpoint_every),
-        )
-        if value is not None
-    }
-    if collection_changes:
-        config = replace(config, collection=replace(config.collection, **collection_changes))
-    if learning_changes:
-        config = replace(config, learning=replace(config.learning, **learning_changes))
-    if top_changes:
-        config = replace(config, **top_changes)
-    if args.smoke:
-        config = replace(
-            config,
-            collection=replace(config.collection, envs=16),
-            replay=replace(
-                config.replay,
-                validation_fraction=0.25,
-                maximum_online_transitions=4096,
-            ),
-            learning=replace(
-                config.learning,
-                critic_batch_size=64,
-                actor_batch_size=64,
-                microbatch_size=16,
-                initial_critic_steps=2,
-                critic_steps_per_iteration=1,
-                actor_steps_per_iteration=1,
-                mc_critic_batch_size=16,
-                mc_critic_steps_per_iteration=1,
-                minimum_critic_steps=1,
-                minimum_middle_late_improvement=-1_000_000.0,
-                minimum_middle_late_correlation=-1.0,
-                maximum_q_disagreement=10.0,
-                teacher_readiness_streak=1,
-                minimum_oracle_relative_mae_gain=-1_000_000.0,
-                minimum_oracle_early_relative_mae_gain=-1_000_000.0,
-                minimum_oracle_early_improvement=-1_000_000.0,
-                minimum_oracle_early_correlation=-1.0,
-                minimum_oracle_value_correlation=-1.0,
-                maximum_oracle_q_disagreement=10.0,
-                maximum_oracle_expectile_balance_error=1.0,
-                minimum_mc_train_targets=1,
-                minimum_mc_validation_targets=1,
-                minimum_mc_validation_groups=1,
-                minimum_mc_pairwise_pairs=0,
-                minimum_mc_pairwise_accuracy=0.0,
-                maximum_mc_mean_regret=1_000_000.0,
-            ),
-            critics=replace(
-                config.critics,
-                d_model=32,
-                num_heads=4,
-                static_layers=1,
-                history_layers=1,
-                ffn_dim=64,
-                head_dim=48,
-            ),
-            mc=replace(
-                config.mc,
-                queries_per_iteration=1,
-                hidden_worlds=2,
-                candidate_pool_states=16,
-                maximum_confidence_half_width=1_000_000.0,
-                minimum_reliable_action_gap=0.0,
-            ),
-            anchor_games=16,
-            games_per_iteration=8,
-            validation_states=64,
-            evaluation_every=1,
-            evaluation_games=8,
-            evaluation_seed_count=1,
-            checkpoint_every=1,
-            mc_validation_every=1,
-        )
-    return config
-
-
-def _validate_args(args: argparse.Namespace) -> None:
-    if args.resume is not None and args.sl_checkpoint != Path(
-        "runs/counterfactual-larger/sl_reference.pt"
-    ):
-        raise ValueError("--resume cannot be combined with --sl-checkpoint")
-    for name in (
-        "envs",
-        "anchor_games",
-        "games_per_iteration",
-        "critic_batch_size",
-        "actor_batch_size",
-        "microbatch_size",
-        "initial_critic_steps",
-        "critic_steps",
-        "actor_steps",
-        "eval_every",
-        "eval_games",
-        "checkpoint_every",
-    ):
-        value = getattr(args, name)
-        if value is not None and value <= 0:
-            raise ValueError(f"--{name.replace('_', '-')} must be positive")
-
-
-def _synchronize() -> None:
-    torch.cuda.synchronize()
-
-
-def _compact_percent(value: object) -> str:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return "-"
-    return f"{100.0 * number:.1f}%" if np.isfinite(number) else "-"
-
-
-def _compact_record(record: dict[str, object]) -> str:
-    phase = str(record.get("phase", "event"))
-    if phase == "baseline":
-        evaluation = record["fixed_evaluation"]
-        assert isinstance(evaluation, dict)
-        return (
-            f"BASE  rank {float(evaluation['mean_rank']):.2f}"
-            f"  score {float(evaluation['mean_score_delta']):.0f}"
-            f"  replay {int(record.get('replay_states', 0)):,}"
-        )
-    if phase == "critic_warmup":
-        validation = record.get("critic_validation", {})
-        q = validation.get("q", {}) if isinstance(validation, dict) else {}
-        return (
-            f"CRITIC  step {int(record.get('critic_steps', 0)):>5}"
-            f"  qMAE {float(q.get('mae', 0.0)):.3f}"
-            f"  corr {float(q.get('correlation', 0.0)):.3f}"
-            f"  ready {str(record.get('actor_gate', 'unknown'))}"
-        )
-    if phase == "iteration":
-        evaluation = record.get("fixed_evaluation")
-        validation = record.get("critic_validation", {})
-        q = validation.get("q", {}) if isinstance(validation, dict) else {}
-        message = (
-            f"u{int(record.get('iteration', 0)):>5}"
-            f"  replay {int(record.get('replay_states', 0)):>9,}"
-            f"  qMAE {float(q.get('mae', 0.0)):.3f}"
-            f"  dis {float(validation.get('q_disagreement', 0.0)):.3f}"
-            f"  actor {record.get('actor_gate', 'held')}"
-        )
-        mc_critic = record.get("mc_critic")
-        mc = record.get("mc")
-        if isinstance(mc_critic, dict) or isinstance(mc, dict):
-            mc_critic = mc_critic if isinstance(mc_critic, dict) else {}
-            mc = mc if isinstance(mc, dict) else {}
-            validation_metrics = mc.get("validation_metrics")
-            validation_metrics = (
-                validation_metrics if isinstance(validation_metrics, dict) else {}
-            )
-            ranking = validation_metrics.get("action_ranking")
-            ranking = ranking if isinstance(ranking, dict) else {}
-            train_targets = mc.get(
-                "train_targets_after_trim", mc.get("train_targets", 0)
-            )
-            validation_targets = mc.get("validation_targets", 0)
-            reliable_pairs = ranking.get(
-                "pair_count", mc.get("validation_reliable_pairs", 0)
-            )
-            all_pairs = ranking.get("all_pair_count", ranking.get("pair_count", 0))
-            reliable_groups = mc.get(
-                "validation_reliable_groups",
-                ranking.get("group_count", 0),
-            )
-            message += (
-                "  MC "
-                f"{int(train_targets):,}/{int(validation_targets):,}"
-                f" diff {float(mc_critic.get('mc_centered_loss', 0.0)):.3f}"
-                f" pair {float(mc_critic.get('mc_pairwise_loss', 0.0)):.3f}"
-                f" train_acc {_compact_percent(mc_critic.get('mc_train_pairwise_accuracy'))}"
-                f" val_acc {_compact_percent(ranking.get('pairwise_accuracy'))}"
-                f" sig_pairs {int(reliable_pairs):,}/{int(all_pairs):,}"
-                f" rel_groups {int(reliable_groups):,}"
-                f" frozen {'yes' if mc.get('validation_frozen') is True else 'no'}"
-                f" {float(record.get('mc_critic_seconds', 0.0)):.1f}s"
-            )
-        actor = record.get("actor")
-        if isinstance(actor, dict):
-            message += f"  KL {float(actor.get('actor_reference_kl', 0.0)):.4f}"
-        if isinstance(evaluation, dict):
-            message += (
-                f"  rank {float(evaluation.get('mean_rank', 0.0)):.2f}"
-                f"  score {float(evaluation.get('mean_score_delta', 0.0)):.0f}"
-            )
-        return message
-    if phase == "stopped":
-        return (
-            f"STOP  u{int(record.get('iteration', 0))}"
-            f"  critic {int(record.get('critic_steps', 0))}"
-            f"  reason {record.get('reason', 'unknown')}"
-        )
-    return phase
-
-
-def _should_evaluate(iteration: int, every: int, *, smoke: bool) -> bool:
-    return smoke or iteration % every == 0
-
-
-def _mc_validation_corpus_status(
-    replay: TrajectoryReplay, config: LearningConfig
-) -> dict[str, object]:
-    """Return cheap, corpus-wide evidence counts used to freeze MC validation."""
-
-    validation_targets = replay.mc_target_count("validation", anchor_only=True)
-    reliable = replay.reliable_mc_counts("validation", anchor_only=True)
-    reliable_targets = int(reliable["targets"])
-    reliable_groups = int(reliable["groups"])
-    reliable_pairs = int(reliable["pairs"])
-    frozen = (
-        validation_targets >= config.minimum_mc_validation_targets
-        and reliable_groups >= config.minimum_mc_validation_groups
-        and reliable_pairs >= config.minimum_mc_pairwise_pairs
-    )
-    return {
-        "validation_targets": validation_targets,
-        "validation_reliable_targets": reliable_targets,
-        "validation_reliable_groups": reliable_groups,
-        "validation_reliable_pairs": reliable_pairs,
-        "validation_frozen": frozen,
-    }
-
-
-def _mc_validation_corpus_gate(
-    status: dict[str, object], config: LearningConfig
-) -> str:
-    if int(status["validation_targets"]) < config.minimum_mc_validation_targets:
-        return "mc_validation_targets"
-    if (
-        int(status["validation_reliable_groups"])
-        < config.minimum_mc_validation_groups
-    ):
-        return "mc_validation_reliable_groups"
-    if (
-        int(status["validation_reliable_pairs"])
-        < config.minimum_mc_pairwise_pairs
-    ):
-        return "mc_validation_reliable_pairs"
-    return "ready"
-
-
-def _write_record(
-    metrics_path: Path,
-    dashboard_path: Path,
-    record: dict[str, object],
-    *,
-    verbose: bool,
-) -> None:
-    with metrics_path.open("a", encoding="utf-8") as stream:
-        stream.write(json.dumps(record, ensure_ascii=False) + "\n")
-    print(_compact_record(record), flush=True)
-    if verbose:
-        print(json.dumps(record, ensure_ascii=False), flush=True)
-    if record.get("phase") != "iteration" or "fixed_evaluation" in record:
-        render_dashboard(metrics_path, dashboard_path)
-
-
-def _mean_statistics(values: list[dict[str, float]]) -> dict[str, float]:
-    if not values:
-        return {}
-    keys = set.intersection(*(set(value) for value in values))
-    return {
-        key: float(np.mean([value[key] for value in values])) for key in sorted(keys)
-    }
-
-
-def _train_critics(
-    replay: TrajectoryReplay,
-    sampler: BalancedReplaySampler,
-    critics: IndependentCritics,
-    optimizers: dict[str, torch.optim.Optimizer],
-    config: RunConfig,
-    device: torch.device,
-    steps: int,
-    *,
-    oracle: OracleCritics | None,
-    enable_oracle_distillation: bool,
-    show_progress: bool = False,
-) -> tuple[dict[str, float], float]:
-    index = replay.index("train", include_mc=False)
-    prepared = sampler.prepare(
-        index.sources,
-        index.categories,
-        duplicate_keys=index.duplicate_keys,
-        policy_versions=index.policy_versions,
-    )
-    current_fraction = float(
-        np.mean(index.sources == int(ReplaySource.CURRENT))
-    )
-    cql_scale = cql_scale_from_coverage(config.learning, current_fraction)
-    statistics: list[torch.Tensor] = []
-    started = time.perf_counter()
-
-    def submit_batch(executor: ThreadPoolExecutor):
-        selected = sampler.sample_index(prepared, config.learning.critic_batch_size)
-        replay.cursor += len(selected.indices)
-        return executor.submit(
-            replay.materialize,
-            index,
-            selected.indices,
-            include_oracle=oracle is not None,
-        )
-
-    # Engine replay runs on a detached Rust thread.  Materialize batch N+1
-    # while CUDA trains batch N so the GPU no longer waits between updates.
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-critic") as executor:
-        pending = submit_batch(executor)
-        for step in range(steps):
-            batch = pending.result()
-            if step + 1 < steps:
-                pending = submit_batch(executor)
-            statistics.append(
-                critic_update_deferred(
-                    critics,
-                    optimizers,
-                    batch,
-                    config.learning,
-                    device,
-                    cql_scale=cql_scale,
-                    oracle=oracle,
-                    enable_oracle_distillation=enable_oracle_distillation,
-                )
-            )
-            completed = step + 1
-            progress_every = max(steps // 5, 1)
-            if show_progress and (
-                completed % progress_every == 0 or completed == steps
-            ):
-                elapsed = time.perf_counter() - started
-                states_per_second = (
-                    completed * config.learning.critic_batch_size
-                ) / max(elapsed, 1e-9)
-                print(
-                    f"WARM  {completed:>4}/{steps:<4}"
-                    f"  {states_per_second:,.0f} states/s",
-                    flush=True,
-                )
-    result = resolve_critic_statistics(
-        torch.stack(statistics).mean(dim=0), cql_scale=cql_scale
-    )
-    return result, time.perf_counter() - started
-
-
-def _train_mc_critics(
-    replay: TrajectoryReplay,
-    critics: IndependentCritics,
-    optimizers: dict[str, torch.optim.Optimizer],
-    config: RunConfig,
-    device: torch.device,
-    *,
-    seed: int,
-) -> tuple[dict[str, float] | None, float]:
-    """Train Q heads on complete MC query groups without touching V."""
-
-    batch_size = min(
-        config.learning.mc_critic_batch_size,
-        config.learning.microbatch_size,
-    )
-    if batch_size < 2:
-        raise ValueError("MC critic batch must fit at least two candidate actions")
-    started = time.perf_counter()
-    statistics: list[torch.Tensor] = []
-
-    def submit(executor: ThreadPoolExecutor, step: int):
-        return executor.submit(
-            replay.mc_training_batch,
-            batch_size,
-            seed=seed + step * 0x9E3779B1,
-        )
-
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-mc") as executor:
-        pending = submit(executor, 0)
-        for step in range(config.learning.mc_critic_steps_per_iteration):
-            batch = pending.result()
-            if batch is None:
-                break
-            if step + 1 < config.learning.mc_critic_steps_per_iteration:
-                pending = submit(executor, step + 1)
-            replay.cursor += len(batch)
-            statistics.append(
-                mc_critic_update_deferred(
-                    critics,
-                    optimizers["q"],
-                    batch,
-                    config.learning,
-                    device,
-                )
-            )
-    if not statistics:
-        return None, time.perf_counter() - started
-    result = resolve_mc_critic_statistics(torch.stack(statistics).mean(dim=0))
-    result["mc_critic_updates"] = float(len(statistics))
-    return result, time.perf_counter() - started
-
-
-def _train_actor(
-    replay: TrajectoryReplay,
-    sampler: BalancedReplaySampler,
-    actor: BloodFlowTransformer,
-    reference: BloodFlowTransformer,
-    critics: IndependentCritics,
-    optimizers: dict[str, torch.optim.Optimizer],
-    config: RunConfig,
-    device: torch.device,
-    *,
-    oracle: OracleCritics | None,
-    use_oracle_teacher: bool,
-) -> tuple[dict[str, float], float]:
-    index = replay.index("train", include_mc=False)
-    prepared = sampler.prepare(
-        index.sources,
-        index.categories,
-        duplicate_keys=index.duplicate_keys,
-        policy_versions=index.policy_versions,
-    )
-    statistics: list[dict[str, float]] = []
-    started = time.perf_counter()
-    actor_steps = config.learning.actor_steps_per_iteration
-
-    def submit_batch(executor: ThreadPoolExecutor):
-        selected = sampler.sample_index(prepared, config.learning.actor_batch_size)
-        replay.cursor += len(selected.indices)
-        return executor.submit(
-            replay.materialize,
-            index,
-            selected.indices,
-            include_oracle=use_oracle_teacher,
-        )
-
-    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="replay-actor") as executor:
-        pending = submit_batch(executor)
-        for step in range(actor_steps):
-            batch = pending.result()
-            if step + 1 < actor_steps:
-                pending = submit_batch(executor)
-            statistics.append(
-                actor_update(
-                    actor,
-                    reference,
-                    critics,
-                    optimizers["actor"],
-                    batch,
-                    config.learning,
-                    device,
-                    oracle=oracle,
-                    use_oracle_teacher=use_oracle_teacher,
-                    measure_post_update_kl=step + 1 == actor_steps,
-                )
-            )
-    _synchronize()
-    result = _mean_statistics(statistics)
-    if "actor_reference_kl" in statistics[-1]:
-        result["actor_reference_kl"] = statistics[-1]["actor_reference_kl"]
-    return result, time.perf_counter() - started
-
-
-def _critic_validation(
-    replay: TrajectoryReplay,
-    critics: IndependentCritics,
-    config: RunConfig,
-    device: torch.device,
-    *,
-    seed: int,
-    oracle: OracleCritics | None,
-) -> dict[str, object]:
-    batch = replay.validation_batch(
-        config.validation_states,
-        seed=seed,
-        include_mc=False,
-        include_oracle=oracle is not None,
-    )
-    return validate_critics(
-        critics,
-        batch,
-        device,
-        microbatch_size=config.learning.microbatch_size,
-        oracle=oracle,
-        expectile=config.learning.expectile,
-    )
-
-
-def _checkpoint_payload(
-    *,
-    experiment: str,
-    config: RunConfig,
-    actor: BloodFlowTransformer,
-    reference: BloodFlowTransformer,
-    critics: IndependentCritics,
-    oracle: OracleCritics | None,
-    optimizers: dict[str, torch.optim.Optimizer],
-    policy_pool: PolicyPool,
-    behavior: BehaviorSampler,
-    sampler: BalancedReplaySampler,
-    replay: TrajectoryReplay,
-    iteration: int,
-    critic_steps: int,
-    actor_updates: int,
-    policy_version: int,
-    teacher_ready_streak: int,
-    collector_next_seed: int,
-    run_seed: int,
-    fixed_seeds: tuple[int, ...],
-    fresh_seeds: tuple[int, ...],
-    baseline_fixed: dict[str, object],
-    baseline_fresh: dict[str, object],
-    best_fixed: dict[str, object],
-    best_fresh: dict[str, object],
-) -> dict[str, object]:
-    return {
-        "checkpoint_version": CHECKPOINT_VERSION,
-        "experiment": experiment,
-        "run_config": config.state_dict(),
-        "model_config": asdict(actor.config),
-        "actor": actor.state_dict(),
-        "reference": reference.state_dict(),
-        "critics": critics.state_dict(),
-        "oracle": None if oracle is None else oracle.state_dict(),
-        "optimizers": {name: value.state_dict() for name, value in optimizers.items()},
-        "policy_pool": policy_pool.state_dict(),
-        "behavior": behavior.state_dict(),
-        "replay_sampler": sampler.state_dict(),
-        "replay": replay.state_dict(),
-        "iteration": iteration,
-        "critic_steps": critic_steps,
-        "actor_updates": actor_updates,
-        "policy_version": policy_version,
-        "teacher_ready_streak": teacher_ready_streak,
-        "collector_next_seed": collector_next_seed,
-        "run_seed": run_seed,
-        "fixed_seeds": fixed_seeds,
-        "fresh_seeds": fresh_seeds,
-        "baseline_fixed": baseline_fixed,
-        "baseline_fresh": baseline_fresh,
-        "best_fixed": best_fixed,
-        "best_fresh": best_fresh,
-        "python_random_state": random.getstate(),
-        "numpy_random_state": np.random.get_state(),
-        "torch_random_state": torch.get_rng_state(),
-        "cuda_random_state": torch.cuda.get_rng_state_all(),
-    }
-
-
-def _save_checkpoint(path: Path, **values: object) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    replay = values.get("replay")
-    if isinstance(replay, TrajectoryReplay):
-        replay.save_manifest()
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    torch.save(_checkpoint_payload(**values), temporary)
-    temporary.replace(path)
-
-
-def _load_checkpoint(path: Path, device: torch.device) -> dict[str, object]:
-    checkpoint = torch.load(path, map_location=device, weights_only=False)
-    version = int(checkpoint.get("checkpoint_version", -1))
-    if version == 2:
-        raise ValueError(
-            f"{path} is a v2 IQL/AWR checkpoint; v2 resume is unsupported "
-            "because it predates reliable MC evidence and v3 validation state"
-        )
-    if version != CHECKPOINT_VERSION:
-        raise ValueError(
-            f"{path} is not an IQL/AWR teacher-gated v{CHECKPOINT_VERSION} "
-            "checkpoint; pre-gate IQL/AWR and old PPO/counterfactual "
-            "checkpoints are unsupported"
-        )
-    return checkpoint
-
-
-def run(args: argparse.Namespace) -> None:
-    _validate_args(args)
-    if not torch.cuda.is_available():
-        raise RuntimeError("training requires CUDA; CPU fallback is unsupported")
-    random.seed(args.seed)
-    np.random.seed(args.seed)
-    torch.manual_seed(args.seed)
-    torch.cuda.manual_seed_all(args.seed)
-    torch.set_float32_matmul_precision("high")
-    device = torch.device("cuda")
-
-    output_dir = args.resume.parent if args.resume is not None else args.output_dir
-    output_dir.mkdir(parents=True, exist_ok=True)
-    metrics_path = output_dir / "metrics.jsonl"
-    dashboard_path = output_dir / "dashboard.html"
-    if args.resume is None and metrics_path.exists():
-        raise FileExistsError(
-            f"{metrics_path} exists; select a new directory or use --resume"
-        )
-
-    def write(record: dict[str, object]) -> None:
-        _write_record(
-            metrics_path,
-            dashboard_path,
-            record,
-            verbose=args.verbose_console,
-        )
-
-    if args.resume is not None:
-        checkpoint = _load_checkpoint(args.resume, device)
-        experiment = str(checkpoint["experiment"])
-        if args.experiment is not None and args.experiment != experiment:
-            raise ValueError("--experiment does not match the resumed checkpoint")
-        config = RunConfig.from_state_dict(checkpoint["run_config"])  # type: ignore[arg-type]
-        model_config = TransformerConfig(**checkpoint["model_config"])  # type: ignore[arg-type]
-        actor = BloodFlowTransformer(model_config).to(device)
-        reference = BloodFlowTransformer(model_config).to(device)
-        actor.load_state_dict(checkpoint["actor"], strict=True)
-        reference.load_state_dict(checkpoint["reference"], strict=True)
-        for parameter in reference.parameters():
-            parameter.requires_grad_(False)
-        critics = IndependentCritics(config.critics).to(device)
-        critics.load_state_dict(checkpoint["critics"], strict=True)
-        oracle = OracleCritics(config.critics).to(device) if experiment == "b" else None
-        if oracle is not None:
-            if checkpoint["oracle"] is None:
-                raise ValueError("oracle experiment checkpoint has no oracle state")
-            oracle.load_state_dict(checkpoint["oracle"], strict=True)
-        optimizers = make_optimizers(actor, critics, config.learning, oracle)
-        for name, optimizer in optimizers.items():
-            optimizer.load_state_dict(checkpoint["optimizers"][name])  # type: ignore[index]
-        policy_pool = PolicyPool.from_state_dict(checkpoint["policy_pool"])  # type: ignore[arg-type]
-        behavior = BehaviorSampler.from_state_dict(checkpoint["behavior"])  # type: ignore[arg-type]
-        sampler = BalancedReplaySampler.from_state_dict(
-            checkpoint["replay_sampler"]  # type: ignore[arg-type]
-        )
-        replay = TrajectoryReplay.load(output_dir / "replay")
-        replay_state = checkpoint["replay"]
-        if not isinstance(replay_state, dict):
-            raise ValueError("checkpoint replay state is invalid")
-        for key in (
-            "next_trajectory_id",
-            "next_target_id",
-            "next_query_id",
-            "next_shard_id",
-        ):
-            if int(replay.state_dict()[key]) != int(replay_state[key]):
-                raise ValueError(f"checkpoint and replay manifest disagree on {key}")
-        replay.cursor = int(replay_state["cursor"])
-        iteration = int(checkpoint["iteration"])
-        critic_steps = int(checkpoint["critic_steps"])
-        actor_updates = int(checkpoint["actor_updates"])
-        policy_version = int(checkpoint["policy_version"])
-        teacher_ready_streak = int(checkpoint["teacher_ready_streak"])
-        run_seed = int(checkpoint["run_seed"])
-        fixed_seeds = tuple(int(value) for value in checkpoint["fixed_seeds"])
-        fresh_seeds = tuple(int(value) for value in checkpoint["fresh_seeds"])
-        baseline_fixed = checkpoint["baseline_fixed"]
-        baseline_fresh = checkpoint["baseline_fresh"]
-        best_fixed = checkpoint["best_fixed"]
-        best_fresh = checkpoint["best_fresh"]
-        random.setstate(checkpoint["python_random_state"])
-        np.random.set_state(checkpoint["numpy_random_state"])
-        torch.set_rng_state(checkpoint["torch_random_state"].cpu())
-        torch.cuda.set_rng_state_all(
-            [value.cpu() for value in checkpoint["cuda_random_state"]]
-        )
-    else:
-        experiment = args.experiment or "a"
-        config = _config_from_args(args)
-        if not args.sl_checkpoint.exists():
-            raise FileNotFoundError(args.sl_checkpoint)
-        reference = load_policy(args.sl_checkpoint, device)
-        actor = clone_policy(reference, device)
-        for parameter in actor.parameters():
-            parameter.requires_grad_(True)
-        critics = IndependentCritics(config.critics).to(device)
-        oracle = OracleCritics(config.critics).to(device) if experiment == "b" else None
-        optimizers = make_optimizers(actor, critics, config.learning, oracle)
-        policy_pool = PolicyPool(
-            str(args.sl_checkpoint.resolve()),
-            seed=args.seed + 11,
-            config=config.opponents,
-        )
-        behavior = BehaviorSampler(seed=args.seed + 17)
-        sampler = BalancedReplaySampler(seed=args.seed + 23)
-        replay = TrajectoryReplay(
-            output_dir / "replay", seed=args.seed + 29, config=config.replay
-        )
-        iteration = 0
-        critic_steps = 0
-        actor_updates = 0
-        policy_version = 0
-        teacher_ready_streak = 0
-        run_seed = args.seed
-        fixed_seeds = tuple(
-            run_seed + 0xA51CE + index * 0x10001
-            for index in range(config.evaluation_seed_count)
-        )
-        fresh_seeds = tuple(
-            run_seed + 0xF12E5 + index * 0x20003
-            for index in range(config.evaluation_seed_count)
-        )
-
-    executables = ExecutablePolicyPool(actor, reference, device)
-    executables.sync(policy_pool)
-    collector = FullTrajectoryCollector(
-        config.collection,
-        policy_pool,
-        executables,
-        behavior,
-        device,
-        seed=(
-            int(checkpoint["collector_next_seed"])
-            if args.resume is not None
-            else run_seed + 0x100000
-        ),
-    )
-
-    (output_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "experiment": experiment,
-                "run": config.state_dict(),
-                "actor": asdict(actor.config),
-                "fixed_seeds": fixed_seeds,
-                "fresh_seeds": fresh_seeds,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    if args.resume is None:
-        _synchronize()
-        baseline_started = time.perf_counter()
-        baseline_fixed = evaluate_panel(
-            actor,
-            reference,
-            policy_pool,
-            executables,
-            behavior,
-            device,
-            seeds=fixed_seeds,
-            games=config.evaluation_games,
-            envs=config.collection.envs,
-        )
-        baseline_fresh = evaluate_panel(
-            actor,
-            reference,
-            policy_pool,
-            executables,
-            behavior,
-            device,
-            seeds=fresh_seeds,
-            games=config.evaluation_games,
-            envs=config.collection.envs,
-        )
-        best_fixed = baseline_fixed
-        best_fresh = baseline_fresh
-        anchor = collector.collect(config.anchor_games)
-        replay.add_trajectories(anchor.trajectories, anchor=True, trusted=True)
-        replay_summary = replay.composition("train")
-        write(
-            {
-                "phase": "baseline",
-                "experiment": experiment,
-                "fixed_evaluation": baseline_fixed,
-                "fresh_evaluation": baseline_fresh,
-                "replay_states": replay_summary["states"],
-                "replay": replay_summary,
-                "collection_seconds": anchor.elapsed_seconds,
-                "environment_steps_per_second": anchor.environment_steps
-                / max(anchor.elapsed_seconds, 1e-9),
-                "elapsed_seconds": time.perf_counter() - baseline_started,
-            }
-        )
-        warmup, warmup_seconds = _train_critics(
-            replay,
-            sampler,
-            critics,
-            optimizers,
-            config,
-            device,
-            config.learning.initial_critic_steps,
-            oracle=oracle,
-            enable_oracle_distillation=False,
-            show_progress=config.learning.initial_critic_steps >= 50,
-        )
-        critic_steps += config.learning.initial_critic_steps
-        validation = _critic_validation(
-            replay,
-            critics,
-            config,
-            device,
-            seed=run_seed + 31,
-            oracle=oracle,
-        )
-        partial_ready, partial_gate = critic_ready(
-            validation, critic_steps, config.learning
-        )
-        ready, gate, teacher_ready_streak = resolve_actor_gate(
-            experiment,
-            validation,
-            critic_steps,
-            config.learning,
-            teacher_ready_streak,
-        )
-        write(
-            {
-                "phase": "critic_warmup",
-                "critic_steps": critic_steps,
-                "critic": warmup,
-                "critic_validation": validation,
-                "actor_ready": ready,
-                "actor_gate": gate,
-                "partial_critic_ready": partial_ready,
-                "partial_critic_gate": partial_gate,
-                "teacher_ready_streak": teacher_ready_streak,
-                "oracle_distillation_active": False,
-                "training_seconds": warmup_seconds,
-            }
-        )
-
-    def checkpoint_values() -> dict[str, object]:
-        return {
-            "experiment": experiment,
-            "config": config,
-            "actor": actor,
-            "reference": reference,
-            "critics": critics,
-            "oracle": oracle,
-            "optimizers": optimizers,
-            "policy_pool": policy_pool,
-            "behavior": behavior,
-            "sampler": sampler,
-            "replay": replay,
-            "iteration": iteration,
-            "critic_steps": critic_steps,
-            "actor_updates": actor_updates,
-            "policy_version": policy_version,
-            "teacher_ready_streak": teacher_ready_streak,
-            "collector_next_seed": collector.next_seed,
-            "run_seed": run_seed,
-            "fixed_seeds": fixed_seeds,
-            "fresh_seeds": fresh_seeds,
-            "baseline_fixed": baseline_fixed,
-            "baseline_fresh": baseline_fresh,
-            "best_fixed": best_fixed,
-            "best_fresh": best_fresh,
-        }
-
-    if args.resume is None:
-        save_policy(output_dir / "best.pt", actor)
-        _save_checkpoint(output_dir / "latest.pt", **checkpoint_values())
-
-    interrupted = False
-    try:
-        while True:
-            iteration += 1
-            iteration_started = time.perf_counter()
-            oracle_distillation_active = (
-                experiment == "b"
-                and teacher_ready_streak >= config.learning.teacher_readiness_streak
-            )
-            critic_stats, critic_seconds = _train_critics(
-                replay,
-                sampler,
-                critics,
-                optimizers,
-                config,
-                device,
-                config.learning.critic_steps_per_iteration,
-                oracle=oracle,
-                enable_oracle_distillation=oracle_distillation_active,
-            )
-            critic_steps += config.learning.critic_steps_per_iteration
-            validation = _critic_validation(
-                replay,
-                critics,
-                config,
-                device,
-                seed=run_seed + 31,
-                oracle=oracle,
-            )
-            partial_ready, partial_gate = critic_ready(
-                validation, critic_steps, config.learning
-            )
-
-            # Experiment C must first accumulate and validate counterfactual
-            # action evidence while Actor remains frozen. These targets join
-            # Critic replay immediately and can only unlock a later Actor step.
-            mc_record: dict[str, object] | None = None
-            mc_validation_metrics: dict[str, object] | None = None
-            mc_critic_stats: dict[str, float] | None = None
-            mc_critic_seconds = 0.0
-            mc_validation_status: dict[str, object] | None = None
-            if experiment == "c" and partial_ready:
-                targets, mc_stats = collect_mc_targets(
-                    replay,
-                    actor,
-                    reference,
-                    critics,
-                    device,
-                    config.mc,
-                    split="train",
-                    seed=run_seed + iteration * 0x100003,
-                )
-                replay.add_mc_targets(targets)
-                mc_record = asdict(mc_stats)
-                mc_validation_status = _mc_validation_corpus_status(
-                    replay, config.learning
-                )
-                if (
-                    iteration % config.mc_validation_every == 0
-                    and not bool(mc_validation_status["validation_frozen"])
-                ):
-                    validation_targets, validation_mc = collect_mc_targets(
-                        replay,
-                        actor,
-                        reference,
-                        critics,
-                        device,
-                        config.mc,
-                        split="validation",
-                        seed=run_seed + iteration * 0x100019,
-                        anchor_only=True,
-                        exclude_existing_states=True,
-                    )
-                    replay.add_mc_targets(validation_targets)
-                    mc_record["validation"] = asdict(validation_mc)
-                    mc_validation_status = _mc_validation_corpus_status(
-                        replay, config.learning
-                    )
-
-                mc_critic_stats, mc_critic_seconds = _train_mc_critics(
-                    replay,
-                    critics,
-                    optimizers,
-                    config,
-                    device,
-                    seed=run_seed + iteration * 0x10002D,
-                )
-                mc_record["critic_update"] = mc_critic_stats
-                if mc_critic_stats is not None:
-                    validation = _critic_validation(
-                        replay,
-                        critics,
-                        config,
-                        device,
-                        seed=run_seed + 31,
-                        oracle=oracle,
-                    )
-                    partial_ready, partial_gate = critic_ready(
-                        validation, critic_steps, config.learning
-                    )
-
-            mc_train_targets = replay.mc_target_count("train")
-            if experiment == "c":
-                if mc_validation_status is None:
-                    mc_validation_status = _mc_validation_corpus_status(
-                        replay, config.learning
-                    )
-                mc_validation_targets = int(
-                    mc_validation_status["validation_targets"]
-                )
-                mc_batch = replay.mc_validation_batch(
-                    config.validation_states,
-                    seed=run_seed + iteration * 0x100021,
-                )
-                if mc_batch is not None:
-                    mc_validation_metrics = validate_critics(
-                        critics,
-                        mc_batch,
-                        device,
-                        microbatch_size=config.learning.microbatch_size,
-                        expectile=config.learning.expectile,
-                    )
-                if mc_record is None:
-                    mc_record = {}
-                mc_record["train_targets"] = mc_train_targets
-                mc_record.update(mc_validation_status)
-                mc_record["validation_metrics"] = mc_validation_metrics
-            else:
-                mc_validation_targets = 0
-
-            ready, gate, teacher_ready_streak = resolve_actor_gate(
-                experiment,
-                validation,
-                critic_steps,
-                config.learning,
-                teacher_ready_streak,
-                mc_validation=mc_validation_metrics,
-                mc_train_targets=mc_train_targets,
-                mc_validation_targets=mc_validation_targets,
-            )
-            if (
-                experiment == "c"
-                and partial_ready
-                and mc_validation_status is not None
-                and not bool(mc_validation_status["validation_frozen"])
-            ):
-                ready = False
-                gate = _mc_validation_corpus_gate(
-                    mc_validation_status, config.learning
-                )
-                teacher_ready_streak = 0
-            teacher_candidate_ready: bool | None = None
-            teacher_candidate_gate: str | None = None
-            if experiment == "b":
-                teacher_candidate_ready, teacher_candidate_gate = oracle_teacher_ready(
-                    validation, config.learning
-                )
-            elif experiment == "c":
-                teacher_candidate_ready, teacher_candidate_gate = mc_teacher_ready(
-                    mc_validation_metrics,
-                    train_targets=mc_train_targets,
-                    validation_targets=mc_validation_targets,
-                    config=config.learning,
-                )
-                if (
-                    mc_validation_status is not None
-                    and not bool(mc_validation_status["validation_frozen"])
-                ):
-                    teacher_candidate_ready = False
-                    teacher_candidate_gate = _mc_validation_corpus_gate(
-                        mc_validation_status, config.learning
-                    )
-            actor_stats: dict[str, float] | None = None
-            actor_seconds = 0.0
-            if ready:
-                actor_stats, actor_seconds = _train_actor(
-                    replay,
-                    sampler,
-                    actor,
-                    reference,
-                    critics,
-                    optimizers,
-                    config,
-                    device,
-                    oracle=oracle,
-                    use_oracle_teacher=experiment == "b",
-                )
-                actor_updates += 1
-                policy_version += 1
-                policy_pool.update_current(
-                    policy_version, artifact=None, update=actor_updates
-                )
-                executables.update_actor(actor)
-
-            # New on-policy-ish trajectories are generated immediately after
-            # every trusted Actor extraction (and also while Critic is held).
-            collected = collector.collect(config.games_per_iteration)
-            replay.add_trajectories(
-                collected.trajectories, anchor=False, trusted=True
-            )
-            if mc_record is not None:
-                mc_record["train_targets_after_trim"] = replay.mc_target_count(
-                    "train"
-                )
-
-            snapshot = None
-            if actor_stats is not None and policy_pool.snapshot_due(actor_updates):
-                snapshot_path = (
-                    output_dir
-                    / "snapshots"
-                    / f"policy-v{policy_version:06d}-a{actor_updates:06d}.pt"
-                )
-                save_policy(snapshot_path, actor)
-                descriptor = policy_pool.add_snapshot(
-                    update=actor_updates,
-                    artifact=str(snapshot_path.resolve()),
-                )
-                executables.register_snapshot(descriptor, actor)
-                executables.sync(policy_pool)
-                snapshot = descriptor.state_dict()
-
-            replay_summary = replay.composition("train")
-            record: dict[str, object] = {
-                "phase": "iteration",
-                "experiment": experiment,
-                "iteration": iteration,
-                "critic_steps": critic_steps,
-                "actor_updates": actor_updates,
-                "policy_version": policy_version,
-                "actor_ready": ready,
-                "actor_gate": gate,
-                "partial_critic_ready": partial_ready,
-                "partial_critic_gate": partial_gate,
-                "teacher_candidate_ready": teacher_candidate_ready,
-                "teacher_candidate_gate": teacher_candidate_gate,
-                "teacher_ready_streak": teacher_ready_streak,
-                "oracle_distillation_active": oracle_distillation_active,
-                "critic": critic_stats,
-                "mc_critic": mc_critic_stats,
-                "critic_validation": validation,
-                "actor": actor_stats,
-                "collection": {
-                    "trajectories": len(collected.trajectories),
-                    "environment_steps": collected.environment_steps,
-                    "seconds": collected.elapsed_seconds,
-                    "states_per_second": collected.environment_steps
-                    / max(collected.elapsed_seconds, 1e-9),
-                    "source_counts": collected.source_counts,
-                },
-                "replay_states": replay_summary["states"],
-                "replay": replay_summary,
-                "critic_seconds": critic_seconds,
-                "mc_critic_seconds": mc_critic_seconds,
-                "actor_seconds": actor_seconds,
-                "training_states_per_second": (
-                    config.learning.critic_batch_size
-                    * config.learning.critic_steps_per_iteration
-                    + (
-                        config.learning.mc_critic_batch_size
-                        * config.learning.mc_critic_steps_per_iteration
-                        if mc_critic_stats is not None
-                        else 0
-                    )
-                    + (
-                        config.learning.actor_batch_size
-                        * config.learning.actor_steps_per_iteration
-                        if ready
-                        else 0
-                    )
-                )
-                / max(critic_seconds + mc_critic_seconds + actor_seconds, 1e-9),
-                "mc": mc_record,
-                "snapshot": snapshot,
-                "iteration_seconds": time.perf_counter() - iteration_started,
-            }
-
-            evaluated = _should_evaluate(
-                iteration,
-                config.evaluation_every,
-                smoke=args.smoke,
-            )
-            improved = False
-            if evaluated:
-                fixed_evaluation = evaluate_panel(
-                    actor,
-                    reference,
-                    policy_pool,
-                    executables,
-                    behavior,
-                    device,
-                    seeds=fixed_seeds,
-                    games=config.evaluation_games,
-                    envs=config.collection.envs,
-                )
-                fresh_evaluation = evaluate_panel(
-                    actor,
-                    reference,
-                    policy_pool,
-                    executables,
-                    behavior,
-                    device,
-                    seeds=fresh_seeds,
-                    games=config.evaluation_games,
-                    envs=config.collection.envs,
-                )
-                record["fixed_evaluation"] = fixed_evaluation
-                record["fresh_evaluation"] = fresh_evaluation
-                improved = better_on_both_panels(
-                    fixed_evaluation,
-                    fresh_evaluation,
-                    best_fixed,
-                    best_fresh,
-                )
-                if improved:
-                    best_fixed = fixed_evaluation
-                    best_fresh = fresh_evaluation
-                record["best_fixed_evaluation"] = best_fixed
-                record["best_fresh_evaluation"] = best_fresh
-
-            write(record)
-            if improved:
-                save_policy(output_dir / "best.pt", actor)
-            if iteration % config.checkpoint_every == 0 or evaluated:
-                _save_checkpoint(output_dir / "latest.pt", **checkpoint_values())
-            if args.smoke:
-                break
-    except KeyboardInterrupt:
-        interrupted = True
-    _save_checkpoint(output_dir / "latest.pt", **checkpoint_values())
-    write(
-        {
-            "phase": "stopped",
-            "iteration": iteration,
-            "critic_steps": critic_steps,
-            "actor_updates": actor_updates,
-            "reason": "user_interrupt" if interrupted else "smoke_complete",
-            "best_fixed_evaluation": best_fixed,
-            "best_fresh_evaluation": best_fresh,
-        }
-    )
-
-
-def main() -> None:
-    args = build_parser().parse_args()
-    print("CUDA eager mode; torch.compile disabled", flush=True)
-    run(args)
+def main(argv: Sequence[str] | None = None) -> None:
+    run(build_parser().parse_args(argv))
 
 
 if __name__ == "__main__":

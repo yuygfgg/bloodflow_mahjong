@@ -149,7 +149,16 @@ class Batch:
         self,
         indices: npt.NDArray[np.uint32],
     ) -> Batch: ...
+    def remove_indices_swap(
+        self,
+        indices: npt.NDArray[np.uint32],
+    ) -> list[int]: ...
     def resample_information_sets(
+        self,
+        indices: npt.NDArray[np.uint32],
+        seeds: npt.NDArray[np.uint64],
+    ) -> Batch: ...
+    def resample_live_walls(
         self,
         indices: npt.NDArray[np.uint32],
         seeds: npt.NDArray[np.uint64],
@@ -160,6 +169,11 @@ class Batch:
     ) -> None: ...
     def legal_action_masks_into(self, output: npt.NDArray[np.uint64]) -> None: ...
     def simple_rule_actions_into(self, output: npt.NDArray[np.uint8]) -> None: ...
+    def simple_rule_actions_masked_into(
+        self,
+        enabled: npt.NDArray[np.uint8],
+        output: npt.NDArray[np.uint8],
+    ) -> None: ...
     def hand_analysis_into(
         self,
         shanten: npt.NDArray[np.int8],
@@ -176,6 +190,12 @@ class Batch:
         events: npt.NDArray[np.int32],
         lengths: npt.NDArray[np.uint16],
     ) -> None: ...
+    def events_masked_into(
+        self,
+        history_seat_masks: npt.NDArray[np.uint8],
+        events: npt.NDArray[np.int32],
+        lengths: npt.NDArray[np.uint16],
+    ) -> None: ...
     def step_events_into(
         self,
         events: npt.NDArray[np.int32],
@@ -183,6 +203,12 @@ class Batch:
     ) -> None: ...
     def step_into(
         self,
+        actions: npt.NDArray[np.uint8],
+        records: npt.NDArray[np.int64],
+    ) -> None: ...
+    def step_masked_into(
+        self,
+        enabled: npt.NDArray[np.uint8],
         actions: npt.NDArray[np.uint8],
         records: npt.NDArray[np.int64],
     ) -> None: ...
