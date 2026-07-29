@@ -1,0 +1,19 @@
+[package]
+name = "bloodflow-mahjong-rule-tournament"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Balanced tournament evaluator for deterministic rule policies"
+rust-version = "1.85"
+publish = false
+
+[[bin]]
+name = "rule-tournament"
+path = "src/main.rs"
+
+[dependencies]
+bloodflow-mahjong = { path = "../../core", features = ["rule-ev-analysis"] }
+clap.workspace = true
+rand = "0.9"
+rand_chacha = "0.9"
+rayon = "1.11"

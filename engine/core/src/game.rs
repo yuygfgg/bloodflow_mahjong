@@ -15,7 +15,7 @@ use rayon::prelude::*;
 use thiserror::Error;
 
 const STARTING_SCORE: i64 = 10_000;
-const SCORE_UNIT: i64 = 100;
+pub(crate) const SCORE_UNIT: i64 = 100;
 /// Increment whenever engine rule semantics or deterministic initialization
 /// change in a way that can invalidate a stored action-sequence replay.
 pub const ENGINE_RULES_VERSION: u32 = 1;
@@ -398,6 +398,13 @@ enum Stage {
     Finished,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HiddenHandConstraint {
+    seat: Seat,
+    tile_count: usize,
+    forbidden_suit: Suit,
+}
+
 /// Authoritative environment state.
 ///
 /// This type intentionally exposes perfect information for simulation,
@@ -417,6 +424,10 @@ pub struct Game {
     discards: [u8; WALL_TILE_COUNT],
     discard_owners: [u8; WALL_TILE_COUNT],
     discard_len: u8,
+    // A discard remains in the river after a discard win, while the winner's
+    // recorded hand also contains that same physical tile. One entry is kept
+    // for every such hand reference so public tile counts can remove it.
+    discard_win_references: [u8; TILE_KIND_COUNT],
     transition_draw: Option<DrawEvent>,
     transition_discard: Option<DiscardEvent>,
     events: [StoredEvent; EVENT_HISTORY_CAPACITY],
@@ -468,6 +479,7 @@ impl Game {
             discards: [0; WALL_TILE_COUNT],
             discard_owners: [0; WALL_TILE_COUNT],
             discard_len: 0,
+            discard_win_references: [0; TILE_KIND_COUNT],
             transition_draw: None,
             transition_discard: None,
             events: [StoredEvent::EMPTY; EVENT_HISTORY_CAPACITY],
@@ -519,12 +531,13 @@ impl Game {
     /// Samples a determinization from the current actor's information set.
     ///
     /// The current actor's complete visible observation is held fixed. Other
-    /// players' non-locked concealed tiles and the live wall are shuffled as a
-    /// single unknown pool while preserving concealed sizes. During exchange,
-    /// players with already-selected tiles are fixed so their pending exchange
-    /// remains valid. During response windows all hands are fixed because the
-    /// pending responder set encodes hand-dependent legality; the live wall is
-    /// still independently resampled.
+    /// players' non-locked concealed tiles and the live wall are sampled from
+    /// one unknown pool while preserving concealed sizes and facts implied by
+    /// public missing-suit discards. During exchange, players with already
+    /// selected tiles are fixed so their pending exchange remains valid.
+    /// During response windows all hands are fixed because the pending
+    /// responder set encodes hand-dependent legality; the live wall is still
+    /// independently resampled.
     pub fn resample_information_set(&self, seed: u64) -> Result<Self, GameError> {
         let viewer = self
             .decision()
@@ -571,21 +584,76 @@ impl Game {
                 .copied(),
         );
 
+        // Canonicalize the multiset before seeded sampling. Hidden source
+        // assignments must not affect a sample from the same public state.
+        unknown.sort_unstable();
         let mut rng = Rng::new(seed);
-        rng.shuffle(&mut unknown);
+
+        let constraints: Vec<_> = Seat::ALL
+            .into_iter()
+            .filter(|&seat| fixed_players & seat_bit(seat) == 0)
+            .filter_map(|seat| {
+                self.known_empty_missing_suit(seat)
+                    .map(|forbidden_suit| HiddenHandConstraint {
+                        seat,
+                        tile_count: movable_counts[seat.index()],
+                        forbidden_suit,
+                    })
+            })
+            .collect();
+        let constrained_allocations =
+            sample_constrained_suit_allocations(&unknown, &constraints, &mut rng);
+        let mut suit_pools: [Vec<u8>; 3] = core::array::from_fn(|_| Vec::new());
+        for tile in unknown {
+            suit_pools[usize::from(tile / 9)].push(tile);
+        }
+        for pool in &mut suit_pools {
+            rng.shuffle(pool);
+        }
+
+        let mut constrained_players = 0_u8;
+        for (constraint, allocation) in constraints.iter().zip(constrained_allocations) {
+            constrained_players |= seat_bit(constraint.seat);
+            let player = &mut sampled.players[constraint.seat.index()];
+            for (suit, count) in allocation.into_iter().enumerate() {
+                for _ in 0..count {
+                    let tile = suit_pools[suit]
+                        .pop()
+                        .expect("a sampled suit allocation fits the unknown pool");
+                    player.concealed[tile as usize] += 1;
+                }
+            }
+        }
+
+        let mut remaining: Vec<_> = suit_pools.into_iter().flatten().collect();
+        rng.shuffle(&mut remaining);
         let mut cursor = 0;
         for seat in Seat::ALL {
+            if constrained_players & seat_bit(seat) != 0 {
+                continue;
+            }
             for _ in 0..movable_counts[seat.index()] {
-                let tile = unknown[cursor] as usize;
+                let tile = remaining[cursor] as usize;
                 sampled.players[seat.index()].concealed[tile] += 1;
                 cursor += 1;
             }
         }
         let wall_len = self.wall_remaining();
         sampled.wall[self.wall_head as usize..self.wall_tail as usize]
-            .copy_from_slice(&unknown[cursor..cursor + wall_len]);
-        debug_assert_eq!(cursor + wall_len, unknown.len());
+            .copy_from_slice(&remaining[cursor..cursor + wall_len]);
+        debug_assert_eq!(cursor + wall_len, remaining.len());
         Ok(sampled)
+    }
+
+    fn known_empty_missing_suit(&self, seat: Seat) -> Option<Suit> {
+        let missing = self.players[seat.index()].missing?;
+        (0..self.discard_len as usize)
+            .rev()
+            .find(|&index| self.discard_owners[index] == seat.as_u8())
+            .and_then(|index| {
+                let tile = Tile::new(self.discards[index]).expect("stored tile is valid");
+                (tile.suit() != missing).then_some(missing)
+            })
     }
 
     /// Clones the state and independently shuffles only the unseen live wall.
@@ -1001,6 +1069,18 @@ impl Game {
         &self.players[seat.index()].concealed
     }
 
+    /// Returns the number of concealed tile references held by a player.
+    ///
+    /// The count is public in the observation schema. It does not reveal tile
+    /// identities and remains valid after repeated blood-flow wins.
+    pub(crate) fn concealed_len(&self, seat: Seat) -> usize {
+        self.players[seat.index()]
+            .concealed
+            .iter()
+            .map(|&count| usize::from(count))
+            .sum()
+    }
+
     pub fn locked(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
         &self.players[seat.index()].locked
     }
@@ -1050,6 +1130,41 @@ impl Game {
                 Seat::new(self.discard_owners[index]).expect("stored seat is valid"),
                 Tile::new(self.discards[index]).expect("stored tile is valid"),
             )
+        })
+    }
+
+    /// Counts tiles known to `viewer` from private and public information.
+    ///
+    /// The result includes the viewer's concealed hand, other players' locked
+    /// tiles, exposed meld contributions, and the discard river. A discarded
+    /// tile claimed by one or more winners is counted once even though the
+    /// authoritative winner hands retain a reference to it.
+    pub(crate) fn visible_tile_counts(&self, viewer: Seat) -> [u8; TILE_KIND_COUNT] {
+        let mut counts = [0_u16; TILE_KIND_COUNT];
+        add_tile_counts(&mut counts, &self.players[viewer.index()].concealed);
+
+        for seat in Seat::ALL {
+            let player = &self.players[seat.index()];
+            if seat != viewer {
+                add_tile_counts(&mut counts, &player.locked);
+            }
+            for meld in player.melds.iter().flatten() {
+                let amount = match meld.kind {
+                    MeldKind::Pong => 2,
+                    MeldKind::ExposedKong | MeldKind::AddedKong => 3,
+                    MeldKind::ConcealedKong => 4,
+                };
+                counts[meld.tile.index()] += amount;
+            }
+        }
+        for &tile in &self.discards[..self.discard_len as usize] {
+            counts[tile as usize] += 1;
+        }
+
+        core::array::from_fn(|index| {
+            let known = counts[index].saturating_sub(u16::from(self.discard_win_references[index]));
+            debug_assert!(known <= u16::from(TILE_COPIES));
+            known.min(u16::from(u8::MAX)) as u8
         })
     }
 
@@ -1762,6 +1877,10 @@ impl Game {
 
         let mut last_winner = source;
         for winner in seats_in_mask_after(source, winners) {
+            if matches!(kind, ReactionKind::Discard { .. }) {
+                self.discard_win_references[tile.index()] =
+                    self.discard_win_references[tile.index()].saturating_add(1);
+            }
             self.players[winner.index()].concealed[tile.index()] =
                 self.players[winner.index()].concealed[tile.index()].saturating_add(1);
             let flags = match kind {
@@ -1834,7 +1953,7 @@ impl Game {
         is_winning(&player.concealed, &melds[..len], required)
     }
 
-    fn can_player_win_with_added_tile(&self, actor: Seat, tile: Tile) -> bool {
+    pub(crate) fn can_player_win_with_added_tile(&self, actor: Seat, tile: Tile) -> bool {
         let player = &self.players[actor.index()];
         if player.missing_count() != 0 || player.missing == Some(tile.suit()) {
             return false;
@@ -3249,6 +3368,129 @@ fn relative_seat(viewer: Seat, seat: Seat) -> u8 {
     ((seat.index() + PLAYER_COUNT - viewer.index()) % PLAYER_COUNT) as u8
 }
 
+fn add_tile_counts(target: &mut [u16; TILE_KIND_COUNT], source: &[u8; TILE_KIND_COUNT]) {
+    for (target, source) in target.iter_mut().zip(source.iter().copied()) {
+        *target += u16::from(source);
+    }
+}
+
+fn sample_constrained_suit_allocations(
+    unknown: &[u8],
+    constraints: &[HiddenHandConstraint],
+    rng: &mut Rng,
+) -> Vec<[usize; 3]> {
+    let mut remaining = [0_usize; 3];
+    for &tile in unknown {
+        remaining[usize::from(tile / 9)] += 1;
+    }
+
+    let mut sampled = Vec::with_capacity(constraints.len());
+    for (index, constraint) in constraints.iter().enumerate() {
+        let options =
+            allowed_suit_allocations(remaining, constraint.tile_count, constraint.forbidden_suit);
+        let weights: Vec<_> = options
+            .iter()
+            .map(|&allocation| {
+                allocation_weight(remaining, allocation)
+                    * constrained_completion_weight(
+                        constraints,
+                        index + 1,
+                        subtract_allocation(remaining, allocation),
+                    )
+            })
+            .collect();
+        let total: f64 = weights.iter().sum();
+        assert!(
+            total.is_finite() && total > 0.0,
+            "public hand constraints are feasible"
+        );
+
+        let mut draw = rng.unit_f64() * total;
+        let selected = weights
+            .iter()
+            .position(|&weight| {
+                if draw < weight {
+                    true
+                } else {
+                    draw -= weight;
+                    false
+                }
+            })
+            .unwrap_or(weights.len() - 1);
+        let allocation = options[selected];
+        remaining = subtract_allocation(remaining, allocation);
+        sampled.push(allocation);
+    }
+    sampled
+}
+
+fn constrained_completion_weight(
+    constraints: &[HiddenHandConstraint],
+    index: usize,
+    remaining: [usize; 3],
+) -> f64 {
+    let Some(constraint) = constraints.get(index) else {
+        return 1.0;
+    };
+    allowed_suit_allocations(remaining, constraint.tile_count, constraint.forbidden_suit)
+        .into_iter()
+        .map(|allocation| {
+            allocation_weight(remaining, allocation)
+                * constrained_completion_weight(
+                    constraints,
+                    index + 1,
+                    subtract_allocation(remaining, allocation),
+                )
+        })
+        .sum()
+}
+
+fn allowed_suit_allocations(
+    remaining: [usize; 3],
+    tile_count: usize,
+    forbidden_suit: Suit,
+) -> Vec<[usize; 3]> {
+    let allowed = match forbidden_suit {
+        Suit::Characters => [Suit::Bamboo as usize, Suit::Dots as usize],
+        Suit::Bamboo => [Suit::Characters as usize, Suit::Dots as usize],
+        Suit::Dots => [Suit::Characters as usize, Suit::Bamboo as usize],
+    };
+    let first = allowed[0];
+    let second = allowed[1];
+    let minimum_first = tile_count.saturating_sub(remaining[second]);
+    let maximum_first = tile_count.min(remaining[first]);
+    (minimum_first..=maximum_first)
+        .map(|first_count| {
+            let mut allocation = [0_usize; 3];
+            allocation[first] = first_count;
+            allocation[second] = tile_count - first_count;
+            allocation
+        })
+        .collect()
+}
+
+fn allocation_weight(remaining: [usize; 3], allocation: [usize; 3]) -> f64 {
+    remaining
+        .into_iter()
+        .zip(allocation)
+        .map(|(available, selected)| combination(available, selected))
+        .product()
+}
+
+fn subtract_allocation(remaining: [usize; 3], allocation: [usize; 3]) -> [usize; 3] {
+    core::array::from_fn(|suit| remaining[suit] - allocation[suit])
+}
+
+fn combination(total: usize, selected: usize) -> f64 {
+    if selected > total {
+        return 0.0;
+    }
+    let selected = selected.min(total - selected);
+    (0..selected).fold(1.0, |value, index| {
+        value * (total - index) as f64 / (index + 1) as f64
+    })
+}
+
 fn first_seat_in_mask(source: Seat, mask: u8) -> Option<Seat> {
     (1..=PLAYER_COUNT as u8)
         .map(|offset| source.offset(offset))
@@ -3663,6 +3905,55 @@ mod tests {
     }
 
     #[test]
+    fn visible_tile_counts_deduplicate_each_discard_win_reference() {
+        let mut game = constructed_game();
+        let first_winner = Seat::ALL[1];
+        let second_winner = Seat::ALL[2];
+        let viewer = Seat::ALL[3];
+        let winning_tile = make_plain_wait(&mut game.players[first_winner.index()]);
+        assert_eq!(
+            make_plain_wait(&mut game.players[second_winner.index()]),
+            winning_tile
+        );
+        add_tile(&mut game.players[Seat::EAST.index()], winning_tile, 1);
+        game.stage = Stage::Turn {
+            actor: Seat::EAST,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(winning_tile)).unwrap();
+        game.step(Action::Hu).unwrap();
+        game.step(Action::Hu).unwrap();
+
+        assert_eq!(game.discard_win_references[winning_tile.index()], 2);
+        assert_eq!(game.locked(first_winner)[winning_tile.index()], 2);
+        assert_eq!(game.locked(second_winner)[winning_tile.index()], 2);
+        assert_eq!(game.visible_tile_counts(viewer)[winning_tile.index()], 3);
+    }
+
+    #[test]
+    fn robbed_added_kong_does_not_create_a_discard_win_reference() {
+        let mut game = constructed_game();
+        let winner = Seat::ALL[1];
+        let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
+        add_tile(&mut game.players[Seat::EAST.index()], winning_tile, 1);
+
+        game.resolve_discard_wins(
+            Seat::EAST,
+            winning_tile,
+            seat_bit(winner),
+            ReactionKind::AddedKong,
+        );
+
+        assert_eq!(game.discard_win_references[winning_tile.index()], 0);
+        assert_eq!(
+            game.visible_tile_counts(Seat::ALL[2])[winning_tile.index()],
+            2
+        );
+    }
+
+    #[test]
     fn multiple_hu_suppresses_melds_and_resumes_after_the_last_winner() {
         let mut game = constructed_game();
         let first_winner = Seat::ALL[1];
@@ -4005,6 +4296,34 @@ mod tests {
             sampled.step_id(action).unwrap();
         }
         assert_eq!(sampled.phase(), Phase::Finished);
+    }
+
+    #[test]
+    fn information_set_resampling_respects_proven_empty_missing_suits() {
+        let mut game = Game::new(913);
+        let constrained = loop {
+            if game.phase() == Phase::Turn {
+                let actor = game.decision().unwrap().actor;
+                if let Some(constraint) = Seat::ALL
+                    .into_iter()
+                    .filter(|&seat| seat != actor)
+                    .find_map(|seat| game.known_empty_missing_suit(seat).map(|suit| (seat, suit)))
+                {
+                    break constraint;
+                }
+            }
+            let action = game
+                .simple_rule_action()
+                .expect("the seeded game reaches a constrained turn");
+            game.step_id(action).unwrap();
+        };
+        let (seat, forbidden_suit) = constrained;
+        let start = forbidden_suit as usize * 9;
+
+        for seed in 0..128 {
+            let sampled = game.resample_information_set(seed).unwrap();
+            assert_eq!(sampled.concealed(seat)[start..start + 9], [0; 9]);
+        }
     }
 
     #[test]

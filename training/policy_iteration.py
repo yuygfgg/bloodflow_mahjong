@@ -1,8 +1,8 @@
 """Large-independent-batch conservative policy iteration primitives.
 
 Each update estimates every legal action on many independent hidden deals,
-accumulates one full-batch gradient, performs exactly one AdamW step, and then
-scales that direction to a KL trust region on disjoint calibration states.
+accumulates one full-batch gradient, performs exactly one optimizer step, and
+then scales that direction to a KL trust region on disjoint calibration states.
 """
 
 from __future__ import annotations
@@ -38,6 +38,17 @@ STATE_CACHE_VERSION = 1
 KL_TARGET_RELATIVE_TOLERANCE = 0.05
 WORLD_SEED_DOMAIN = 0xC71E_0001
 UINT64_MASK = (1 << 64) - 1
+WORLD_SAMPLING_MODES = frozenset({"live_wall", "information_set"})
+POLICY_DIRECTION_OBJECTIVES = frozenset(
+    {
+        "expected_q",
+        "search_ce",
+        "uniform_ce",
+        "hard_ce",
+        "softmax_ce",
+        "mirror_ce",
+    }
+)
 TargetProgress = Callable[[int, Mapping[str, object]], None]
 
 
@@ -430,6 +441,28 @@ def _live_wall_world_group(source: Any, seeds: np.ndarray) -> Any:
     return worlds
 
 
+def _information_set_world_group(source: Any, seeds: np.ndarray) -> Any:
+    """Sample determinizations from each current actor's information set."""
+
+    seeds = np.ascontiguousarray(seeds, dtype=np.uint64)
+    if seeds.ndim != 2 or not seeds.shape[0] or not seeds.shape[1]:
+        raise ValueError("world seeds must have shape [queries, worlds]")
+    if len(source) != seeds.shape[0]:
+        raise ValueError("source batch and world-seed queries do not match")
+    source_indices = np.repeat(
+        np.arange(len(source), dtype=np.uint32), seeds.shape[1]
+    )
+    return source.resample_information_sets(source_indices, seeds.reshape(-1))
+
+
+def _sample_world_group(source: Any, seeds: np.ndarray, mode: str) -> Any:
+    if mode == "live_wall":
+        return _live_wall_world_group(source, seeds)
+    if mode == "information_set":
+        return _information_set_world_group(source, seeds)
+    raise ValueError(f"unsupported world sampling mode {mode!r}")
+
+
 def estimate_counterfactual_batch(
     queries: Sequence[PolicyQuery],
     actor: BloodFlowTransformer,
@@ -441,6 +474,7 @@ def estimate_counterfactual_batch(
     seed: int,
     query_batch_size: int = 64,
     inference_batch_size: int = 512,
+    world_sampling: str = "live_wall",
     on_progress: TargetProgress | None = None,
 ) -> tuple[CounterfactualBatch, dict[str, object]]:
     if (
@@ -449,6 +483,7 @@ def estimate_counterfactual_batch(
         or world_chunk <= 0
         or query_batch_size <= 0
         or inference_batch_size <= 0
+        or world_sampling not in WORLD_SAMPLING_MODES
     ):
         raise ValueError("queries and rollout batch sizes must be valid")
     query_ids: list[int] = []
@@ -516,7 +551,7 @@ def estimate_counterfactual_batch(
             )
 
         grouped_result = rollout_query_group_chunked(
-            _live_wall_world_group(source, seed_matrix),
+            _sample_world_group(source, seed_matrix, world_sampling),
             action_sets,
             actor,
             device,
@@ -598,6 +633,7 @@ def estimate_counterfactual_batch(
     return batch, {
         "states": len(batch),
         "worlds": worlds,
+        "world_sampling": world_sampling,
         "rollout_states": rollout_states,
         "rollout_seconds": rollout_seconds,
         "rollout_states_per_second": rollout_states / max(rollout_seconds, 1e-9),
@@ -784,11 +820,16 @@ def cached_counterfactual_corpus(
     shard_size: int,
     query_batch_size: int = 64,
     inference_batch_size: int = 512,
+    world_sampling: str = "live_wall",
     on_progress: TargetProgress | None = None,
 ) -> tuple[CounterfactualBatch, dict[str, object]]:
     """Build or resume immutable target shards for one frozen policy version."""
 
-    if shard_size <= 0 or not fingerprint:
+    if (
+        shard_size <= 0
+        or not fingerprint
+        or world_sampling not in WORLD_SAMPLING_MODES
+    ):
         raise ValueError("target cache needs a shard size and fingerprint")
     directory.mkdir(parents=True, exist_ok=True)
     manifest_path = directory / "manifest.json"
@@ -804,6 +845,10 @@ def cached_counterfactual_corpus(
         "query_batch_size": query_batch_size,
         "inference_batch_size": inference_batch_size,
     }
+    # Preserve compatibility with existing live-wall caches while ensuring an
+    # information-set run can never silently reuse them (or vice versa).
+    if world_sampling != "live_wall":
+        expected["world_sampling"] = world_sampling
     if manifest_path.exists():
         actual = json.loads(manifest_path.read_text())
         if actual != expected:
@@ -847,6 +892,7 @@ def cached_counterfactual_corpus(
                 seed=world_seed,
                 query_batch_size=query_batch_size,
                 inference_batch_size=inference_batch_size,
+                world_sampling=world_sampling,
                 on_progress=shard_progress,
             )
             save_counterfactual_batch(path, batch)
@@ -862,6 +908,7 @@ def cached_counterfactual_corpus(
     return result, {
         "states": len(result),
         "worlds": worlds,
+        "world_sampling": world_sampling,
         "new_rollout_states": rollout_states,
         "new_rollout_seconds": rollout_seconds,
         "new_rollout_states_per_second": rollout_states
@@ -952,6 +999,96 @@ def policy_direction_row_loss(
     return -expected_q, expected_q, entropy
 
 
+def policy_improvement_target(
+    logits: Tensor,
+    legal: Tensor,
+    centered_q: Tensor,
+    *,
+    objective: str,
+    temperature: float,
+    prior_floor: float,
+) -> Tensor:
+    """Return a detached search-improved policy target over legal actions."""
+
+    if objective not in POLICY_DIRECTION_OBJECTIVES - {"expected_q"}:
+        raise ValueError(f"unsupported CE policy objective {objective!r}")
+    if not math.isfinite(temperature) or temperature <= 0:
+        raise ValueError("policy target temperature must be positive")
+    if not math.isfinite(prior_floor) or not 0.0 <= prior_floor < 1.0:
+        raise ValueError("policy target prior floor must be in [0, 1)")
+    legal = legal.bool()
+    q = torch.where(legal, centered_q.float(), -torch.inf)
+    with torch.no_grad():
+        if objective == "uniform_ce":
+            return legal.float() / legal.sum(dim=-1, keepdim=True)
+        if objective == "hard_ce":
+            best = q.max(dim=-1, keepdim=True).values
+            winners = legal & torch.isclose(q, best, rtol=0.0, atol=1e-7)
+            return winners.float() / winners.sum(dim=-1, keepdim=True)
+        target_logits = q / temperature
+        if objective == "mirror_ce":
+            masked_logits = logits.detach().float().masked_fill(~legal, -torch.inf)
+            prior = F.softmax(masked_logits, dim=-1)
+            minimum = max(prior_floor, torch.finfo(prior.dtype).tiny)
+            prior = torch.where(legal, prior.clamp_min(minimum), 0.0)
+            prior = prior / prior.sum(dim=-1, keepdim=True)
+            target_logits = target_logits + torch.log(prior)
+        return F.softmax(target_logits.masked_fill(~legal, -torch.inf), dim=-1)
+
+
+def policy_cross_entropy_row_loss(
+    logits: Tensor,
+    legal: Tensor,
+    centered_q: Tensor,
+    *,
+    objective: str,
+    temperature: float,
+    prior_floor: float,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    target = policy_improvement_target(
+        logits,
+        legal,
+        centered_q,
+        objective=objective,
+        temperature=temperature,
+        prior_floor=prior_floor,
+    )
+    return policy_target_cross_entropy_row_loss(
+        logits, legal, centered_q, target
+    )
+
+
+def policy_target_cross_entropy_row_loss(
+    logits: Tensor,
+    legal: Tensor,
+    centered_q: Tensor,
+    target: Tensor,
+) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+    legal = legal.bool()
+    log_probs = F.log_softmax(logits.float().masked_fill(~legal, -torch.inf), dim=-1)
+    probabilities = log_probs.exp()
+    safe_log = torch.where(legal, log_probs, torch.zeros_like(log_probs))
+    q = torch.where(legal, centered_q.float(), torch.zeros_like(centered_q.float()))
+    target = torch.where(legal, target.float(), torch.zeros_like(target.float()))
+    row_loss = -(target * safe_log).sum(dim=-1)
+    expected_q = (probabilities * q).sum(dim=-1)
+    entropy = -(probabilities * safe_log).sum(dim=-1)
+    target_safe_log = torch.where(
+        target > 0, torch.log(target.clamp_min(torch.finfo(target.dtype).tiny)), 0.0
+    )
+    target_expected_q = (target * q).sum(dim=-1)
+    target_entropy = -(target * target_safe_log).sum(dim=-1)
+    target_l1 = (target - probabilities.detach()).abs().sum(dim=-1)
+    return (
+        row_loss,
+        expected_q,
+        entropy,
+        target_expected_q,
+        target_entropy,
+        target_l1,
+    )
+
+
 def cpu_model_state(model: BloodFlowTransformer) -> dict[str, Tensor]:
     result: dict[str, Tensor] = {}
     for name, value in model.state_dict().items():
@@ -970,23 +1107,96 @@ def one_step_direction(
     category_weights: np.ndarray,
     learning_rate: float,
     microbatch_size: int,
+    optimizer_name: str = "adamw",
+    gradient_clip_norm: float | None = 1.0,
+    trainable_parameter_names: Sequence[str] | None = None,
+    objective: str = "expected_q",
+    target_temperature: float = 0.1,
+    target_prior_floor: float = 0.0,
+    policy_targets: np.ndarray | None = None,
+    policy_row_confidence: np.ndarray | None = None,
     on_progress: TargetProgress | None = None,
 ) -> tuple[BloodFlowTransformer, dict[str, Tensor], dict[str, Tensor], dict[str, object]]:
     if learning_rate <= 0 or microbatch_size <= 0:
         raise ValueError("direction optimizer arguments must be positive")
+    if gradient_clip_norm is not None and (
+        not math.isfinite(gradient_clip_norm) or gradient_clip_norm <= 0
+    ):
+        raise ValueError("gradient clip norm must be positive or None")
+    if optimizer_name not in {"adamw", "sgd"}:
+        raise ValueError(f"unsupported direction optimizer {optimizer_name!r}")
+    if objective not in POLICY_DIRECTION_OBJECTIVES:
+        raise ValueError(f"unsupported policy direction objective {objective!r}")
+    if not math.isfinite(target_temperature) or target_temperature <= 0:
+        raise ValueError("policy target temperature must be positive")
+    if not math.isfinite(target_prior_floor) or not 0.0 <= target_prior_floor < 1.0:
+        raise ValueError("policy target prior floor must be in [0, 1)")
+    if objective == "search_ce":
+        if policy_targets is None:
+            raise ValueError("search_ce needs explicit policy targets")
+        policy_targets = np.asarray(policy_targets, dtype=np.float32)
+        if (
+            policy_targets.shape != batch.legal.shape
+            or not np.isfinite(policy_targets).all()
+            or np.any(policy_targets < 0)
+            or np.any(policy_targets[~batch.legal] != 0)
+            or not np.allclose(policy_targets.sum(axis=1), 1.0, atol=1e-6)
+        ):
+            raise ValueError("explicit policy targets are invalid")
+        if policy_row_confidence is None:
+            policy_row_confidence = np.ones(len(batch), dtype=np.float32)
+        else:
+            policy_row_confidence = np.asarray(
+                policy_row_confidence, dtype=np.float32
+            )
+        if (
+            policy_row_confidence.shape != (len(batch),)
+            or not np.isfinite(policy_row_confidence).all()
+            or np.any((policy_row_confidence < 0) | (policy_row_confidence > 1))
+        ):
+            raise ValueError("policy row confidence is invalid")
+    elif policy_targets is not None:
+        raise ValueError("explicit policy targets require search_ce")
+    elif policy_row_confidence is not None:
+        raise ValueError("policy row confidence requires search_ce")
     actor = copy.deepcopy(reference).to(device)
-    for parameter in actor.parameters():
-        parameter.requires_grad_(True)
+    named_parameters = dict(actor.named_parameters())
+    if trainable_parameter_names is None:
+        selected_names = tuple(named_parameters)
+    else:
+        selected_names = tuple(str(name) for name in trainable_parameter_names)
+        if (
+            not selected_names
+            or len(set(selected_names)) != len(selected_names)
+            or not set(selected_names).issubset(named_parameters)
+        ):
+            raise ValueError("trainable parameter names must be a unique Actor subset")
+    selected = set(selected_names)
+    for name, parameter in named_parameters.items():
+        parameter.requires_grad_(name in selected)
     initial = cpu_model_state(actor)
-    row_weights = category_row_weights(batch.categories, category_weights)
+    base_row_weights = category_row_weights(batch.categories, category_weights)
+    row_weights = base_row_weights
+    if policy_row_confidence is not None:
+        row_weights = row_weights * policy_row_confidence.astype(np.float64)
     weight_tensor = torch.as_tensor(row_weights, device=device, dtype=torch.float32)
     device_states = _device_state_batch(batch, device)
     legal_tensor = torch.as_tensor(batch.legal, device=device)
     q_tensor = torch.as_tensor(batch.centered_rank_q, device=device)
-    parameters = list(actor.parameters())
-    optimizer = torch.optim.AdamW(parameters, lr=learning_rate, weight_decay=0.0)
+    target_tensor = (
+        None
+        if policy_targets is None
+        else torch.as_tensor(policy_targets, device=device)
+    )
+    parameters = [named_parameters[name] for name in selected_names]
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            parameters, lr=learning_rate, weight_decay=0.0
+        )
+    else:
+        optimizer = torch.optim.SGD(parameters, lr=learning_rate)
     optimizer.zero_grad(set_to_none=True)
-    totals = torch.zeros(3, device=device, dtype=torch.float64)
+    totals = torch.zeros(6, device=device, dtype=torch.float64)
     microbatches = math.ceil(len(batch) / microbatch_size)
     actor.train()
     for index, start in enumerate(range(0, len(batch), microbatch_size), start=1):
@@ -999,11 +1209,46 @@ def one_step_direction(
         q = q_tensor[start:stop]
         with _autocast(device):
             output = actor(*state, legal)
-            row_loss, expected_q, entropy = policy_direction_row_loss(
-                output.raw_logits,
-                legal,
-                q,
-            )
+            if objective == "expected_q":
+                row_loss, expected_q, entropy = policy_direction_row_loss(
+                    output.raw_logits,
+                    legal,
+                    q,
+                )
+                target_expected_q = expected_q.detach()
+                target_entropy = entropy.detach()
+                target_l1 = torch.zeros_like(expected_q)
+            elif objective == "search_ce":
+                assert target_tensor is not None
+                (
+                    row_loss,
+                    expected_q,
+                    entropy,
+                    target_expected_q,
+                    target_entropy,
+                    target_l1,
+                ) = policy_target_cross_entropy_row_loss(
+                    output.raw_logits,
+                    legal,
+                    q,
+                    target_tensor[start:stop],
+                )
+            else:
+                (
+                    row_loss,
+                    expected_q,
+                    entropy,
+                    target_expected_q,
+                    target_entropy,
+                    target_l1,
+                ) = policy_cross_entropy_row_loss(
+                    output.raw_logits,
+                    legal,
+                    q,
+                    objective=objective,
+                    temperature=target_temperature,
+                    prior_floor=target_prior_floor,
+                )
             weights = weight_tensor[start:stop]
             loss = (row_loss * weights).sum()
         loss.backward()
@@ -1011,27 +1256,290 @@ def one_step_direction(
             torch.stack(
                 [
                     (value.detach() * weights).sum().double()
-                    for value in (row_loss, expected_q, entropy)
+                    for value in (
+                        row_loss,
+                        expected_q,
+                        entropy,
+                        target_expected_q,
+                        target_entropy,
+                        target_l1,
+                    )
                 ]
             )
         )
         if on_progress is not None:
             on_progress(index, {"microbatches": microbatches})
-    gradient_norm = torch.nn.utils.clip_grad_norm_(parameters, 1.0)
+    gradient_norm = torch.nn.utils.clip_grad_norm_(
+        parameters,
+        math.inf if gradient_clip_norm is None else gradient_clip_norm,
+    )
+    gradient_was_clipped = bool(
+        gradient_clip_norm is not None
+        and float(gradient_norm.detach()) > gradient_clip_norm
+    )
     optimizer.step()
     metric_values = torch.cat((totals, gradient_norm.detach().double()[None])).cpu()
     candidate = cpu_model_state(actor)
     return actor, initial, candidate, {
+        "optimizer": optimizer_name,
+        "objective": objective,
+        "target_temperature": float(target_temperature),
+        "target_prior_floor": float(target_prior_floor),
+        "trainable_parameter_tensors": len(parameters),
+        "trainable_parameters": int(sum(parameter.numel() for parameter in parameters)),
+        "total_parameters": int(sum(parameter.numel() for parameter in actor.parameters())),
         "optimizer_steps": 1,
         "states": len(batch),
         "microbatches": microbatches,
         "loss": float(metric_values[0]),
         "expected_rank_q": float(metric_values[1]),
         "entropy": float(metric_values[2]),
-        "gradient_norm": float(metric_values[3]),
-        "effective_sample_size": float(1.0 / np.square(row_weights).sum()),
+        "target_expected_rank_q": float(metric_values[3]),
+        "target_entropy": float(metric_values[4]),
+        "target_policy_l1": float(metric_values[5]),
+        "gradient_norm": float(metric_values[6]),
+        "gradient_clip_norm": gradient_clip_norm,
+        "gradient_was_clipped": gradient_was_clipped,
+        "effective_sample_size": float(
+            np.square(row_weights.sum()) / np.square(row_weights).sum()
+        )
+        if np.any(row_weights)
+        else 0.0,
+        "supervised_states": int(
+            len(batch)
+            if policy_row_confidence is None
+            else np.count_nonzero(policy_row_confidence)
+        ),
+        "supervised_state_rate": float(
+            1.0
+            if policy_row_confidence is None
+            else np.count_nonzero(policy_row_confidence) / len(batch)
+        ),
+        "base_row_weight_sum": float(base_row_weights.sum()),
         "row_weight_sum": float(row_weights.sum()),
     }
+
+
+DIRECTION_OPTIMIZERS = frozenset({"adamw", "sgd", "momentum", "nesterov"})
+_STATEFUL_DIRECTION_OPTIMIZERS = frozenset({"momentum", "nesterov"})
+
+
+def _validated_parameter_displacement(
+    reference: BloodFlowTransformer,
+    state: Mapping[str, Tensor] | None,
+) -> dict[str, Tensor]:
+    if state is None or not state:
+        return {}
+    parameters = dict(reference.named_parameters())
+    if set(state) != set(parameters):
+        missing = sorted(set(parameters) - set(state))
+        extra = sorted(set(state) - set(parameters))
+        raise ValueError(
+            "direction optimizer state parameter names do not match the Actor: "
+            f"missing={missing[:3]}, extra={extra[:3]}"
+        )
+    result: dict[str, Tensor] = {}
+    for name, parameter in parameters.items():
+        value = state[name]
+        if not isinstance(value, Tensor) or not value.is_floating_point():
+            raise ValueError(f"direction optimizer state {name} is not floating point")
+        if value.shape != parameter.shape:
+            raise ValueError(f"direction optimizer state {name} has the wrong shape")
+        if not torch.isfinite(value).all():
+            raise ValueError(f"direction optimizer state {name} is not finite")
+        result[name] = value.detach().cpu()
+    return result
+
+
+def _parameter_displacement_l2(state: Mapping[str, Tensor]) -> float:
+    squared = 0.0
+    for value in state.values():
+        flat = value.detach().double().reshape(-1)
+        squared += float(torch.dot(flat, flat))
+    return math.sqrt(squared)
+
+
+def _apply_parameter_displacement(
+    actor: BloodFlowTransformer,
+    state: Mapping[str, Tensor],
+    scale: float,
+) -> None:
+    if not math.isfinite(scale):
+        raise ValueError("direction optimizer state scale must be finite")
+    parameters = dict(actor.named_parameters())
+    if set(state) != set(parameters):
+        raise ValueError("direction optimizer state parameter names do not match")
+    with torch.no_grad():
+        for name, parameter in parameters.items():
+            parameter.add_(
+                state[name].to(device=parameter.device, dtype=parameter.dtype),
+                alpha=scale,
+            )
+
+
+def _proposal_metrics(
+    initial: Mapping[str, Tensor],
+    gradient_initial: Mapping[str, Tensor],
+    gradient_candidate: Mapping[str, Tensor],
+    candidate: Mapping[str, Tensor],
+    velocity: Mapping[str, Tensor],
+    momentum: float,
+    parameter_names: Sequence[str],
+) -> dict[str, float]:
+    gradient_squared = momentum_squared = proposal_squared = dot = 0.0
+    for name in parameter_names:
+        gradient = (
+            gradient_candidate[name] - gradient_initial[name]
+        ).double().reshape(-1)
+        proposal = (candidate[name] - initial[name]).double().reshape(-1)
+        gradient_squared += float(torch.dot(gradient, gradient))
+        proposal_squared += float(torch.dot(proposal, proposal))
+        if velocity:
+            momentum_step = (velocity[name].double() * momentum).reshape(-1)
+            momentum_squared += float(torch.dot(momentum_step, momentum_step))
+            dot += float(torch.dot(gradient, momentum_step))
+    result = {
+        "raw_gradient_step_l2": math.sqrt(gradient_squared),
+        "momentum_step_l2": math.sqrt(momentum_squared),
+        "raw_proposal_l2": math.sqrt(proposal_squared),
+    }
+    result["gradient_momentum_cosine"] = (
+        dot / math.sqrt(gradient_squared * momentum_squared)
+        if gradient_squared > 0 and momentum_squared > 0
+        else 0.0
+    )
+    return result
+
+
+def optimizer_direction(
+    reference: BloodFlowTransformer,
+    batch: CounterfactualBatch,
+    device: torch.device,
+    *,
+    category_weights: np.ndarray,
+    learning_rate: float,
+    microbatch_size: int,
+    optimizer_name: str = "adamw",
+    momentum: float = 0.9,
+    gradient_clip_norm: float | None = 1.0,
+    optimizer_state: Mapping[str, Tensor] | None = None,
+    objective: str = "expected_q",
+    target_temperature: float = 0.1,
+    target_prior_floor: float = 0.0,
+    policy_targets: np.ndarray | None = None,
+    policy_row_confidence: np.ndarray | None = None,
+    on_progress: TargetProgress | None = None,
+) -> tuple[BloodFlowTransformer, dict[str, Tensor], dict[str, Tensor], dict[str, object]]:
+    """Build one raw direction, optionally using committed-step momentum.
+
+    ``momentum`` and ``nesterov`` carry the previous *committed* parameter
+    displacement, rather than a pre-calibration optimizer buffer. This keeps
+    their state consistent with the policy that survived KL calibration.
+    Nesterov evaluates the fresh gradient at ``theta + momentum * velocity``.
+    """
+    if optimizer_name not in DIRECTION_OPTIMIZERS:
+        raise ValueError(f"unsupported direction optimizer {optimizer_name!r}")
+    if not 0.0 <= momentum < 1.0:
+        raise ValueError("direction momentum must be in [0, 1)")
+    velocity = _validated_parameter_displacement(reference, optimizer_state)
+    if optimizer_name not in _STATEFUL_DIRECTION_OPTIMIZERS:
+        if velocity:
+            raise ValueError(f"{optimizer_name} does not accept optimizer state")
+        return one_step_direction(
+            reference,
+            batch,
+            device,
+            category_weights=category_weights,
+            learning_rate=learning_rate,
+            microbatch_size=microbatch_size,
+            optimizer_name=optimizer_name,
+            gradient_clip_norm=gradient_clip_norm,
+            objective=objective,
+            target_temperature=target_temperature,
+            target_prior_floor=target_prior_floor,
+            policy_targets=policy_targets,
+            policy_row_confidence=policy_row_confidence,
+            on_progress=on_progress,
+        )
+
+    initial = cpu_model_state(reference)
+    parameter_names = tuple(dict(reference.named_parameters()))
+    gradient_reference = reference
+    lookahead: BloodFlowTransformer | None = None
+    if optimizer_name == "nesterov" and velocity:
+        lookahead = copy.deepcopy(reference).to(device)
+        _apply_parameter_displacement(lookahead, velocity, momentum)
+        gradient_reference = lookahead
+
+    actor, gradient_initial, gradient_candidate, metrics = one_step_direction(
+        gradient_reference,
+        batch,
+        device,
+        category_weights=category_weights,
+        learning_rate=learning_rate,
+        microbatch_size=microbatch_size,
+        optimizer_name="sgd",
+        gradient_clip_norm=gradient_clip_norm,
+        objective=objective,
+        target_temperature=target_temperature,
+        target_prior_floor=target_prior_floor,
+        policy_targets=policy_targets,
+        policy_row_confidence=policy_row_confidence,
+        on_progress=on_progress,
+    )
+    if lookahead is not None:
+        del lookahead
+
+    candidate = dict(gradient_candidate)
+    if optimizer_name == "momentum" and velocity:
+        for name in parameter_names:
+            candidate[name] = candidate[name] + momentum * velocity[name]
+        actor.load_state_dict(candidate, strict=True)
+
+    proposal = _proposal_metrics(
+        initial,
+        gradient_initial,
+        gradient_candidate,
+        candidate,
+        velocity,
+        momentum,
+        parameter_names,
+    )
+    metrics.update(
+        {
+            "optimizer": optimizer_name,
+            "momentum": float(momentum),
+            "optimizer_state_parameters": len(velocity),
+            "optimizer_state_l2": _parameter_displacement_l2(velocity),
+            "gradient_evaluation": (
+                "lookahead" if optimizer_name == "nesterov" else "current"
+            ),
+            **proposal,
+        }
+    )
+    return actor, initial, candidate, metrics
+
+
+def committed_optimizer_state(
+    optimizer_name: str,
+    initial: Mapping[str, Tensor],
+    actor: BloodFlowTransformer,
+) -> dict[str, Tensor]:
+    """Return state for the next update after KL calibration has committed."""
+    if optimizer_name not in DIRECTION_OPTIMIZERS:
+        raise ValueError(f"unsupported direction optimizer {optimizer_name!r}")
+    if optimizer_name not in _STATEFUL_DIRECTION_OPTIMIZERS:
+        return {}
+    committed = cpu_model_state(actor)
+    result = {
+        name: (committed[name] - initial[name]).detach().cpu()
+        for name, _parameter in actor.named_parameters()
+    }
+    if not result or not all(torch.isfinite(value).all() for value in result.values()):
+        raise RuntimeError("committed direction optimizer state is invalid")
+    if _parameter_displacement_l2(result) <= 0:
+        return {}
+    return result
 
 
 def load_scaled_direction(
@@ -1174,6 +1682,183 @@ def _greedy_change_metrics(
     return float(values[0]), float(values[1]) / total_states
 
 
+def evaluate_direction_scale(
+    actor: BloodFlowTransformer,
+    reference: BloodFlowTransformer,
+    initial: Mapping[str, Tensor],
+    candidate: Mapping[str, Tensor],
+    states: PolicyStateBatch,
+    device: torch.device,
+    *,
+    category_weights: np.ndarray,
+    scale: float,
+    batch_size: int,
+) -> dict[str, float]:
+    """Load one fixed direction scale and measure its calibration KL/flips."""
+    if not math.isfinite(scale) or scale < 0 or batch_size <= 0:
+        raise ValueError("fixed direction scale arguments are invalid")
+    row_weights = category_row_weights(states.categories, category_weights)
+    chunks = _prepare_calibration_chunks(
+        reference,
+        states,
+        row_weights,
+        device,
+        batch_size=batch_size,
+    )
+    _load_scaled_device_direction(
+        actor,
+        _device_model_state(initial, device),
+        _device_model_state(candidate, device),
+        scale,
+    )
+    kl = _mean_reverse_kl(actor, chunks, device)
+    if not math.isfinite(kl) or kl < -1e-8:
+        raise RuntimeError("direction produced an invalid calibration KL")
+    weighted_flips, equal_flips = _greedy_change_metrics(actor, chunks, device)
+    return {
+        "scale": float(scale),
+        "kl": max(float(kl), 0.0),
+        "greedy_flip_rate": weighted_flips,
+        "equal_state_greedy_flip_rate": equal_flips,
+        "evaluations": 1.0,
+    }
+
+
+def policy_outputs(
+    actor: BloodFlowTransformer,
+    states: PolicyStateBatch,
+    device: torch.device,
+    *,
+    batch_size: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return legal-action probabilities and greedy actions for policy states."""
+    if batch_size <= 0:
+        raise ValueError("policy output batch size must be positive")
+    probabilities = np.zeros(states.legal.shape, dtype=np.float32)
+    actions = np.empty(len(states), dtype=np.int64)
+    actor.eval()
+    for start in range(0, len(states), batch_size):
+        stop = min(start + batch_size, len(states))
+        rows = np.arange(start, stop)
+        state = _state_tensors(states, rows, device)
+        legal = torch.as_tensor(states.legal[rows], device=device)
+        with torch.inference_mode(), _autocast(device):
+            logits = actor(*state, legal).raw_logits.float()
+        masked = logits.masked_fill(~legal, -torch.inf)
+        chunk = F.softmax(masked, dim=-1)
+        probabilities[start:stop] = chunk.cpu().numpy()
+        actions[start:stop] = masked.argmax(dim=-1).cpu().numpy()
+    if (
+        not np.isfinite(probabilities).all()
+        or np.any(probabilities[~states.legal] != 0)
+        or not np.allclose(probabilities.sum(axis=1), 1.0, atol=1e-6)
+    ):
+        raise RuntimeError("policy output probe produced invalid probabilities")
+    return probabilities, actions
+
+
+ACTION_FAMILY_NAMES = (
+    "exchange",
+    "choose_missing",
+    "discard",
+    "hu",
+    "pong",
+    "kong",
+    "pass",
+)
+
+
+def _action_families(actions: np.ndarray) -> np.ndarray:
+    actions = np.asarray(actions, dtype=np.int64)
+    if actions.ndim != 1 or np.any((actions < 0) | (actions >= ACTION_SPACE_SIZE)):
+        raise ValueError("actions must be a valid action-id vector")
+    families = np.full(len(actions), -1, dtype=np.int8)
+    families[actions < int(bm.ACTION_CHOOSE_MISSING_OFFSET)] = 0
+    families[
+        (actions >= int(bm.ACTION_CHOOSE_MISSING_OFFSET))
+        & (actions < int(bm.ACTION_DISCARD_OFFSET))
+    ] = 1
+    families[
+        (actions >= int(bm.ACTION_DISCARD_OFFSET)) & (actions < int(bm.ACTION_HU))
+    ] = 2
+    families[actions == int(bm.ACTION_HU)] = 3
+    families[actions == int(bm.ACTION_PONG)] = 4
+    families[
+        (actions >= int(bm.ACTION_EXPOSED_KONG)) & (actions < int(bm.ACTION_PASS))
+    ] = 5
+    families[actions == int(bm.ACTION_PASS)] = 6
+    if np.any(families < 0):
+        raise RuntimeError("action family mapping is incomplete")
+    return families
+
+
+def _family_transition_counts(
+    reference: np.ndarray, candidate: np.ndarray, rows: np.ndarray
+) -> dict[str, dict[str, int]]:
+    reference_family = _action_families(reference[rows])
+    candidate_family = _action_families(candidate[rows])
+    return {
+        source: {
+            target: int(
+                np.sum((reference_family == source_index) & (candidate_family == target_index))
+            )
+            for target_index, target in enumerate(ACTION_FAMILY_NAMES)
+        }
+        for source_index, source in enumerate(ACTION_FAMILY_NAMES)
+    }
+
+
+def policy_change_metrics(
+    candidate: BloodFlowTransformer,
+    reference: BloodFlowTransformer,
+    states: PolicyStateBatch,
+    device: torch.device,
+    *,
+    category_weights: np.ndarray,
+    batch_size: int,
+) -> dict[str, object]:
+    """Report KL and greedy action migrations for all nine decision categories."""
+    reference_probabilities, reference_actions = policy_outputs(
+        reference, states, device, batch_size=batch_size
+    )
+    candidate_probabilities, candidate_actions = policy_outputs(
+        candidate, states, device, batch_size=batch_size
+    )
+    safe_candidate = np.clip(candidate_probabilities, 1e-30, 1.0)
+    safe_reference = np.clip(reference_probabilities, 1e-30, 1.0)
+    reverse_kl = (
+        candidate_probabilities * (np.log(safe_candidate) - np.log(safe_reference))
+    ).sum(axis=1)
+    changed = candidate_actions != reference_actions
+    row_weights = category_row_weights(states.categories, category_weights)
+
+    def category_metrics(rows: np.ndarray) -> dict[str, object]:
+        return {
+            "states": int(len(rows)),
+            "mean_reverse_kl": float(reverse_kl[rows].mean()),
+            "greedy_flip_rate": float(changed[rows].mean()),
+            "action_family_transitions": _family_transition_counts(
+                reference_actions, candidate_actions, rows
+            ),
+        }
+
+    all_rows = np.arange(len(states))
+    return {
+        "states": len(states),
+        "visitation_weighted_reverse_kl": float(np.dot(row_weights, reverse_kl)),
+        "visitation_weighted_greedy_flip_rate": float(np.dot(row_weights, changed)),
+        "equal_state_reverse_kl": float(reverse_kl.mean()),
+        "equal_state_greedy_flip_rate": float(changed.mean()),
+        "action_family_transitions": _family_transition_counts(
+            reference_actions, candidate_actions, all_rows
+        ),
+        "categories": {
+            name: category_metrics(np.flatnonzero(states.categories == category))
+            for category, name in enumerate(CATEGORY_NAMES)
+        },
+    }
+
+
 def calibrate_direction(
     actor: BloodFlowTransformer,
     reference: BloodFlowTransformer,
@@ -1270,6 +1955,91 @@ def calibrate_direction(
     }
 
 
+def cap_direction(
+    actor: BloodFlowTransformer,
+    reference: BloodFlowTransformer,
+    initial: Mapping[str, Tensor],
+    candidate: Mapping[str, Tensor],
+    states: PolicyStateBatch,
+    device: torch.device,
+    *,
+    category_weights: np.ndarray,
+    kl_cap: float,
+    batch_size: int,
+    search_steps: int,
+    on_progress: TargetProgress | None = None,
+) -> dict[str, float | bool]:
+    """Keep a raw optimizer step unless it exceeds a reverse-KL cap.
+
+    Unlike :func:`calibrate_direction`, this never enlarges a conservative raw
+    step merely to spend the full trust-region budget.  When the endpoint is
+    outside the cap, bisection selects the largest measured scale in ``[0, 1]``
+    that remains inside it.
+    """
+    if kl_cap <= 0 or batch_size <= 0 or search_steps <= 0:
+        raise ValueError("KL cap arguments are invalid")
+    row_weights = category_row_weights(states.categories, category_weights)
+    chunks = _prepare_calibration_chunks(
+        reference,
+        states,
+        row_weights,
+        device,
+        batch_size=batch_size,
+    )
+    device_initial = _device_model_state(initial, device)
+    device_candidate = _device_model_state(candidate, device)
+    evaluations = 0
+
+    def evaluate(scale: float) -> float:
+        nonlocal evaluations
+        _load_scaled_device_direction(
+            actor, device_initial, device_candidate, scale
+        )
+        result = _mean_reverse_kl(actor, chunks, device)
+        evaluations += 1
+        if on_progress is not None:
+            on_progress(evaluations, {"scale": scale, "kl": result})
+        if not math.isfinite(result) or result < -1e-8:
+            raise RuntimeError("direction produced an invalid calibration KL")
+        return max(result, 0.0)
+
+    candidate_kl = evaluate(1.0)
+    cap_activated = candidate_kl > kl_cap
+    if cap_activated:
+        low, low_kl = 0.0, evaluate(0.0)
+        if abs(low_kl) > max(1e-8, kl_cap * 1e-3):
+            raise RuntimeError(f"zero direction has KL {low_kl}")
+        high, high_kl = 1.0, candidate_kl
+        for _ in range(search_steps):
+            middle = 0.5 * (low + high)
+            middle_kl = evaluate(middle)
+            if middle_kl <= kl_cap:
+                low, low_kl = middle, middle_kl
+            else:
+                high, high_kl = middle, middle_kl
+        scale, final_kl = low, low_kl
+        _load_scaled_device_direction(
+            actor, device_initial, device_candidate, scale
+        )
+        if final_kl > kl_cap:
+            raise RuntimeError("KL-capped direction escaped its trust region")
+    else:
+        scale, final_kl = 1.0, candidate_kl
+
+    weighted_flips, equal_flips = _greedy_change_metrics(actor, chunks, device)
+    return {
+        "scale": float(scale),
+        "candidate_kl": float(candidate_kl),
+        "final_kl": float(final_kl),
+        "kl_cap": float(kl_cap),
+        "cap_activated": bool(cap_activated),
+        "cap_slack": float(kl_cap - final_kl),
+        "greedy_flip_rate": weighted_flips,
+        "equal_state_greedy_flip_rate": equal_flips,
+        "evaluations": float(evaluations),
+    }
+
+
 def direction_cosine(
     initial: Mapping[str, Tensor],
     candidate: Mapping[str, Tensor],
@@ -1357,12 +2127,15 @@ __all__ = [
     "build_state_batch",
     "cached_counterfactual_corpus",
     "calibrate_direction",
+    "cap_direction",
+    "committed_optimizer_state",
     "category_row_weights",
     "center_legal_values",
     "concatenate_counterfactual_batches",
     "cpu_model_state",
     "direction_cosine",
     "domain_seed",
+    "evaluate_direction_scale",
     "estimate_counterfactual_batch",
     "heldout_policy_value",
     "load_counterfactual_batch",
@@ -1370,6 +2143,9 @@ __all__ = [
     "mix64",
     "nested_category_indices",
     "one_step_direction",
+    "optimizer_direction",
+    "policy_change_metrics",
+    "policy_outputs",
     "load_policy_state_batch",
     "query_signature",
     "require_cuda",

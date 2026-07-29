@@ -1,13 +1,11 @@
 from __future__ import annotations
 
-from dataclasses import asdict
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 import torch
-
-import bloodflow_mahjong as bm
 
 import training.batch_sweep as batch_sweep
 from training.batch_sweep import SweepConfig
@@ -64,20 +62,7 @@ def test_completed_sweep_returns_before_collection(monkeypatch, tmp_path) -> Non
     sl.write_bytes(b"actor")
     output = tmp_path / "sweep"
     output.mkdir()
-    identity = json.loads(
-        json.dumps(
-            {
-                "version": batch_sweep.SWEEP_VERSION,
-                "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
-                "policy_execution_version": batch_sweep.POLICY_EXECUTION_VERSION,
-                "seed": 7,
-                "sl_checkpoint": str(sl.resolve()),
-                "sl_sha256": batch_sweep._sha256(sl),
-                "config": asdict(config),
-            },
-            sort_keys=True,
-        )
-    )
+    identity = batch_sweep._single_identity(sl, None, config, 7)
     (output / "config.json").write_text(json.dumps(identity))
     result = {
         "identity": identity,
@@ -122,6 +107,115 @@ def test_parser_defaults_cover_the_full_batch_search_range() -> None:
     assert args.target_shard_size == 64
     assert args.target_query_batch_size == 64
     assert args.rollout_inference_batch_size == 128
+    assert args.self_play_checkpoint is None
+    assert args.self_play_fraction == 0.0
+    assert args.anchor_rule_fast is False
+
+
+def test_parser_accepts_reference_alias_and_late_stage_lineup() -> None:
+    args = batch_sweep.build_parser().parse_args(
+        [
+            "--sl-checkpoint",
+            "u56.pt",
+            "--self-play-checkpoint",
+            "u40.pt",
+            "--self-play-fraction",
+            "0.5",
+            "--anchor-rule-fast",
+        ]
+    )
+    assert args.reference_checkpoint.name == "u56.pt"
+    assert args.self_play_checkpoint.name == "u40.pt"
+    assert args.self_play_fraction == 0.5
+    assert args.anchor_rule_fast is True
+
+
+def test_lineup_identity_hashes_both_checkpoints(tmp_path) -> None:
+    reference = tmp_path / "u56.pt"
+    opponent = tmp_path / "u40.pt"
+    reference.write_bytes(b"reference")
+    opponent.write_bytes(b"opponent")
+    config = SweepConfig(self_play_fraction=0.5, anchor_rule_fast=True)
+
+    identity = batch_sweep._single_identity(reference, opponent, config, 7)
+
+    assert identity["reference_checkpoint"] == str(reference.resolve())
+    assert identity["reference_sha256"] == batch_sweep._sha256(reference)
+    assert identity["self_play_checkpoint"] == str(opponent.resolve())
+    assert identity["self_play_sha256"] == batch_sweep._sha256(opponent)
+    assert identity["config"]["self_play_fraction"] == 0.5
+    assert identity["config"]["anchor_rule_fast"] is True
+
+
+def test_positive_self_play_requires_a_checkpoint(tmp_path) -> None:
+    reference = tmp_path / "u56.pt"
+    reference.write_bytes(b"reference")
+    config = SweepConfig(self_play_fraction=0.5)
+    with pytest.raises(ValueError, match="requires --self-play-checkpoint"):
+        batch_sweep._single_identity(reference, None, config, 7)
+
+
+def test_source_collection_propagates_late_stage_lineup(monkeypatch) -> None:
+    calls = {}
+
+    class StubCollector:
+        def __init__(self, collection_config, actor, device, **kwargs):
+            calls["collection_config"] = collection_config
+            calls["actor"] = actor
+            calls["device"] = device
+            calls["kwargs"] = kwargs
+
+        def collect(self, games, *, on_progress):
+            calls["games"] = games
+            on_progress(games, 20, 2.0)
+            return SimpleNamespace(
+                trajectories=("trajectory",),
+                environment_steps=20,
+                elapsed_seconds=2.0,
+            )
+
+    class StubProgress:
+        def start(self, *_args, **_kwargs):
+            pass
+
+        def update(self, *_args, **_kwargs):
+            pass
+
+        def complete(self, *_args, **_kwargs):
+            pass
+
+    actor = SimpleNamespace(config=SimpleNamespace(max_history=192))
+    opponent = object()
+    monkeypatch.setattr(batch_sweep, "TrajectoryCollector", StubCollector)
+    monkeypatch.setattr(
+        batch_sweep,
+        "select_independent_queries",
+        lambda trajectories, **_kwargs: [trajectories[0]],
+    )
+
+    queries, trajectories = batch_sweep._collect(
+        actor,
+        torch.device("cpu"),
+        StubProgress(),
+        self_play_actor=opponent,
+        self_play_fraction=0.5,
+        anchor_rule_fast=True,
+        games=8,
+        envs=4,
+        qpc=1,
+        source_seed=11,
+        query_seed=12,
+        phase="SOURCE",
+    )
+
+    assert queries == ["trajectory"]
+    assert trajectories == ("trajectory",)
+    assert calls["kwargs"] == {
+        "seed": 11,
+        "self_play_fraction": 0.5,
+        "self_play_actor": opponent,
+        "anchor_rule_fast": True,
+    }
 
 
 def test_target_collection_propagates_grouped_rollout_sizes(
@@ -152,6 +246,7 @@ def test_target_collection_propagates_grouped_rollout_sizes(
         "actor",
         torch.device("cpu"),
         StubProgress(),
+        self_play_actor="opponent",
         phase="TARGETS",
         fingerprint="identity",
         worlds=16,
@@ -164,6 +259,7 @@ def test_target_collection_propagates_grouped_rollout_sizes(
 
     assert batch == "batch"
     assert metrics == {"states": 1}
+    assert calls["kwargs"]["self_play_actor"] == "opponent"
     assert calls["kwargs"]["query_batch_size"] == 16
     assert calls["kwargs"]["inference_batch_size"] == 512
 
@@ -209,7 +305,7 @@ def test_multi_seed_aggregate_pools_raw_panels(tmp_path) -> None:
         reference_scores = np.asarray([0.0, 0.0])
         reference_fingerprint = batch_sweep._fingerprint(
             {
-                "sl": identity["sl_sha256"],
+                "reference": identity["reference_sha256"],
                 "policy_execution_version": batch_sweep.POLICY_EXECUTION_VERSION,
                 "seed": int(batch_sweep.domain_seed(seed, batch_sweep.FIXED_EVAL)),
                 "games": config.evaluation_games,
@@ -252,7 +348,7 @@ def test_multi_seed_aggregate_pools_raw_panels(tmp_path) -> None:
         identity=identity,
         seeds=seeds,
         config=config,
-        sl_hash=str(identity["sl_sha256"]),
+        reference_hash=str(identity["reference_sha256"]),
         child_summaries=child_summaries,
     )
     variant = aggregate["variants"]["1"]

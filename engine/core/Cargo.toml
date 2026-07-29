@@ -28,6 +28,7 @@ path = "benchmarks/ffi_throughput.rs"
 
 [features]
 default = []
+rule-ev-analysis = []
 
 [dependencies]
 rand = "0.9"

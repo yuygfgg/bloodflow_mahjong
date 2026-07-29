@@ -11,6 +11,7 @@ mod game;
 mod hand;
 mod rng;
 mod rule_agent;
+mod rule_ev;
 mod types;
 
 pub use action::{
@@ -34,4 +35,13 @@ pub use hand::{
     evaluate_win, is_winning,
 };
 pub use rule_agent::SIMPLE_RULE_ACTION_TERMINAL;
+pub use rule_ev::{
+    RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense, RuleEvSearchStats,
+    reset_rule_ev_search_stats, rule_ev_search_stats,
+};
+#[cfg(feature = "rule-ev-analysis")]
+pub use rule_ev::{
+    RuleEvSearchAction, RuleEvSearchCandidateSet, RuleEvSearchGate, RuleEvSearchTrace,
+    RuleEvSearchTraceConfig, RuleEvSearchTraceError,
+};
 pub use types::{ExchangeDirection, Meld, MeldKind, Seat, Suit, Tile, WinSource};

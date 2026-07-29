@@ -23,7 +23,7 @@ CollectionProgress = Callable[[int, int, float], None]
 
 # Execution ordering can affect BF16 tie-breaking even with identical weights
 # and seeds. Persistent run and cache identities include this value.
-POLICY_EXECUTION_VERSION = 2
+POLICY_EXECUTION_VERSION = 4
 
 
 @dataclass(frozen=True)
@@ -195,21 +195,41 @@ def _autocast(device: torch.device) -> torch.autocast:
     )
 
 
+@dataclass
+class _PolicyStageSlot:
+    capacity: int = 0
+    host: tuple[torch.Tensor, ...] = ()
+    host_numpy: tuple[np.ndarray, ...] = ()
+    staged: tuple[torch.Tensor, ...] = ()
+    reusable: Any | None = None
+
+
+@dataclass(frozen=True)
+class _StagedPolicyInputs:
+    slot: _PolicyStageSlot
+    inputs: tuple[torch.Tensor, ...]
+
+
 class _PinnedPolicyStager:
-    """Reusable pinned host and device buffers for one rollout stream."""
+    """Double-buffered pinned staging for chunked CUDA policy inference.
+
+    A slot remains unavailable until the consuming CUDA stream finishes its
+    forward pass. This prevents a second Actor launch from overwriting pinned
+    host memory while an earlier non-blocking H2D copy still reads it.
+    """
+
+    _SLOT_COUNT = 2
 
     def __init__(self, device: torch.device, history: int) -> None:
         if device.type != "cuda" or history <= 0:
             raise ValueError("pinned policy staging requires CUDA and history")
         self.device = device
         self.history = history
-        self.capacity = 0
-        self.host: tuple[torch.Tensor, ...] = ()
-        self.host_numpy: tuple[np.ndarray, ...] = ()
-        self.staged: tuple[torch.Tensor, ...] = ()
+        self._slots = [_PolicyStageSlot() for _ in range(self._SLOT_COUNT)]
+        self._next_slot = 0
 
-    def _allocate(self, required: int) -> None:
-        capacity = max(required, 32, 2 * self.capacity)
+    def _allocate(self, slot: _PolicyStageSlot, required: int) -> None:
+        capacity = max(required, 32, 2 * slot.capacity)
         specifications = (
             ((capacity, 10, 27), torch.uint8),
             ((capacity, 4, 4, 3), torch.uint8),
@@ -218,28 +238,38 @@ class _PinnedPolicyStager:
             ((capacity,), torch.int64),
             ((capacity, ACTION_SPACE_SIZE), torch.bool),
         )
-        self.host = tuple(
+        slot.host = tuple(
             torch.empty(shape, dtype=dtype, pin_memory=True)
             for shape, dtype in specifications
         )
-        self.host_numpy = tuple(value.numpy() for value in self.host)
-        self.staged = tuple(
+        slot.host_numpy = tuple(value.numpy() for value in slot.host)
+        slot.staged = tuple(
             torch.empty(shape, dtype=dtype, device=self.device)
             for shape, dtype in specifications
         )
-        self.capacity = capacity
+        slot.capacity = capacity
+
+    def _acquire(self, required: int) -> _PolicyStageSlot:
+        slot = self._slots[self._next_slot]
+        self._next_slot = (self._next_slot + 1) % len(self._slots)
+        if slot.reusable is not None and not slot.reusable.query():
+            slot.reusable.synchronize()
+        if required > slot.capacity:
+            self._allocate(slot, required)
+        return slot
 
     def stage(
-        self, buffers: EngineBuffers, rows: np.ndarray
-    ) -> tuple[torch.Tensor, ...]:
+        self, buffers: EngineBuffers, rows: np.ndarray, *, width: int
+    ) -> _StagedPolicyInputs:
         rows = np.ascontiguousarray(rows, dtype=np.int64)
         count = len(rows)
         if not count:
             raise ValueError("cannot stage an empty inference batch")
         if buffers.events.shape[1] != self.history:
             raise ValueError("inference history capacity changed")
-        if count > self.capacity:
-            self._allocate(count)
+        if not 1 <= width <= self.history:
+            raise ValueError("inference history width is invalid")
+        slot = self._acquire(count)
         sources = (
             buffers.tile_obs,
             buffers.melds,
@@ -248,16 +278,38 @@ class _PinnedPolicyStager:
             buffers.event_lengths,
             buffers.legal,
         )
-        for index, (source, target) in enumerate(
-            zip(sources, self.host_numpy)
-        ):
+        for index, (source, target) in enumerate(zip(sources, slot.host_numpy)):
             if index == 4:
                 target[:count] = source[rows]
+            elif index == 3:
+                np.take(source[:, :width], rows, axis=0, out=target[:count, :width])
             else:
                 np.take(source, rows, axis=0, out=target[:count])
-        for host, staged in zip(self.host, self.staged):
-            staged[:count].copy_(host[:count], non_blocking=True)
-        return tuple(value[:count] for value in self.staged)
+        for index, (host, staged) in enumerate(zip(slot.host, slot.staged)):
+            if index == 3:
+                staged[:count, :width].copy_(
+                    host[:count, :width], non_blocking=True
+                )
+            else:
+                staged[:count].copy_(host[:count], non_blocking=True)
+        return _StagedPolicyInputs(
+            slot,
+            (
+                slot.staged[0][:count],
+                slot.staged[1][:count],
+                slot.staged[2][:count],
+                slot.staged[3][:count, :width],
+                slot.staged[4][:count],
+                slot.staged[5][:count],
+            ),
+        )
+
+    def release(self, staged: _StagedPolicyInputs) -> None:
+        if not any(slot is staged.slot for slot in self._slots):
+            raise ValueError("staged policy inputs belong to another stager")
+        if staged.slot.reusable is None:
+            staged.slot.reusable = torch.cuda.Event()
+        staged.slot.reusable.record(torch.cuda.current_stream(self.device))
 
 
 def _launch_policy_actions(
@@ -269,35 +321,28 @@ def _launch_policy_actions(
     inference_batch_size: int,
     stager: _PinnedPolicyStager | None = None,
 ) -> torch.Tensor:
-    """Launch chunked policy inference with one staged transfer per step."""
+    """Launch chunked policy inference with double-buffered CUDA staging."""
 
     rows = np.asarray(rows, dtype=np.int64)
     if rows.ndim != 1 or not len(rows) or inference_batch_size <= 0:
         raise ValueError("policy inference rows and batch size must be valid")
-    chunks: list[tuple[int, int, int, int, np.ndarray]] = []
-    staged_rows: list[np.ndarray] = []
-    offset = 0
+    chunks: list[tuple[int, int, np.ndarray]] = []
     for start in range(0, len(rows), inference_batch_size):
         chunk = rows[start : start + inference_batch_size]
         inference_rows = _bucket_inference_rows(chunk)
         lengths = buffers.event_lengths[inference_rows]
         width = bucket_history_width(lengths, buffers.events.shape[1])
-        chunks.append(
-            (offset, len(inference_rows), len(chunk), width, inference_rows)
-        )
-        staged_rows.append(inference_rows)
-        offset += len(inference_rows)
+        chunks.append((len(chunk), width, inference_rows))
 
-    staged: tuple[torch.Tensor, ...] | None = None
     if device.type == "cuda":
         if stager is None:
             stager = _PinnedPolicyStager(device, buffers.events.shape[1])
-        staged = stager.stage(buffers, np.concatenate(staged_rows))
 
     actions: list[torch.Tensor] = []
     with torch.inference_mode(), _autocast(device):
-        for offset, padded, valid, width, inference_rows in chunks:
-            if staged is None:
+        for valid, width, inference_rows in chunks:
+            staged: _StagedPolicyInputs | None = None
+            if device.type != "cuda":
                 lengths = buffers.event_lengths[inference_rows].astype(np.int64)
                 inputs = (
                     torch.as_tensor(buffers.tile_obs[inference_rows], device=device),
@@ -310,24 +355,22 @@ def _launch_policy_actions(
                     torch.as_tensor(buffers.legal[inference_rows], device=device),
                 )
             else:
-                stop = offset + padded
-                inputs = (
-                    staged[0][offset:stop],
-                    staged[1][offset:stop],
-                    staged[2][offset:stop],
-                    staged[3][offset:stop, :width],
-                    staged[4][offset:stop],
-                    staged[5][offset:stop],
+                assert stager is not None
+                staged = stager.stage(buffers, inference_rows, width=width)
+                inputs = staged.inputs
+            try:
+                logits = model(*inputs).logits[:valid]
+                selected = logits.argmax(dim=-1).to(torch.uint8)
+                actions.append(
+                    torch.where(
+                        torch.isfinite(logits).all(dim=-1),
+                        selected,
+                        torch.full_like(selected, np.iinfo(np.uint8).max),
+                    )
                 )
-            logits = model(*inputs).logits[:valid]
-            selected = logits.argmax(dim=-1).to(torch.uint8)
-            actions.append(
-                torch.where(
-                    torch.isfinite(logits).all(dim=-1),
-                    selected,
-                    torch.full_like(selected, np.iinfo(np.uint8).max),
-                )
-            )
+            finally:
+                if staged is not None:
+                    stager.release(staged)
     return actions[0] if len(actions) == 1 else torch.cat(actions)
 
 
@@ -434,9 +477,12 @@ class TrajectoryCollector:
         seed: int,
         self_play_fraction: float = 0.0,
         self_play_actor: BloodFlowTransformer | None = None,
+        anchor_rule_fast: bool = False,
     ) -> None:
         if not 0.0 <= self_play_fraction <= 2.0 / 3.0:
             raise ValueError("self_play_fraction must be in [0, 2/3]")
+        if not isinstance(anchor_rule_fast, bool):
+            raise TypeError("anchor_rule_fast must be a bool")
         self.config = config
         self.actor = actor.eval()
         self.self_play_actor = (
@@ -451,6 +497,7 @@ class TrajectoryCollector:
             self._seed(int(seed) ^ 0x5E1F_504C_4159)
         )
         self.self_play_fraction = float(self_play_fraction)
+        self.anchor_rule_fast = anchor_rule_fast
         self.inference_stager = (
             _PinnedPolicyStager(device, config.history)
             if device.type == "cuda"
@@ -469,14 +516,22 @@ class TrajectoryCollector:
             np.arange(games, dtype=np.uint64) + int(focal_offset)
         ).astype(np.uint8) % 4
         sources = np.empty((games, 4), dtype=np.uint8)
-        for row in range(games):
-            for seat in range(4):
-                sources[row, seat] = int(
-                    ReplaySource.RULE_SAFE
-                    if (row + seat) % 2
-                    else ReplaySource.RULE_FAST
-                )
-        sources[np.arange(games), focal] = int(ReplaySource.CURRENT)
+        if self.anchor_rule_fast:
+            sources.fill(int(ReplaySource.RULE_SAFE))
+            sources[np.arange(games), focal] = int(ReplaySource.CURRENT)
+            for row in range(games):
+                opponents = np.flatnonzero(np.arange(4) != int(focal[row]))
+                anchor = int(self.lineup_random.choice(opponents))
+                sources[row, anchor] = int(ReplaySource.RULE_FAST)
+        else:
+            for row in range(games):
+                for seat in range(4):
+                    sources[row, seat] = int(
+                        ReplaySource.RULE_SAFE
+                        if (row + seat) % 2
+                        else ReplaySource.RULE_FAST
+                    )
+            sources[np.arange(games), focal] = int(ReplaySource.CURRENT)
         expected_self_play_seats = 3.0 * self.self_play_fraction
         guaranteed = int(np.floor(expected_self_play_seats))
         fractional = expected_self_play_seats - guaranteed
@@ -486,7 +541,12 @@ class TrajectoryCollector:
                 self_play_seats += 1
             if not self_play_seats:
                 continue
-            opponents = np.flatnonzero(np.arange(4) != int(focal[row]))
+            if self.anchor_rule_fast:
+                opponents = np.flatnonzero(
+                    sources[row] == int(ReplaySource.RULE_SAFE)
+                )
+            else:
+                opponents = np.flatnonzero(np.arange(4) != int(focal[row]))
             selected = self.lineup_random.choice(
                 opponents, size=self_play_seats, replace=False
             )

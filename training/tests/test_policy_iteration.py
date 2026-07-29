@@ -9,20 +9,30 @@ import torch
 import bloodflow_mahjong as bm
 
 from training.model import BloodFlowTransformer, TransformerConfig
+from training.pipeline import EngineBuffers
 from training.policy_iteration import (
     CounterfactualBatch,
     PolicyQuery,
     PolicyStateBatch,
+    _information_set_world_group,
     cached_counterfactual_corpus,
     calibrate_direction,
+    cap_direction,
+    committed_optimizer_state,
     category_row_weights,
     center_legal_values,
     direction_cosine,
+    evaluate_direction_scale,
     load_counterfactual_batch,
     load_policy_state_batch,
     load_scaled_direction,
     nested_category_indices,
     one_step_direction,
+    optimizer_direction,
+    policy_cross_entropy_row_loss,
+    policy_direction_row_loss,
+    policy_improvement_target,
+    policy_target_cross_entropy_row_loss,
     query_signature,
     require_deterministic_actor,
     save_counterfactual_batch,
@@ -76,6 +86,95 @@ def tiny_batch() -> CounterfactualBatch:
         centered_rank_q=center_legal_values(rank_q, legal),
         behavior_actions=np.zeros(size, dtype=np.uint8),
     )
+
+
+def test_ce_target_escapes_a_saturated_policy_gradient() -> None:
+    legal = torch.tensor([[True, True, False]])
+    q = torch.tensor([[-0.5, 0.5, 0.0]])
+    pg_logits = torch.tensor([[20.0, -20.0, 0.0]], requires_grad=True)
+    pg_loss, _expected_q, _entropy = policy_direction_row_loss(
+        pg_logits, legal, q
+    )
+    pg_loss.sum().backward()
+
+    ce_logits = torch.tensor([[20.0, -20.0, 0.0]], requires_grad=True)
+    ce_loss, *_metrics = policy_cross_entropy_row_loss(
+        ce_logits,
+        legal,
+        q,
+        objective="hard_ce",
+        temperature=0.1,
+        prior_floor=0.0,
+    )
+    ce_loss.sum().backward()
+
+    assert abs(float(pg_logits.grad[0, 1])) < 1e-12
+    assert float(ce_logits.grad[0, 1]) == pytest.approx(-1.0)
+    assert float(ce_logits.grad[0, 0]) == pytest.approx(1.0)
+    assert float(ce_logits.grad[0, 2]) == pytest.approx(0.0)
+
+
+def test_search_policy_targets_respect_legality_ties_and_prior() -> None:
+    logits = torch.tensor([[2.0, 0.0, 7.0]])
+    legal = torch.tensor([[True, True, False]])
+    tied_q = torch.tensor([[0.25, 0.25, 0.0]])
+    hard = policy_improvement_target(
+        logits,
+        legal,
+        tied_q,
+        objective="hard_ce",
+        temperature=0.1,
+        prior_floor=0.0,
+    )
+    np.testing.assert_allclose(hard.numpy(), [[0.5, 0.5, 0.0]])
+
+    flat_q = torch.zeros_like(tied_q)
+    mirror = policy_improvement_target(
+        logits,
+        legal,
+        flat_q,
+        objective="mirror_ce",
+        temperature=0.1,
+        prior_floor=0.0,
+    )
+    expected = torch.softmax(torch.tensor([2.0, 0.0]), dim=0)
+    torch.testing.assert_close(mirror[0, :2], expected)
+    assert float(mirror[0, 2]) == 0.0
+
+
+def test_explicit_search_policy_target_drives_cross_entropy() -> None:
+    logits = torch.tensor([[4.0, -4.0, 2.0]], requires_grad=True)
+    legal = torch.tensor([[True, True, False]])
+    q = torch.tensor([[-0.25, 0.25, 0.0]])
+    target = torch.tensor([[0.25, 0.75, 0.0]])
+    loss, *_metrics = policy_target_cross_entropy_row_loss(
+        logits, legal, q, target
+    )
+    loss.sum().backward()
+    expected = torch.softmax(torch.tensor([4.0, -4.0]), dim=0) - target[0, :2]
+    torch.testing.assert_close(logits.grad[0, :2], expected)
+    assert float(logits.grad[0, 2]) == 0.0
+
+
+def test_information_set_world_group_preserves_current_actor_view() -> None:
+    source = bm.Batch(2, seed=31)
+    # Use the same public buffer helpers as policy iteration.  The initial
+    # exchange decisions already have hidden opponent hands to resample.
+    source_engine = EngineBuffers.for_batch(source, history=8)
+    source_engine.observe()
+    seeds = np.asarray([[101, 102, 103], [201, 202, 203]], dtype=np.uint64)
+    sampled = _information_set_world_group(source, seeds)
+    sampled_engine = EngineBuffers.for_batch(sampled, history=8)
+    sampled_engine.observe()
+    repeated = np.repeat(np.arange(2), 3)
+    np.testing.assert_array_equal(
+        sampled_engine.tile_obs, source_engine.tile_obs[repeated]
+    )
+    np.testing.assert_array_equal(
+        sampled_engine.melds, source_engine.melds[repeated]
+    )
+    np.testing.assert_array_equal(sampled_engine.meta, source_engine.meta[repeated])
+    np.testing.assert_array_equal(sampled_engine.legal, source_engine.legal[repeated])
 
 
 def tiny_actor() -> BloodFlowTransformer:
@@ -336,6 +435,216 @@ def test_full_batch_microbatching_executes_exactly_one_adam_step(monkeypatch) ->
     del actor
 
 
+def test_full_batch_sgd_direction_executes_exactly_one_step(monkeypatch) -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    calls = 0
+    original = torch.optim.SGD.step
+
+    def counted(optimizer, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        return original(optimizer, *args, **kwargs)
+
+    monkeypatch.setattr(torch.optim.SGD, "step", counted)
+    _actor, initial, candidate, metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        learning_rate=0.1,
+        microbatch_size=4,
+        optimizer_name="sgd",
+    )
+
+    assert calls == 1
+    assert metrics["optimizer"] == "sgd"
+    assert metrics["optimizer_steps"] == 1
+    assert any(
+        not torch.equal(initial[name], candidate[name])
+        for name in initial
+        if initial[name].is_floating_point()
+    )
+
+
+def test_direction_optimizer_name_is_strict() -> None:
+    with pytest.raises(ValueError, match="unsupported direction optimizer"):
+        one_step_direction(
+            tiny_actor(),
+            tiny_batch(),
+            torch.device("cpu"),
+            category_weights=np.full(9, 1 / 9),
+            learning_rate=0.1,
+            microbatch_size=4,
+            optimizer_name="sign-sgd",
+        )
+
+
+def test_direction_can_restrict_updates_to_the_policy_head() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    head_names = tuple(
+        name for name, _parameter in reference.named_parameters()
+        if name.startswith("actor.")
+    )
+
+    _actor, initial, candidate, metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        learning_rate=0.1,
+        microbatch_size=4,
+        optimizer_name="sgd",
+        trainable_parameter_names=head_names,
+    )
+
+    assert metrics["trainable_parameters"] < metrics["total_parameters"]
+    assert any(not torch.equal(initial[name], candidate[name]) for name in head_names)
+    assert all(
+        torch.equal(initial[name], candidate[name])
+        for name in initial
+        if name not in set(head_names)
+    )
+    with pytest.raises(ValueError, match="trainable parameter names"):
+        one_step_direction(
+            reference,
+            batch,
+            torch.device("cpu"),
+            category_weights=np.full(9, 1 / 9),
+            learning_rate=0.1,
+            microbatch_size=4,
+            trainable_parameter_names=("missing",),
+    )
+
+
+def test_gradient_clip_can_be_disabled_without_hiding_the_raw_norm() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    kwargs = {
+        "category_weights": np.full(9, 1 / 9),
+        "learning_rate": 0.01,
+        "microbatch_size": 4,
+        "optimizer_name": "sgd",
+    }
+    _clipped_actor, clipped_initial, clipped_candidate, clipped_metrics = (
+        one_step_direction(
+            reference,
+            batch,
+            torch.device("cpu"),
+            gradient_clip_norm=0.05,
+            **kwargs,
+        )
+    )
+    _raw_actor, raw_initial, raw_candidate, raw_metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        gradient_clip_norm=None,
+        **kwargs,
+    )
+
+    def displacement(initial, candidate) -> float:
+        return float(
+            sum(
+                torch.sum((candidate[name].double() - value.double()).square())
+                for name, value in initial.items()
+            ).sqrt()
+        )
+
+    assert clipped_metrics["gradient_was_clipped"] is True
+    assert raw_metrics["gradient_was_clipped"] is False
+    assert raw_metrics["gradient_clip_norm"] is None
+    assert raw_metrics["gradient_norm"] == pytest.approx(
+        clipped_metrics["gradient_norm"]
+    )
+    assert displacement(raw_initial, raw_candidate) > displacement(
+        clipped_initial, clipped_candidate
+    )
+
+
+def test_nesterov_cold_start_is_the_same_raw_direction_as_sgd() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    kwargs = {
+        "category_weights": np.full(9, 1 / 9),
+        "learning_rate": 0.1,
+        "microbatch_size": 4,
+    }
+    _sgd_actor, sgd_initial, sgd_candidate, _sgd_metrics = optimizer_direction(
+        reference, batch, torch.device("cpu"), optimizer_name="sgd", **kwargs
+    )
+    _nag_actor, nag_initial, nag_candidate, nag_metrics = optimizer_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        optimizer_name="nesterov",
+        momentum=0.9,
+        optimizer_state={},
+        **kwargs,
+    )
+    for name in sgd_initial:
+        torch.testing.assert_close(sgd_initial[name], nag_initial[name])
+        torch.testing.assert_close(sgd_candidate[name], nag_candidate[name])
+    assert nag_metrics["gradient_evaluation"] == "lookahead"
+    assert nag_metrics["optimizer_state_parameters"] == 0
+
+
+def test_search_ce_zero_confidence_has_exactly_zero_fresh_gradient() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    target = np.zeros_like(batch.rank_q)
+    target[:, 1] = 1.0
+    actor, initial, candidate, metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        learning_rate=0.1,
+        microbatch_size=4,
+        optimizer_name="sgd",
+        objective="search_ce",
+        policy_targets=target,
+        policy_row_confidence=np.zeros(len(batch), dtype=np.float32),
+    )
+
+    for name in initial:
+        torch.testing.assert_close(candidate[name], initial[name])
+    assert metrics["row_weight_sum"] == 0.0
+    assert metrics["effective_sample_size"] == 0.0
+    assert metrics["supervised_states"] == 0
+    for expected, actual in zip(reference.parameters(), actor.parameters()):
+        torch.testing.assert_close(expected, actual)
+
+
+def test_stateful_optimizer_keeps_the_kl_committed_displacement() -> None:
+    reference = tiny_actor()
+    initial = {
+        name: value.detach().cpu().clone()
+        for name, value in reference.state_dict().items()
+    }
+    with torch.no_grad():
+        next(reference.parameters()).add_(0.01)
+
+    state = committed_optimizer_state("nesterov", initial, reference)
+
+    assert set(state) == {name for name, _parameter in reference.named_parameters()}
+    first_name = next(iter(state))
+    expected = reference.state_dict()[first_name].cpu() - initial[first_name]
+    torch.testing.assert_close(state[first_name], expected)
+    with pytest.raises(ValueError, match="parameter names"):
+        optimizer_direction(
+            tiny_actor(),
+            tiny_batch(),
+            torch.device("cpu"),
+            category_weights=np.full(9, 1 / 9),
+            learning_rate=0.1,
+            microbatch_size=4,
+            optimizer_name="nesterov",
+            optimizer_state={"missing": torch.ones(1)},
+        )
+
+
 def test_calibration_caches_reference_forwards_and_stops_within_tolerance(
     monkeypatch,
 ) -> None:
@@ -382,3 +691,109 @@ def test_calibration_caches_reference_forwards_and_stops_within_tolerance(
     assert 0 <= metrics["final_kl"] <= target
     assert metrics["relative_shortfall"] <= 0.05
     assert metrics["evaluations"] < 15
+
+
+def test_kl_cap_never_enlarges_a_raw_direction() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    actor, initial, candidate, _metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        learning_rate=0.1,
+        microbatch_size=4,
+        optimizer_name="sgd",
+    )
+    states = PolicyStateBatch(
+        **{
+            name: getattr(batch, name)
+            for name in PolicyStateBatch.__dataclass_fields__
+        }
+    )
+    raw = evaluate_direction_scale(
+        actor,
+        reference,
+        initial,
+        candidate,
+        states,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        scale=1.0,
+        batch_size=4,
+    )
+    assert raw["kl"] > 0
+
+    accepted = cap_direction(
+        actor,
+        reference,
+        initial,
+        candidate,
+        states,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        kl_cap=2 * raw["kl"],
+        batch_size=4,
+        search_steps=12,
+    )
+    assert accepted["scale"] == pytest.approx(1.0)
+    assert accepted["cap_activated"] is False
+    expected = tiny_actor()
+    expected.load_state_dict(candidate)
+    for name, value in actor.state_dict().items():
+        torch.testing.assert_close(value.cpu(), expected.state_dict()[name].cpu())
+
+    capped = cap_direction(
+        actor,
+        reference,
+        initial,
+        candidate,
+        states,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        kl_cap=raw["kl"] / 4,
+        batch_size=4,
+        search_steps=18,
+    )
+    assert capped["cap_activated"] is True
+    assert 0 < capped["scale"] < 1
+    assert capped["final_kl"] <= capped["kl_cap"]
+
+
+def test_fixed_direction_scale_loads_the_requested_endpoint() -> None:
+    reference = tiny_actor()
+    batch = tiny_batch()
+    actor, initial, candidate, _metrics = one_step_direction(
+        reference,
+        batch,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        learning_rate=1e-3,
+        microbatch_size=4,
+    )
+    states = PolicyStateBatch(
+        **{
+            name: getattr(batch, name)
+            for name in PolicyStateBatch.__dataclass_fields__
+        }
+    )
+
+    metrics = evaluate_direction_scale(
+        actor,
+        reference,
+        initial,
+        candidate,
+        states,
+        torch.device("cpu"),
+        category_weights=np.full(9, 1 / 9),
+        scale=0.5,
+        batch_size=4,
+    )
+
+    assert metrics["scale"] == pytest.approx(0.5)
+    assert metrics["kl"] >= 0
+    assert 0 <= metrics["greedy_flip_rate"] <= 1
+    expected = tiny_actor()
+    load_scaled_direction(expected, initial, candidate, 0.5)
+    for name, value in actor.state_dict().items():
+        torch.testing.assert_close(value.cpu(), expected.state_dict()[name].cpu())

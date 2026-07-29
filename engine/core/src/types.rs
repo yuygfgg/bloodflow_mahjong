@@ -53,10 +53,6 @@ impl Tile {
     pub const fn is_terminal(self) -> bool {
         self.rank() == 0 || self.rank() == 8
     }
-
-    pub const fn is_two_five_eight(self) -> bool {
-        matches!(self.rank(), 1 | 4 | 7)
-    }
 }
 
 impl fmt::Display for Tile {

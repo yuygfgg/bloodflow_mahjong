@@ -154,6 +154,42 @@ def test_two_thirds_self_play_is_exact_and_seed_deterministic() -> None:
     )
 
 
+def test_rule_fast_anchor_preserves_one_fast_seat_at_half_self_play() -> None:
+    config = CollectionConfig(envs=1024, history=32)
+    left = TrajectoryCollector(
+        config,
+        tiny_actor(),
+        torch.device("cpu"),
+        seed=31,
+        self_play_fraction=0.5,
+        anchor_rule_fast=True,
+    )._lineups(1024, focal_offset=3)
+    right = TrajectoryCollector(
+        config,
+        tiny_actor(),
+        torch.device("cpu"),
+        seed=31,
+        self_play_fraction=0.5,
+        anchor_rule_fast=True,
+    )._lineups(1024, focal_offset=3)
+    np.testing.assert_array_equal(left.sources, right.sources)
+    assert np.all(
+        np.count_nonzero(left.sources == int(ReplaySource.CURRENT), axis=1) == 1
+    )
+    assert np.all(
+        np.count_nonzero(left.sources == int(ReplaySource.RULE_FAST), axis=1) == 1
+    )
+    self_play_seats = np.count_nonzero(
+        left.sources == int(ReplaySource.SELF_PLAY), axis=1
+    )
+    assert np.isin(self_play_seats, (1, 2)).all()
+    assert self_play_seats.mean() == pytest.approx(1.5, abs=0.05)
+    safe_seats = np.count_nonzero(
+        left.sources == int(ReplaySource.RULE_SAFE), axis=1
+    )
+    np.testing.assert_array_equal(safe_seats, 2 - self_play_seats)
+
+
 def test_collection_routes_current_and_self_play_to_separate_models(monkeypatch) -> None:
     focal = tiny_actor()
     opponent = tiny_actor()

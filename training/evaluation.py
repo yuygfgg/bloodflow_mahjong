@@ -35,15 +35,40 @@ def collect_fixed_panel(
     envs: int,
     on_progress: EvaluationProgress | None = None,
 ) -> CollectionResult:
+    return collect_policy_panel(
+        actor,
+        device,
+        seeds,
+        envs=envs,
+        self_play_fraction=0.0,
+        on_progress=on_progress,
+    )
+
+
+def collect_policy_panel(
+    actor: BloodFlowTransformer,
+    device: torch.device,
+    seeds: np.ndarray,
+    *,
+    envs: int,
+    self_play_fraction: float,
+    self_play_actor: BloodFlowTransformer | None = None,
+    anchor_rule_fast: bool = False,
+    lineup_seed: int = 0,
+    on_progress: EvaluationProgress | None = None,
+) -> CollectionResult:
+    """Collect a seeded focal-policy panel against one reproducible lineup mix."""
     seeds = np.ascontiguousarray(seeds, dtype=np.uint64)
     if seeds.ndim != 1 or not len(seeds) or envs <= 0:
-        raise ValueError("fixed panel needs seeds and positive envs")
+        raise ValueError("policy panel needs seeds and positive envs")
     collector = TrajectoryCollector(
         CollectionConfig(envs=min(envs, len(seeds)), history=actor.config.max_history),
         actor,
         device,
-        seed=0,
-        self_play_fraction=0.0,
+        seed=lineup_seed,
+        self_play_fraction=self_play_fraction,
+        self_play_actor=self_play_actor,
+        anchor_rule_fast=anchor_rule_fast,
     )
     trajectories = []
     focal_rows = []
@@ -126,11 +151,15 @@ def bootstrap_mean_interval(
         raise ValueError("bootstrap needs values and positive samples")
     random = np.random.default_rng(seed)
     means = np.empty(samples, dtype=np.float64)
+    support, frequencies = np.unique(values, return_counts=True)
+    probabilities = frequencies.astype(np.float64) / len(values)
     chunk = min(256, samples)
     for start in range(0, samples, chunk):
         stop = min(start + chunk, samples)
-        indices = random.integers(0, len(values), size=(stop - start, len(values)))
-        means[start:stop] = values[indices].mean(axis=1)
+        bootstrap_counts = random.multinomial(
+            len(values), probabilities, size=stop - start
+        )
+        means[start:stop] = bootstrap_counts @ support / len(values)
     low, high = np.quantile(means, (0.025, 0.975))
     return {
         "mean": float(values.mean()),
@@ -248,6 +277,7 @@ __all__ = [
     "atomic_json",
     "bootstrap_mean_interval",
     "collect_fixed_panel",
+    "collect_policy_panel",
     "evaluation_seeds",
     "load_reference_panel",
     "outcomes",

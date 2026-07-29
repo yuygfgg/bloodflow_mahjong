@@ -55,8 +55,8 @@ from .policy_iteration import (
 from .progress import Progress
 
 
-SWEEP_VERSION = 4
-MULTI_SWEEP_VERSION = 1
+SWEEP_VERSION = 5
+MULTI_SWEEP_VERSION = 2
 SHARED_CACHE_VERSION = 1
 DIRECTION_CACHE_VERSION = 1
 ACTOR_PANEL_VERSION = 1
@@ -100,6 +100,8 @@ class SweepConfig:
     evaluation_games: int = 16_384
     evaluation_envs: int = 512
     bootstrap_samples: int = 10_000
+    self_play_fraction: float = 0.0
+    anchor_rule_fast: bool = False
 
     def __post_init__(self) -> None:
         nested = tuple(int(value) for value in self.batch_queries_per_category)
@@ -139,6 +141,10 @@ class SweepConfig:
             raise ValueError("calibration games cannot cover independent queries")
         if self.heldout_source_games < 9 * self.heldout_queries_per_category:
             raise ValueError("heldout games cannot cover independent queries")
+        if not 0.0 <= self.self_play_fraction <= 2.0 / 3.0:
+            raise ValueError("self-play fraction must be in [0, 2/3]")
+        if not isinstance(self.anchor_rule_fast, bool):
+            raise TypeError("anchor_rule_fast must be a bool")
 
 
 def _atomic_json(path: Path, value: object) -> None:
@@ -160,6 +166,61 @@ def _sha256(path: Path) -> str:
         while chunk := stream.read(1024 * 1024):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _checkpoint_identity(
+    reference_checkpoint: Path,
+    self_play_checkpoint: Path | None,
+    config: SweepConfig,
+) -> dict[str, object]:
+    reference_checkpoint = reference_checkpoint.resolve()
+    if not reference_checkpoint.exists():
+        raise FileNotFoundError(reference_checkpoint)
+    if config.self_play_fraction > 0.0:
+        if self_play_checkpoint is None:
+            raise ValueError(
+                "positive self-play fraction requires --self-play-checkpoint"
+            )
+        self_play_checkpoint = self_play_checkpoint.resolve()
+        if not self_play_checkpoint.exists():
+            raise FileNotFoundError(self_play_checkpoint)
+    elif self_play_checkpoint is not None:
+        raise ValueError(
+            "--self-play-checkpoint requires a positive --self-play-fraction"
+        )
+    return {
+        "reference_checkpoint": str(reference_checkpoint),
+        "reference_sha256": _sha256(reference_checkpoint),
+        "self_play_checkpoint": (
+            None if self_play_checkpoint is None else str(self_play_checkpoint)
+        ),
+        "self_play_sha256": (
+            None if self_play_checkpoint is None else _sha256(self_play_checkpoint)
+        ),
+    }
+
+
+def _single_identity(
+    reference_checkpoint: Path,
+    self_play_checkpoint: Path | None,
+    config: SweepConfig,
+    seed: int,
+) -> dict[str, object]:
+    return json.loads(
+        json.dumps(
+            {
+                "version": SWEEP_VERSION,
+                "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
+                "policy_execution_version": POLICY_EXECUTION_VERSION,
+                "seed": int(seed),
+                **_checkpoint_identity(
+                    reference_checkpoint, self_play_checkpoint, config
+                ),
+                "config": asdict(config),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 def _model_digest(model) -> str:
@@ -313,6 +374,9 @@ def _collect(
     device: torch.device,
     progress: Progress,
     *,
+    self_play_actor=None,
+    self_play_fraction: float = 0.0,
+    anchor_rule_fast: bool = False,
     games: int,
     envs: int,
     qpc: int,
@@ -326,7 +390,9 @@ def _collect(
         actor,
         device,
         seed=source_seed,
-        self_play_fraction=0.0,
+        self_play_fraction=self_play_fraction,
+        self_play_actor=self_play_actor,
+        anchor_rule_fast=anchor_rule_fast,
     )
 
     def report(done: int, states: int, elapsed: float) -> None:
@@ -356,6 +422,7 @@ def _targets(
     device: torch.device,
     progress: Progress,
     *,
+    self_play_actor=None,
     phase: str,
     fingerprint: str,
     worlds: int,
@@ -376,6 +443,7 @@ def _targets(
         queries,
         actor,
         device,
+        self_play_actor=self_play_actor,
         fingerprint=fingerprint,
         worlds=worlds,
         world_chunk=world_chunk,
@@ -397,12 +465,12 @@ def _reference_panel(
     *,
     seed: int,
     config: SweepConfig,
-    sl_hash: str,
+    reference_hash: str,
 ):
     seeds = evaluation_seeds(domain_seed(seed, FIXED_EVAL), config.evaluation_games)
     fingerprint = _fingerprint(
         {
-            "sl": sl_hash,
+            "reference": reference_hash,
             "policy_execution_version": POLICY_EXECUTION_VERSION,
             "seed": int(domain_seed(seed, FIXED_EVAL)),
             "games": config.evaluation_games,
@@ -437,34 +505,26 @@ def _reference_panel(
 
 
 def run(
-    sl_checkpoint: Path,
+    reference_checkpoint: Path,
     output_dir: Path,
     *,
+    self_play_checkpoint: Path | None = None,
     config: SweepConfig | None = None,
     seed: int = 20260727,
     device: str | torch.device | None = None,
 ) -> dict[str, object]:
     config = config or SweepConfig()
-    resolved = require_cuda(device)
-    if not sl_checkpoint.exists():
-        raise FileNotFoundError(sl_checkpoint)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    sl_checkpoint = sl_checkpoint.resolve()
-    sl_hash = _sha256(sl_checkpoint)
-    identity = json.loads(
-        json.dumps(
-            {
-                "version": SWEEP_VERSION,
-                "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
-                "policy_execution_version": POLICY_EXECUTION_VERSION,
-                "seed": seed,
-                "sl_checkpoint": str(sl_checkpoint),
-                "sl_sha256": sl_hash,
-                "config": asdict(config),
-            },
-            sort_keys=True,
-        )
+    identity = _single_identity(
+        reference_checkpoint, self_play_checkpoint, config, seed
     )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    reference_checkpoint = Path(str(identity["reference_checkpoint"]))
+    self_play_checkpoint = (
+        None
+        if identity["self_play_checkpoint"] is None
+        else Path(str(identity["self_play_checkpoint"]))
+    )
+    reference_hash = str(identity["reference_sha256"])
     config_path = output_dir / "config.json"
     if config_path.exists():
         if json.loads(config_path.read_text()) != identity:
@@ -499,17 +559,29 @@ def run(
         print(f"RESULT cached complete  {summary_path}", flush=True)
         return summary
 
+    resolved = require_cuda(device)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed & 0xFFFF_FFFF)
     torch.set_float32_matmul_precision("high")
     torch.backends.cuda.matmul.allow_tf32 = True
-    reference = load_policy(sl_checkpoint, resolved, frozen=True)
+    reference = load_policy(reference_checkpoint, resolved, frozen=True)
     require_deterministic_actor(reference)
+    self_play_actor = (
+        None
+        if self_play_checkpoint is None
+        else load_policy(self_play_checkpoint, resolved, frozen=True)
+    )
+    if self_play_actor is not None:
+        require_deterministic_actor(self_play_actor)
+        if self_play_actor.config != reference.config:
+            raise ValueError("self-play Actor config must match the reference Actor")
     progress = Progress()
     print(
         f"CUDA {torch.cuda.get_device_name(resolved)}  nested batch sweep  "
-        f"QPC {','.join(map(str, config.batch_queries_per_category))}",
+        f"QPC {','.join(map(str, config.batch_queries_per_category))}  "
+        f"self {100 * config.self_play_fraction:.0f}%  "
+        f"fast-anchor {'on' if config.anchor_rule_fast else 'off'}",
         flush=True,
     )
 
@@ -550,6 +622,9 @@ def run(
             reference,
             resolved,
             progress,
+            self_play_actor=self_play_actor,
+            self_play_fraction=config.self_play_fraction,
+            anchor_rule_fast=config.anchor_rule_fast,
             games=config.source_games,
             envs=config.envs,
             qpc=maximum,
@@ -564,6 +639,7 @@ def run(
             reference,
             resolved,
             progress,
+            self_play_actor=self_play_actor,
             phase="TRAIN_TARGETS",
             fingerprint=_fingerprint(
                 {"identity": identity, "corpus": "train", "qpc": maximum}
@@ -579,6 +655,9 @@ def run(
             reference,
             resolved,
             progress,
+            self_play_actor=self_play_actor,
+            self_play_fraction=config.self_play_fraction,
+            anchor_rule_fast=config.anchor_rule_fast,
             games=config.calibration_source_games,
             envs=config.envs,
             qpc=config.calibration_queries_per_category,
@@ -593,6 +672,9 @@ def run(
             reference,
             resolved,
             progress,
+            self_play_actor=self_play_actor,
+            self_play_fraction=config.self_play_fraction,
+            anchor_rule_fast=config.anchor_rule_fast,
             games=config.heldout_source_games,
             envs=config.envs,
             qpc=config.heldout_queries_per_category,
@@ -616,6 +698,7 @@ def run(
             reference,
             resolved,
             progress,
+            self_play_actor=self_play_actor,
             phase="HELDOUT_TARGETS",
             fingerprint=_fingerprint(
                 {"identity": identity, "corpus": "heldout"}
@@ -663,7 +746,7 @@ def run(
         progress,
         seed=seed,
         config=config,
-        sl_hash=sl_hash,
+        reference_hash=reference_hash,
     )
 
     maximum_batch = subset_counterfactual_batch(train_batch, nested[maximum])
@@ -898,15 +981,16 @@ def run(
 
 
 def _multi_identity(
-    sl_checkpoint: Path, config: SweepConfig, seeds: Sequence[int]
+    reference_checkpoint: Path,
+    config: SweepConfig,
+    seeds: Sequence[int],
+    *,
+    self_play_checkpoint: Path | None = None,
 ) -> dict[str, object]:
     """Return the immutable identity for a multi-seed sweep directory."""
-    sl_checkpoint = sl_checkpoint.resolve()
     normalized = [int(seed) for seed in seeds]
     if not normalized or len(set(normalized)) != len(normalized):
         raise ValueError("multi-seed sweep needs unique seeds")
-    if not sl_checkpoint.exists():
-        raise FileNotFoundError(sl_checkpoint)
     return json.loads(
         json.dumps(
             {
@@ -915,8 +999,9 @@ def _multi_identity(
                 "engine_rules_version": int(bm.ENGINE_RULES_VERSION),
                 "policy_execution_version": POLICY_EXECUTION_VERSION,
                 "seeds": normalized,
-                "sl_checkpoint": str(sl_checkpoint),
-                "sl_sha256": _sha256(sl_checkpoint),
+                **_checkpoint_identity(
+                    reference_checkpoint, self_play_checkpoint, config
+                ),
                 "config": asdict(config),
             },
             sort_keys=True,
@@ -978,7 +1063,7 @@ def _aggregate_multi_seed(
     identity: Mapping[str, object],
     seeds: Sequence[int],
     config: SweepConfig,
-    sl_hash: str,
+    reference_hash: str,
     child_summaries: Mapping[int, Mapping[str, object]],
 ) -> dict[str, object]:
     """Pool raw paired panels and retain per-seed metrics for variance checks."""
@@ -1018,7 +1103,7 @@ def _aggregate_multi_seed(
             )
             reference_fingerprint = _fingerprint(
                 {
-                    "sl": sl_hash,
+                    "reference": reference_hash,
                     "policy_execution_version": POLICY_EXECUTION_VERSION,
                     "seed": int(domain_seed(int(seed), FIXED_EVAL)),
                     "games": config.evaluation_games,
@@ -1134,10 +1219,11 @@ def _load_multi_summary(
 
 
 def run_many(
-    sl_checkpoint: Path,
+    reference_checkpoint: Path,
     output_dir: Path,
     *,
     seeds: Sequence[int],
+    self_play_checkpoint: Path | None = None,
     config: SweepConfig | None = None,
     device: str | torch.device | None = None,
 ) -> dict[str, object]:
@@ -1152,13 +1238,19 @@ def run_many(
         raise ValueError("multi-seed sweep needs unique seeds")
     if len(normalized) == 1:
         return run(
-            sl_checkpoint,
+            reference_checkpoint,
             output_dir,
+            self_play_checkpoint=self_play_checkpoint,
             config=config,
             seed=normalized[0],
             device=device,
         )
-    identity = _multi_identity(sl_checkpoint, config, normalized)
+    identity = _multi_identity(
+        reference_checkpoint,
+        config,
+        normalized,
+        self_play_checkpoint=self_play_checkpoint,
+    )
     _prepare_multi_directory(output_dir, identity)
     aggregate_path = output_dir / "aggregate.json"
     cached = _load_multi_summary(
@@ -1179,8 +1271,9 @@ def run_many(
             flush=True,
         )
         child_summaries[seed] = run(
-            sl_checkpoint,
+            reference_checkpoint,
             child_dir,
+            self_play_checkpoint=self_play_checkpoint,
             config=config,
             seed=seed,
             device=device,
@@ -1191,7 +1284,7 @@ def run_many(
         identity=identity,
         seeds=normalized,
         config=config,
-        sl_hash=str(identity["sl_sha256"]),
+        reference_hash=str(identity["reference_sha256"]),
         child_summaries=child_summaries,
     )
     _atomic_json(aggregate_path, aggregate)
@@ -1216,9 +1309,23 @@ def run_many(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--reference-checkpoint",
         "--sl-checkpoint",
+        dest="reference_checkpoint",
         type=Path,
         default=Path("runs/counterfactual-larger/sl_reference.pt"),
+        help="Actor-only policy to update (--sl-checkpoint is a compatibility alias)",
+    )
+    parser.add_argument(
+        "--self-play-checkpoint",
+        type=Path,
+        help="Actor-only frozen historical opponent for self-play source seats",
+    )
+    parser.add_argument("--self-play-fraction", type=float, default=0.0)
+    parser.add_argument(
+        "--anchor-rule-fast",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--output-dir", type=Path)
     seed_group = parser.add_mutually_exclusive_group()
@@ -1303,6 +1410,8 @@ def main(argv: Sequence[str] | None = None) -> None:
         heldout_worlds=args.heldout_worlds,
         evaluation_games=args.evaluation_games,
         evaluation_envs=args.evaluation_envs,
+        self_play_fraction=args.self_play_fraction,
+        anchor_rule_fast=args.anchor_rule_fast,
     )
     if args.smoke:
         config = replace(
@@ -1343,17 +1452,19 @@ def main(argv: Sequence[str] | None = None) -> None:
     try:
         if args.seeds is None:
             run(
-                args.sl_checkpoint,
+                args.reference_checkpoint,
                 output_dir,
+                self_play_checkpoint=args.self_play_checkpoint,
                 config=config,
                 seed=args.seed,
             )
         else:
             run_many(
-                args.sl_checkpoint,
+                args.reference_checkpoint,
                 output_dir,
                 config=config,
                 seeds=args.seeds,
+                self_play_checkpoint=args.self_play_checkpoint,
             )
     except KeyboardInterrupt:
         print(

@@ -18,6 +18,11 @@ impl Rng {
         self.0.random_range(0..upper)
     }
 
+    #[inline]
+    pub(crate) fn unit_f64(&mut self) -> f64 {
+        self.0.random()
+    }
+
     pub(crate) fn shuffle(&mut self, values: &mut [u8]) {
         values.shuffle(&mut self.0);
     }
