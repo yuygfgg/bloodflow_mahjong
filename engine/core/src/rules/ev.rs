@@ -1912,7 +1912,7 @@ mod tests {
     }
 
     #[test]
-    fn holding_transforms_never_consume_locked_tiles_for_pong() {
+    fn discard_meld_transforms_never_consume_locked_tiles() {
         let pong_tile = tile(Suit::Characters, 5);
         let mut counts = [0; TILE_KIND_COUNT];
         counts[pong_tile.index()] = 3;
@@ -1920,7 +1920,15 @@ mod tests {
         let mut state = holding(counts);
         state.locked[pong_tile.index()] = 2;
         assert!(state.after_pong(pong_tile, Seat::EAST).is_none());
-        assert!(state.after_exposed_kong(pong_tile, Seat::EAST).is_some());
+        assert!(state.after_exposed_kong(pong_tile, Seat::EAST).is_none());
+
+        state.concealed[pong_tile.index()] = 4;
+        state.locked[pong_tile.index()] = 1;
+        let kong = state
+            .after_exposed_kong(pong_tile, Seat::EAST)
+            .expect("three unlocked matching tiles form an exposed Kong");
+        assert_eq!(kong.concealed[pong_tile.index()], 1);
+        assert_eq!(kong.locked[pong_tile.index()], 1);
     }
 
     #[test]

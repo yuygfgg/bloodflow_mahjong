@@ -135,7 +135,7 @@ impl Holding {
 
     pub(crate) fn after_exposed_kong(mut self, tile: Tile, source: Seat) -> Option<Self> {
         if self.missing == Some(tile.suit())
-            || !self.remove_for_meld(tile, 3, true)
+            || !self.remove_for_meld(tile, 3, false)
             || !self.push_meld(Meld {
                 tile,
                 kind: MeldKind::ExposedKong,

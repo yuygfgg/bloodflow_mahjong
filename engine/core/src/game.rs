@@ -18,7 +18,7 @@ const STARTING_SCORE: i64 = 10_000;
 pub(crate) const SCORE_UNIT: i64 = 100;
 /// Increment whenever engine rule semantics or deterministic initialization
 /// change in a way that can invalidate a stored action-sequence replay.
-pub const ENGINE_RULES_VERSION: u32 = 1;
+pub const ENGINE_RULES_VERSION: u32 = 2;
 pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
@@ -367,6 +367,26 @@ impl Player {
     fn unlocked_count(&self, tile: Tile) -> u8 {
         self.concealed[tile.index()].saturating_sub(self.locked[tile.index()])
     }
+
+    fn unlocked_len(&self) -> usize {
+        self.concealed
+            .iter()
+            .zip(self.locked.iter())
+            .map(|(&concealed, &locked)| concealed.saturating_sub(locked) as usize)
+            .sum()
+    }
+
+    fn can_claim_meld(&self, tile: Tile) -> bool {
+        self.meld_count < 4 && self.missing != Some(tile.suit())
+    }
+
+    fn can_pong(&self, tile: Tile) -> bool {
+        self.can_claim_meld(tile) && self.unlocked_count(tile) >= 2 && self.unlocked_len() >= 3
+    }
+
+    fn can_exposed_kong(&self, tile: Tile) -> bool {
+        self.can_claim_meld(tile) && self.unlocked_count(tile) >= 3
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -675,10 +695,7 @@ impl Game {
                             continue;
                         }
                         let player = &sampled.players[seat.index()];
-                        if player.missing == Some(tile.suit()) || player.meld_count >= 4 {
-                            continue;
-                        }
-                        if sampled.can_pong(seat, tile) || player.concealed[tile.index()] >= 3 {
+                        if player.can_pong(tile) || player.can_exposed_kong(tile) {
                             remaining |= seat_bit(seat);
                         }
                     }
@@ -854,9 +871,9 @@ impl Game {
                 let player = &self.players[actor.index()];
                 legal.can_hu = can_hu;
                 legal.discard_mask = self.legal_discard_mask(actor);
-                // After a player has won, only a self-drawn fourth tile for
-                // an existing pong may be used as an added kong.  Concealed
-                // kongs are no longer legal for that player.
+                // After a player has won, concealed kongs are no longer legal.
+                // An existing pong can still use any matching tile in the hand;
+                // that tile need not be the current turn's draw.
                 if !player.has_won && player.meld_count < 4 && origin != TurnOrigin::AfterPong {
                     for index in 0..TILE_KIND_COUNT {
                         let tile = Tile::from_index_unchecked(index as u8);
@@ -885,9 +902,8 @@ impl Game {
             }
             Stage::MeldResponse { tile, .. } => {
                 let player = &self.players[decision.actor.index()];
-                legal.can_pong = self.can_pong(decision.actor, tile);
-                legal.can_exposed_kong =
-                    player.meld_count < 4 && player.concealed[tile.index()] >= 3;
+                legal.can_pong = player.can_pong(tile);
+                legal.can_exposed_kong = player.can_exposed_kong(tile);
                 legal.can_pass = true;
             }
             Stage::Finished => return None,
@@ -1732,8 +1748,8 @@ impl Game {
     ) -> Result<(), GameError> {
         let actor = first_seat_in_mask(source, remaining).ok_or(GameError::InvalidAction)?;
         let player = &self.players[actor.index()];
-        let can_pong = self.can_pong(actor, tile);
-        let can_kong = player.meld_count < 4 && player.concealed[tile.index()] >= 3;
+        let can_pong = player.can_pong(tile);
+        let can_kong = player.can_exposed_kong(tile);
         match action {
             Action::Pong if can_pong => return self.pong(actor, source, tile),
             Action::ExposedKong if can_kong => return self.exposed_kong(actor, source, tile),
@@ -1838,19 +1854,6 @@ impl Game {
         Ok(())
     }
 
-    fn can_pong(&self, actor: Seat, tile: Tile) -> bool {
-        let player = &self.players[actor.index()];
-        player.meld_count < 4
-            && player.unlocked_count(tile) >= 2
-            && player
-                .concealed
-                .iter()
-                .zip(player.locked.iter())
-                .map(|(&concealed, &locked)| concealed.saturating_sub(locked) as usize)
-                .sum::<usize>()
-                >= 3
-    }
-
     fn begin_meld_responses(&mut self, source: Seat, tile: Tile) {
         let mut candidates = 0_u8;
         for seat in Seat::ALL {
@@ -1858,13 +1861,7 @@ impl Game {
                 continue;
             }
             let player = &self.players[seat.index()];
-            if player.missing == Some(tile.suit()) || player.meld_count >= 4 {
-                continue;
-            }
-            // A pong must leave one unlocked tile for the immediate discard
-            // that follows it.  Keep the response window aligned with the
-            // same predicate used by `legal_actions` and `step_meld_response`.
-            if self.can_pong(seat, tile) || player.concealed[tile.index()] >= 3 {
+            if player.can_pong(tile) || player.can_exposed_kong(tile) {
                 candidates |= seat_bit(seat);
             }
         }
@@ -1908,7 +1905,7 @@ impl Game {
     }
 
     fn exposed_kong(&mut self, actor: Seat, source: Seat, tile: Tile) -> Result<(), GameError> {
-        self.remove_for_meld(actor, tile, 3, true);
+        self.remove_for_meld(actor, tile, 3, false);
         let added = self.players[actor.index()].add_meld(Meld {
             tile,
             kind: MeldKind::ExposedKong,
@@ -3976,6 +3973,47 @@ mod tests {
     }
 
     #[test]
+    fn locked_triplet_cannot_form_an_exposed_kong() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let called = tile(Suit::Characters, 1);
+        let next_draw = tile(Suit::Bamboo, 1);
+        let player = &mut game.players[actor.index()];
+        player.concealed[called.index()] = 3;
+        player.locked[called.index()] = 3;
+        player.has_won = true;
+        set_wall(&mut game, &[next_draw]);
+
+        let mut response = game.clone();
+        response.stage = Stage::MeldResponse {
+            source: Seat::EAST,
+            tile: called,
+            remaining: seat_bit(actor),
+        };
+        let before = response.clone();
+        let legal = response.legal_actions().expect("response has a decision");
+        assert!(!legal.can_pong);
+        assert!(!legal.can_exposed_kong);
+        assert!(legal.can_pass);
+        assert_eq!(response.simple_rule_action(), Some(ActionId::PASS));
+        assert_eq!(
+            response.step(Action::ExposedKong),
+            Err(GameError::InvalidAction)
+        );
+        assert_eq!(response, before);
+
+        game.begin_meld_responses(Seat::EAST, called);
+        assert_eq!(
+            game.decision(),
+            Some(Decision {
+                actor,
+                phase: Phase::Turn,
+            })
+        );
+        assert_eq!(game.current_draw().unwrap().tile, next_draw);
+    }
+
+    #[test]
     fn concealed_kong_is_rejected_after_hu() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
@@ -4258,14 +4296,16 @@ mod tests {
     }
 
     #[test]
-    fn added_kong_charges_each_opponent_and_empty_tail_finishes() {
+    fn added_kong_can_use_a_previously_held_tile() {
         let mut game = constructed_game();
         for seat in Seat::ALL {
             make_flower_pig(&mut game.players[seat.index()]);
         }
         let actor = Seat::ALL[1];
         let kong_tile = tile(Suit::Characters, 5);
+        let current_draw = tile(Suit::Bamboo, 5);
         add_tile(&mut game.players[actor.index()], kong_tile, 1);
+        add_tile(&mut game.players[actor.index()], current_draw, 1);
         assert!(game.players[actor.index()].add_meld(Meld {
             tile: kong_tile,
             kind: MeldKind::Pong,
@@ -4273,7 +4313,11 @@ mod tests {
         }));
         game.stage = Stage::Turn {
             actor,
-            origin: TurnOrigin::Initial,
+            origin: TurnOrigin::Draw {
+                tile: current_draw,
+                after_kong: false,
+                last_wall_tile: false,
+            },
             can_hu: false,
         };
 

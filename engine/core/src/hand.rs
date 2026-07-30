@@ -207,7 +207,7 @@ impl WinFlags {
 /// The highest-scoring deterministic interpretation of a winning hand.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct WinEvaluation {
-    /// Structural multiplier before self-draw payment and event multipliers.
+    /// Pattern-and-root multiplier before self-draw payment and event multipliers.
     pub shape_multiplier: u32,
     pub multiplier: u32,
     pub patterns: PatternSet,
@@ -485,11 +485,12 @@ pub fn evaluate_win(
 
 /// Finds the winning tile and structure with the highest possible multiplier.
 ///
-/// Event multipliers are intentionally excluded because this is used for
-/// end-of-wall dajiao settlement. The hypothetical tile is required to be in
-/// the selected structure. A configured missing suit rejects hands or melds
-/// which still contain that suit and is not searched for a winning tile.
-/// Equal-multiplier waits are resolved in tile order.
+/// Pattern and root multipliers are included. Event multipliers are
+/// intentionally excluded because this is used for end-of-wall dajiao
+/// settlement. The hypothetical tile is required to be in the selected
+/// structure. A configured missing suit rejects hands or melds which still
+/// contain that suit and is not searched for a winning tile. Equal-multiplier
+/// waits are resolved in tile order.
 pub fn evaluate_max_wait(
     counts: &[u8; TILE_KIND_COUNT],
     melds: &[Meld],

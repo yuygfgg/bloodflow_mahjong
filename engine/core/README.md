@@ -44,7 +44,7 @@ fn play(seed: u64) -> Result<Game, GameError> {
 - `is_winning`：判断指定持牌是否包含合法和牌结构；
 - `evaluate_win`：选择倍率最高的和牌拆分；
 - `analyze_shanten`：返回结构向听数和有效牌 mask；
-- `evaluate_max_wait`：返回查大叫所需的最大牌型倍率。
+- `evaluate_max_wait`：返回查大叫所需的最大牌型与根倍率；不计算状态/事件番。
 
 向听数是传统结构指标。玩家已经胡牌后，旧结构仍保留在扩展持牌中。因此，`SHANTEN_COMPLETE` 不能解释为“距离下一次血流胡牌一步”。
 
