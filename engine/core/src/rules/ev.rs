@@ -4,8 +4,11 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use rayon::prelude::*;
 
 use crate::game::{Batch, Game, GameError, LegalActions, PARALLEL_BATCH_THRESHOLD, Phase};
-use crate::types::{Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
+use crate::types::{PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
 use crate::{ACTION_SPACE_SIZE, Action, ActionId, WinFlags, analyze_shanten, evaluate_win};
+
+use super::hand::{DUMMY_MELD, Holding, all_tiles, hand_structure_score, mask_tiles};
+use super::opening;
 
 /// Sentinel written for terminal batch slots by [`Batch::rule_ev_actions_into`].
 pub const RULE_EV_ACTION_TERMINAL: u8 = u8::MAX;
@@ -139,12 +142,6 @@ const MAX_SEARCH_DEPTH: u8 = 3;
 const MAX_SEARCH_WORLDS: u16 = 256;
 const DEEP_SEARCH_DISCOUNT: u64 = 1;
 
-const DUMMY_MELD: Meld = Meld {
-    tile: Tile::from_index_unchecked(0),
-    kind: MeldKind::Pong,
-    source: Seat::EAST,
-};
-
 /// Compute budget for deterministic rule-EV lookahead.
 ///
 /// Depth zero uses static hand evaluation. Each additional level enumerates
@@ -255,8 +252,12 @@ impl Game {
         }
         let actor = legal.decision.actor;
         let action = match legal.decision.phase {
-            Phase::Exchange => choose_exchange(self, actor, legal.exchange_mask),
-            Phase::ChooseMissing => choose_missing(self, actor),
+            Phase::Exchange => opening::choose_exchange(
+                self.concealed(actor),
+                self.exchange_selection(actor),
+                legal.exchange_mask,
+            ),
+            Phase::ChooseMissing => opening::choose_missing(self.concealed(actor)),
             Phase::Turn => choose_turn(self, actor, &legal, config),
             Phase::HuResponse => ActionId::HU,
             Phase::MeldResponse => choose_meld_response(self, actor, &legal, config),
@@ -403,6 +404,7 @@ struct RolloutPolicy {
 }
 
 impl RolloutPolicy {
+    #[cfg(feature = "rule-ev-analysis")]
     const fn homogeneous(config: RuleEvConfig) -> Self {
         Self {
             root: config,
@@ -919,8 +921,12 @@ fn score_search_actions(
 fn heuristic_action(game: &Game, legal: &LegalActions, config: RuleEvConfig) -> ActionId {
     let actor = legal.decision.actor;
     match legal.decision.phase {
-        Phase::Exchange => choose_exchange(game, actor, legal.exchange_mask),
-        Phase::ChooseMissing => choose_missing(game, actor),
+        Phase::Exchange => opening::choose_exchange(
+            game.concealed(actor),
+            game.exchange_selection(actor),
+            legal.exchange_mask,
+        ),
+        Phase::ChooseMissing => opening::choose_missing(game.concealed(actor)),
         Phase::Turn => choose_turn(game, actor, legal, config),
         Phase::HuResponse => ActionId::HU,
         Phase::MeldResponse => choose_meld_response(game, actor, legal, config),
@@ -1032,135 +1038,6 @@ fn mix_search_seed(mut value: u64) -> u64 {
     value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
     value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
     value ^ (value >> 31)
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct Holding {
-    concealed: [u8; TILE_KIND_COUNT],
-    locked: [u8; TILE_KIND_COUNT],
-    melds: [Meld; 4],
-    meld_len: usize,
-    missing: Option<Suit>,
-}
-
-impl Holding {
-    fn from_game(game: &Game, actor: Seat) -> Self {
-        let mut melds = [DUMMY_MELD; 4];
-        let meld_len = game.meld_count(actor);
-        for (index, meld) in melds.iter_mut().enumerate().take(meld_len) {
-            *meld = game.meld(actor, index).expect("meld slots are dense");
-        }
-        Self {
-            concealed: *game.concealed(actor),
-            locked: *game.locked(actor),
-            melds,
-            meld_len,
-            missing: game.missing_suit(actor),
-        }
-    }
-
-    fn melds(&self) -> &[Meld] {
-        &self.melds[..self.meld_len]
-    }
-
-    fn unlocked_count(&self, tile: Tile) -> u8 {
-        self.concealed[tile.index()].saturating_sub(self.locked[tile.index()])
-    }
-
-    fn missing_count(&self) -> u8 {
-        self.missing
-            .map_or(0, |suit| suit_count(&self.concealed, suit))
-    }
-
-    fn discard_mask(&self) -> u32 {
-        let mut unlocked = 0_u32;
-        for tile in all_tiles() {
-            if self.unlocked_count(tile) != 0 {
-                unlocked |= 1 << tile.index();
-            }
-        }
-        let forced = self.missing.map_or(0, Suit::mask) & unlocked;
-        if forced == 0 { unlocked } else { forced }
-    }
-
-    fn after_discard(mut self, tile: Tile) -> Option<Self> {
-        if self.unlocked_count(tile) == 0 {
-            return None;
-        }
-        self.concealed[tile.index()] -= 1;
-        Some(self)
-    }
-
-    fn remove_for_meld(&mut self, tile: Tile, amount: u8, allow_locked: bool) -> bool {
-        let index = tile.index();
-        if self.concealed[index] < amount || (!allow_locked && self.unlocked_count(tile) < amount) {
-            return false;
-        }
-        if allow_locked {
-            self.locked[index] -= self.locked[index].min(amount);
-        }
-        self.concealed[index] -= amount;
-        true
-    }
-
-    fn push_meld(&mut self, meld: Meld) -> bool {
-        if self.meld_len == self.melds.len() {
-            return false;
-        }
-        self.melds[self.meld_len] = meld;
-        self.meld_len += 1;
-        true
-    }
-
-    fn after_pong(mut self, tile: Tile, source: Seat) -> Option<Self> {
-        if !self.remove_for_meld(tile, 2, false)
-            || !self.push_meld(Meld {
-                tile,
-                kind: MeldKind::Pong,
-                source,
-            })
-        {
-            return None;
-        }
-        Some(self)
-    }
-
-    fn after_exposed_kong(mut self, tile: Tile, source: Seat) -> Option<Self> {
-        if !self.remove_for_meld(tile, 3, true)
-            || !self.push_meld(Meld {
-                tile,
-                kind: MeldKind::ExposedKong,
-                source,
-            })
-        {
-            return None;
-        }
-        Some(self)
-    }
-
-    fn after_concealed_kong(mut self, tile: Tile, actor: Seat) -> Option<Self> {
-        if !self.remove_for_meld(tile, 4, true)
-            || !self.push_meld(Meld {
-                tile,
-                kind: MeldKind::ConcealedKong,
-                source: actor,
-            })
-        {
-            return None;
-        }
-        Some(self)
-    }
-
-    fn after_added_kong(mut self, tile: Tile) -> Option<Self> {
-        if !self.remove_for_meld(tile, 1, true) {
-            return None;
-        }
-        let meld = self.melds[..self.meld_len]
-            .iter_mut()
-            .find(|meld| meld.kind == MeldKind::Pong && meld.tile == tile)?;
-        meld.kind = MeldKind::AddedKong;
-        Some(self)
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1334,183 +1211,6 @@ fn wait_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> WaitQual
         augmented[tile.index()] = holding.concealed[tile.index()];
     }
     result
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct OpeningQuality {
-    estimated_turns: u8,
-    shanten: i8,
-    missing_tiles: u8,
-    live_improvements: u16,
-    structure: i32,
-}
-
-impl OpeningQuality {
-    fn cmp_quality(self, other: Self) -> Ordering {
-        other
-            .estimated_turns
-            .cmp(&self.estimated_turns)
-            .then_with(|| other.shanten.cmp(&self.shanten))
-            .then_with(|| other.missing_tiles.cmp(&self.missing_tiles))
-            .then_with(|| self.live_improvements.cmp(&other.live_improvements))
-            .then_with(|| self.structure.cmp(&other.structure))
-    }
-}
-
-fn opening_quality(
-    counts: &[u8; TILE_KIND_COUNT],
-    exposure: &[u8; TILE_KIND_COUNT],
-    missing: Suit,
-) -> OpeningQuality {
-    let analysis = analyze_shanten(counts, &[], Some(missing));
-    let missing_tiles = suit_count(counts, missing);
-    let structural_turns =
-        u8::try_from(analysis.shanten.max(0) + 1).expect("shanten is a small non-negative value");
-    OpeningQuality {
-        estimated_turns: missing_tiles.max(structural_turns),
-        shanten: analysis.shanten,
-        missing_tiles,
-        live_improvements: remaining_copies(analysis.improving_tiles, exposure),
-        structure: structure_without_suit(counts, missing),
-    }
-}
-
-fn best_missing_choice(
-    counts: &[u8; TILE_KIND_COUNT],
-    exposure: &[u8; TILE_KIND_COUNT],
-) -> (Suit, OpeningQuality) {
-    let mut best: Option<(Suit, OpeningQuality)> = None;
-    for suit in Suit::ALL {
-        let quality = opening_quality(counts, exposure, suit);
-        if best.is_none_or(|(current_suit, current)| {
-            quality.cmp_quality(current) == Ordering::Greater
-                || (quality == current && (suit as u8) < current_suit as u8)
-        }) {
-            best = Some((suit, quality));
-        }
-    }
-    best.expect("three suits are always available")
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct ExchangePlan {
-    quality: OpeningQuality,
-    next_tile: Tile,
-}
-
-fn choose_exchange(game: &Game, actor: Seat, legal_mask: u32) -> ActionId {
-    let counts = *game.concealed(actor);
-    let selected = *game.exchange_selection(actor);
-    let selected_count: u8 = selected.iter().copied().sum();
-    let mut best = None;
-
-    if selected_count == 0 {
-        for suit in Suit::ALL {
-            if legal_mask & suit.mask() == 0 {
-                continue;
-            }
-            let mut outgoing = selected;
-            search_exchange_plans(
-                &counts,
-                &selected,
-                legal_mask,
-                suit,
-                suit as usize * 9,
-                3,
-                &mut outgoing,
-                &mut best,
-            );
-        }
-    } else {
-        let suit = all_tiles()
-            .find(|tile| selected[tile.index()] != 0)
-            .map(Tile::suit)
-            .expect("a partial exchange has a selected suit");
-        let mut outgoing = selected;
-        search_exchange_plans(
-            &counts,
-            &selected,
-            legal_mask,
-            suit,
-            suit as usize * 9,
-            3 - selected_count,
-            &mut outgoing,
-            &mut best,
-        );
-    }
-
-    ActionId::select_exchange_tile(
-        best.expect("an exchange decision has a complete legal plan")
-            .next_tile,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn search_exchange_plans(
-    counts: &[u8; TILE_KIND_COUNT],
-    original_selected: &[u8; TILE_KIND_COUNT],
-    legal_mask: u32,
-    suit: Suit,
-    start: usize,
-    needed: u8,
-    outgoing: &mut [u8; TILE_KIND_COUNT],
-    best: &mut Option<ExchangePlan>,
-) {
-    if needed == 0 {
-        let mut remaining = *counts;
-        for (count, selected) in remaining.iter_mut().zip(outgoing.iter().copied()) {
-            *count -= selected;
-        }
-        let (_, quality) = best_missing_choice(&remaining, counts);
-        let next_tile = all_tiles()
-            .find(|tile| {
-                outgoing[tile.index()] > original_selected[tile.index()]
-                    && legal_mask & (1 << tile.index()) != 0
-            })
-            .expect("a completed plan adds a legal tile");
-        let plan = ExchangePlan { quality, next_tile };
-        if best.is_none_or(|current| exchange_plan_better(plan, current)) {
-            *best = Some(plan);
-        }
-        return;
-    }
-
-    let end = suit as usize * 9 + 9;
-    for index in start..end {
-        if outgoing[index] >= counts[index] {
-            continue;
-        }
-        outgoing[index] += 1;
-        search_exchange_plans(
-            counts,
-            original_selected,
-            legal_mask,
-            suit,
-            index,
-            needed - 1,
-            outgoing,
-            best,
-        );
-        outgoing[index] -= 1;
-    }
-}
-
-fn exchange_plan_better(candidate: ExchangePlan, current: ExchangePlan) -> bool {
-    candidate.quality.cmp_quality(current.quality) == Ordering::Greater
-        || (candidate.quality == current.quality
-            && (
-                edge_distance(candidate.next_tile),
-                u8::MAX - candidate.next_tile.as_u8(),
-            ) > (
-                edge_distance(current.next_tile),
-                u8::MAX - current.next_tile.as_u8(),
-            ))
-}
-
-fn choose_missing(game: &Game, actor: Seat) -> ActionId {
-    let counts = game.concealed(actor);
-    let (suit, _) = best_missing_choice(counts, counts);
-    ActionId::choose_missing(suit)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1963,75 +1663,8 @@ fn remaining_copies(mask: u32, exposure: &[u8; TILE_KIND_COUNT]) -> u16 {
         .sum()
 }
 
-fn hand_structure_score(counts: &[u8; TILE_KIND_COUNT]) -> i32 {
-    Suit::ALL
-        .into_iter()
-        .map(|suit| suit_structure_score(counts, suit))
-        .sum()
-}
-
-fn structure_without_suit(counts: &[u8; TILE_KIND_COUNT], missing: Suit) -> i32 {
-    Suit::ALL
-        .into_iter()
-        .filter(|&suit| suit != missing)
-        .map(|suit| suit_structure_score(counts, suit))
-        .sum()
-}
-
-fn suit_structure_score(counts: &[u8; TILE_KIND_COUNT], suit: Suit) -> i32 {
-    let start = suit as usize * 9;
-    let suit_counts = &counts[start..start + 9];
-    let mut score = 0_i32;
-    for (rank, &count) in suit_counts.iter().enumerate() {
-        let count = i32::from(count);
-        score += count * (4 - (rank as i32 - 4).abs());
-        if count >= 2 {
-            score += 8;
-        }
-        if count >= 3 {
-            score += 12;
-        }
-        if count == 4 {
-            score += 2;
-        }
-    }
-    for rank in 0..8 {
-        score += 3 * i32::from(suit_counts[rank].min(suit_counts[rank + 1]));
-    }
-    for rank in 0..7 {
-        score += 2 * i32::from(suit_counts[rank].min(suit_counts[rank + 2]));
-        score += 12
-            * i32::from(
-                suit_counts[rank]
-                    .min(suit_counts[rank + 1])
-                    .min(suit_counts[rank + 2]),
-            );
-    }
-    score
-}
-
-fn suit_count(counts: &[u8; TILE_KIND_COUNT], suit: Suit) -> u8 {
-    let start = suit as usize * 9;
-    counts[start..start + 9].iter().copied().sum()
-}
-
 fn edge_distance(tile: Tile) -> u8 {
     tile.rank().abs_diff(4)
-}
-
-fn all_tiles() -> impl Iterator<Item = Tile> {
-    (0..TILE_KIND_COUNT).map(|index| Tile::from_index_unchecked(index as u8))
-}
-
-fn mask_tiles(mut mask: u32) -> impl Iterator<Item = Tile> {
-    core::iter::from_fn(move || {
-        if mask == 0 {
-            return None;
-        }
-        let index = mask.trailing_zeros() as u8;
-        mask &= mask - 1;
-        Some(Tile::from_index_unchecked(index))
-    })
 }
 
 const _: () = assert!(RULE_EV_ACTION_TERMINAL as usize >= ACTION_SPACE_SIZE);
@@ -2357,34 +1990,5 @@ mod tests {
             },
             false,
         ));
-    }
-
-    #[test]
-    fn exchange_search_returns_one_legal_tile_from_a_complete_plan() {
-        let mut counts = [0; TILE_KIND_COUNT];
-        for rank in 1..=5 {
-            counts[tile(Suit::Characters, rank).index()] = 1;
-        }
-        for rank in 1..=4 {
-            counts[tile(Suit::Bamboo, rank).index()] = 1;
-            counts[tile(Suit::Dots, rank).index()] = 1;
-        }
-        let legal = Suit::Characters.mask() | Suit::Bamboo.mask() | Suit::Dots.mask();
-        let selected = [0; TILE_KIND_COUNT];
-        let mut outgoing = selected;
-        let mut best = None;
-        search_exchange_plans(
-            &counts,
-            &selected,
-            legal,
-            Suit::Characters,
-            0,
-            3,
-            &mut outgoing,
-            &mut best,
-        );
-        let plan = best.expect("the suit contains three tiles");
-        assert_ne!(legal & (1 << plan.next_tile.index()), 0);
-        assert_eq!(plan.next_tile.suit(), Suit::Characters);
     }
 }

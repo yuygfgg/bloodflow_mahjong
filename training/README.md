@@ -1,5 +1,7 @@
 # 训练
 
+> 文档状态：本文保留 Python 训练实验的使用说明。当前未发现已知过时内容，但该训练路径已不再作为 Rust 主线维护，后续可能与代码产生偏差。旧文中的“规则对手”均指固定策略，不指游戏规则。
+
 当前推荐主线是 CUDA champion/candidate policy generation。它从 SL 训练得到的 U61 Actor 开始。每个 attempt 冻结 champion，采集 4 批九类各 128 个状态，使用独立的 32-world selection、64-world validation 和 32-world audit。validation 使用 paired mean-rank advantage、lower confidence bound 和 BH-FDR=0.05。通过验证的行形成 mirror CE target；未通过行的梯度权重为零。audit 只续局 candidate 与 champion greedy action 不同的状态，但未翻转状态仍以零差值进入完整统计。
 
 一个 generation 内执行 4 个 Nesterov inner steps。速度只在该 generation 内保留。每一步都投影到相对 champion 的累计 `KL <= 1e-4`。最终 candidate 在 fixed-rule 和 historical-opponent 阵容各跑 65536 局配对 arena。只有 pooled dRank 显著改善且所有名次、分差和 audit 安全护栏通过时，candidate 才会晋升。拒绝不会修改 champion、自博弈课程或 opponent snapshots，但会推进历史对手轮换游标。

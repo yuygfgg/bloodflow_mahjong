@@ -1,5 +1,7 @@
 # 保守策略迭代训练
 
+> 文档状态：本文保留 Python 训练实验的完整说明。当前未发现已知过时内容，但该训练路径已不再作为 Rust 主线维护，后续可能与代码产生偏差。旧文中的“规则对手”均指固定策略，不指游戏规则。
+
 `python -m training.train` 是正式训练入口。推荐主线从 U61 champion 启动 `rank_lcb_mirror_ce` generation。旧的 `expected_q`、split CE 和单步 AdamW/SGD 路径仍可复现实验，但不再用于继续主线。
 
 ```text

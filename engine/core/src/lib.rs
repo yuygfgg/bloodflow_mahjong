@@ -10,8 +10,7 @@ mod action;
 mod game;
 mod hand;
 mod rng;
-mod rule_agent;
-mod rule_ev;
+mod rules;
 mod types;
 
 pub use action::{
@@ -34,14 +33,18 @@ pub use hand::{
     ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten, evaluate_max_wait, evaluate_shanten,
     evaluate_win, is_winning,
 };
-pub use rule_agent::SIMPLE_RULE_ACTION_TERMINAL;
-pub use rule_ev::{
+pub use rules::ev::{
     RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense, RuleEvSearchStats,
     reset_rule_ev_search_stats, rule_ev_search_stats,
 };
 #[cfg(feature = "rule-ev-analysis")]
-pub use rule_ev::{
+pub use rules::ev::{
     RuleEvSearchAction, RuleEvSearchCandidateSet, RuleEvSearchGate, RuleEvSearchTrace,
     RuleEvSearchTraceConfig, RuleEvSearchTraceError,
+};
+pub use rules::fast::SIMPLE_RULE_ACTION_TERMINAL;
+pub use rules::planner::{
+    RulePlannerConfig, RulePlannerSearchStats, reset_rule_planner_search_stats,
+    rule_planner_search_stats,
 };
 pub use types::{ExchangeDirection, Meld, MeldKind, Seat, Suit, Tile, WinSource};

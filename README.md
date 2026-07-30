@@ -1,67 +1,123 @@
-# Blood Flow Mahjong Engine
+# 血流麻将引擎
 
-高性能、确定性的血流麻将规则引擎。规则来源为 [`rules.md`](rules.md)，Rust workspace 位于 [`engine`](engine)，分为纯 Rust [`core`](engine/core) 和 Python [`pybind`](engine/pybind)。
+本仓库包含确定性的四人血流麻将 Rust 引擎、三种内置策略、平衡策略锦标赛工具，以及可选的 Python 绑定。
 
-## 当前能力
+本文档统一使用以下术语：
 
-- 108 张三门数牌、换三张、定缺
-- 摸打、碰、直杠、碰杠、暗杠、抢杠胡和一炮多响
-- 胡后锁牌并继续行牌，锁定牌可在后续胡牌和碰杠中复用；和牌后不能暗杠
-- 全部结构牌型、独立事件番、即时杠分和自摸/点炮结算
-- 查大叫、查花猪、最低 0 分和三家 0 分提前终局
-- 115 维固定 Legal Action Mask、固定种子重放、Rayon 批量环境和无分配的 step 输出
-- 固定宽度 viewer-scoped 事件流，支持完整历史环形缓冲和每步事件 delta
+- **游戏规则**：牌局流程、合法动作、牌型和计分。
+- **策略**：根据可见状态选择动作的实现。
+- **引擎**：执行游戏规则、维护状态并结算分数的程序。
 
-## Rust API
+CLI 沿用 `rule-fast`、`rule-ev` 和 `rule-planner` 作为策略标识符。标识符中的 `rule` 不表示存在三套不同的游戏规则。
+
+## 当前范围
+
+当前维护重点是 [`engine/`](engine/) 中的 Rust workspace。系统支持：
+
+- 108 张三门数牌、换三张和定缺；
+- 胡后继续行牌，以及和牌结构锁定；
+- 碰、直杠、碰杠、暗杠、抢杠胡和一炮多响；
+- 全部结构牌型、事件番和即时计分；
+- 牌墙耗尽后的查花猪和查大叫；
+- 固定种子、115 维动作空间、观察者视角事件和批量环境；
+- 三种 Rust 策略，以及任意两种策略之间的平衡测评。
+
+Python 扩展仍可用于模拟和批量数组接口。`training/` 下的神经网络训练代码是独立的实验性 Python 子系统，不属于当前 Rust 主线。相关文档为复现实验而保留，未来可能与当前代码产生偏差。
+
+## 仓库结构
+
+| 路径 | 职责 |
+| --- | --- |
+| [`GAME_RULES.md`](GAME_RULES.md) | 唯一的游戏规则和计分规范 |
+| [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | 确定性约定、状态机和信息边界 |
+| [`engine/core`](engine/core/) | 权威游戏状态、计分、分析、批量环境和内置策略 |
+| [`engine/pybind`](engine/pybind/) | PyO3 和 NumPy 兼容接口 |
+| [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种内置策略的平衡测评工具 |
+| [`TRAINING.md`](TRAINING.md) | 保留的 Python 训练实验文档 |
+
+Rust workspace 包含三个 package：
+
+| Package | Crate 或二进制 | 用途 |
+| --- | --- | --- |
+| `bloodflow-mahjong` | `bloodflow_mahjong` | Rust 库和诊断 benchmark |
+| `bloodflow-mahjong-pybind` | `bloodflow_mahjong` | Python 扩展模块 |
+| `bloodflow-mahjong-rule-tournament` | `rule-tournament` | 策略锦标赛 CLI |
+
+## 快速开始
+
+需要 Rust 1.85 或更高版本。
+
+```bash
+cargo test --manifest-path engine/Cargo.toml --workspace --all-targets
+
+cargo run --manifest-path engine/Cargo.toml --release \
+  -p bloodflow-mahjong-rule-tournament -- \
+  --blocks 1 \
+  --bootstrap-samples 100 \
+  --policy-a rule-ev \
+  --policy-b rule-fast
+```
+
+一个锦标赛 block 包含 6 局。上述命令只验证功能，样本量不足以判断策略强弱。大规模测评前，请先阅读 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
+
+## Rust 示例
 
 ```rust
-use bloodflow_mahjong::{ActionId, Game, GameError};
+use bloodflow_mahjong::{Game, GameError};
 
-fn run() -> Result<(), GameError> {
+fn main() -> Result<(), GameError> {
     let mut game = Game::new(42);
-    while let Some(mask) = game.legal_action_mask() {
-        let action: ActionId = policy_action(&game, mask);
-        let actor = game.decision().expect("active game has a decision").actor;
-        let outcome = game.step_id(action)?;
 
-        // 原始 outcome 属于全知环境；交给某个玩家前过滤暗摸牌面。
-        let player_outcome = outcome.for_player(actor);
-        consume_transition(player_outcome);
+    while let Some(action) = game.simple_rule_action() {
+        let viewer = game
+            .decision()
+            .expect("an active game has a decision")
+            .actor;
+        let outcome = game.step_id(action)?;
+        let _visible_outcome = outcome.for_player(viewer);
     }
+
     Ok(())
 }
 ```
 
-`ActionMask` 用两个 `u64` 表示 115 个固定动作，可通过 `words()` 零分配读取，也可通过 `to_dense()` 得到训练常用的 0/1 数组。换三张按每名玩家连续三次选一张实现，后两次 mask 只开放首张同花色且仍持有的牌；定缺保持一次三选一。`Batch::legal_action_masks_into` 和 `Batch::step_ids` 可直接用于并行环境。
+`Game` 是权威模拟状态。它为测试和重放提供全知接口。部署策略必须只读取观察者视角的 observation 和过滤后的 transition。具体边界见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)。
 
-正常轮次不存在空过：引擎强制摸牌，玩家随后必须弃牌、胡牌或杠。`Action::Pass` 只在其他玩家出牌或抢杠响应窗口合法。`StepOutcome` 明确返回本步摸牌、弃牌、分数变化和下一决策。
+## 内置策略
 
-## Python API
+| CLI 标识符 | 设计 | 公开接口 |
+| --- | --- | --- |
+| `rule-fast` | 低成本、确定性的基准策略 | Rust `Game` 和 `Batch`；Python `Game` 和 `Batch` |
+| `rule-ev` | 手牌价值、防守启发式和可选的信息集搜索 | Rust `Game` 和 `Batch` |
+| `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust `Game` |
+
+三种策略在锦标赛中地位相同。任意一侧都可以选择任意策略。增加计算预算不等于策略必然更强；预算比较必须使用独立 seed block 和置信区间。
+
+## Python 绑定
+
+Python 绑定需要 Python 3.10 或更高版本、NumPy 和 Maturin。
 
 ```bash
 maturin develop --release --manifest-path engine/pybind/Cargo.toml
+python -m pytest engine/pybind/tests
 ```
 
-训练热路径使用 `Batch.step_and_observe_history_into`：一次 Rayon 遍历完成动作、transition、下一状态观测、合法动作 mask 和 viewer-scoped 完整历史。完整轨迹采集为四个绝对座位都保留历史，终局后由 `Batch.reset_and_observe_history_into` 只重置完成的行；这些调用都释放 GIL 且不创建 Python 对象列表。
-
-策略迭代只保存紧凑的 seed、动作序列和策略元数据，并通过引擎严格重建 observation 与 legal mask。配对续局保留当前四家手牌和公开状态，只用 `resample_live_walls` 重洗尚未摸出的牌墙；对手暗手差异由大量独立来源牌局平均。Actor 的部署输入始终不包含暗手或牌墙。
-
-观测由当前行动者视角编码，不暴露其他玩家暗手、墙序以及尚未统一公开的换牌/定缺选择。事件记录为八个 `int32` 字段，摸牌牌面只对摸牌者可见，响应动作不向其他玩家泄露。完整数组布局见 [`engine/pybind/README.md`](engine/pybind/README.md)。
+绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样和 `rule-fast` 策略。绑定不公开 `rule-ev` 或 `rule-planner`。数组格式见 [`engine/pybind/README.md`](engine/pybind/README.md)。
 
 ## 验证
 
+从仓库根目录执行：
+
 ```bash
+cargo fmt --manifest-path engine/Cargo.toml --all -- --check
 cargo test --manifest-path engine/Cargo.toml --workspace --all-targets
 cargo clippy --manifest-path engine/Cargo.toml --workspace --all-targets -- -D warnings
-cargo run --manifest-path engine/Cargo.toml --release -p bloodflow-mahjong --bin throughput-benchmark -- 50000
-cargo run --manifest-path engine/Cargo.toml --release -p bloodflow-mahjong --bin batch-throughput-benchmark -- 1024 4096
-cargo run --manifest-path engine/Cargo.toml --release -p bloodflow-mahjong --bin ffi-throughput-benchmark -- 1024 4096
-python -m pytest engine/pybind/tests
-python engine/pybind/benchmarks/throughput.py --batch-size 1024 --iterations 4096
+cargo doc --manifest-path engine/Cargo.toml \
+  -p bloodflow-mahjong \
+  -p bloodflow-mahjong-rule-tournament \
+  --no-deps
 ```
 
-实现约定和验收矩阵见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md)。
+PyBind cdylib 与 core crate 使用同一个 Rust lib 名称，不能写入同一个 rustdoc 输出目录。因此，rustdoc 命令只生成 core 和 tournament 文档；Python 接口以 [`engine/pybind/README.md`](engine/pybind/README.md) 和 `.pyi` 为准。
 
-无真人牌谱条件下的大独立状态保守策略迭代、固定规则评测和 batch size sweep 见 [`TRAINING.md`](TRAINING.md)。
-
-Transformer Actor、配对 live-wall 目标和 CUDA-only 训练入口位于 [`training`](training)，快速运行与恢复说明见 [`training/README.md`](training/README.md)。
+仓库中的 benchmark 是独立诊断程序，不是 Cargo benchmark harness。完整命令见 [`engine/README.md`](engine/README.md)。

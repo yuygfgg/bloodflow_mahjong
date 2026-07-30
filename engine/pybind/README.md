@@ -1,27 +1,39 @@
-# Python bindings
+# Python 绑定
 
-This crate exposes the Rust rules engine as the `bloodflow_mahjong` Python
-extension. Build and install it into the active virtual environment with:
+本 crate 将 Rust 引擎公开为 `bloodflow_mahjong` Python 扩展。绑定面向模拟、批量环境、重放和数组调用者。它不是独立的游戏规则实现。
+
+## 安装
+
+需要 Python 3.10 或更高版本、NumPy 和 Maturin。在仓库根目录执行：
 
 ```bash
 maturin develop --release --manifest-path engine/pybind/Cargo.toml
+python -m pytest engine/pybind/tests
 ```
 
-The fixed policy action space has 115 entries:
+PyO3 使用 `abi3-py310`。模块只公开 `Game`、`Batch`、事件枚举和常量。内置策略中，Python 只公开 `rule-fast` 对应的 `simple_rule_action` 接口；`rule-ev` 和 `rule-planner` 仅在 Rust 中公开。
 
-| IDs | Action |
+## 固定动作空间
+
+策略动作空间固定为 115 维：
+
+| ID | 动作 |
 | --- | --- |
-| `0..26` | select one exchange tile |
-| `27..29` | choose missing suit |
-| `30..56` | discard tile |
-| `57`, `58`, `59` | hu, pong, exposed kong |
-| `60..86` | concealed kong by tile |
-| `87..113` | added kong by tile |
-| `114` | pass in a response window |
+| `0..26` | 选择一张换出牌 |
+| `27..29` | 选择缺门 |
+| `30..56` | 弃牌 |
+| `57` | 胡 |
+| `58` | 碰 |
+| `59` | 直杠 |
+| `60..86` | 按牌种选择暗杠 |
+| `87..113` | 按牌种选择碰杠 |
+| `114` | 在响应窗口中过 |
 
-The module exports named `ACTION_*` constants for every singleton action and
-range offset. Batch methods operate directly on caller-owned, C-contiguous
-NumPy buffers:
+模块为单动作和每个区间起点公开 `ACTION_*` 常量。合法动作 mask 使用两个 `uint64`，按 little-endian bit 顺序解释。
+
+## Batch 示例
+
+所有高吞吐方法直接写入调用者分配的 C-contiguous NumPy 数组。
 
 ```python
 import numpy as np
@@ -37,11 +49,12 @@ river = np.empty((len(batch), bm.RIVER_TILE_CAPACITY, bm.RIVER_FIELDS), dtype=np
 meta = np.empty((len(batch), bm.META_OBSERVATION_WIDTH), dtype=np.int32)
 events = np.empty((len(batch), 192, bm.EVENT_RECORD_WIDTH), dtype=np.int32)
 event_lengths = np.empty(len(batch), dtype=np.uint16)
-# Absolute-seat bits whose decisions are handled by a neural policy.
+
+# Each bit selects one absolute seat controlled by an external policy.
 history_seat_masks = np.full(len(batch), 0b0001, dtype=np.uint8)
 
 batch.legal_action_masks_into(masks)
-# Fill actions from the two packed mask words, then step all environments.
+batch.simple_rule_actions_into(actions)
 batch.step_and_observe_history_into(
     actions,
     history_seat_masks,
@@ -56,168 +69,156 @@ batch.step_and_observe_history_into(
 )
 ```
 
-## Rule baseline and shanten
+融合 step 写入动作执行后的 observation、下一步 legal mask 和下一行动者视角的事件历史。
 
-`Game.simple_rule_action()` returns a deterministic legal action for the current
-decision, or `None` after terminal. `Batch.simple_rule_actions_into` writes one
-action per environment to a `uint8[batch]` buffer; terminal slots receive
-`SIMPLE_RULE_ACTION_TERMINAL` (`255`). The policy is a cold-start opponent and
-evaluation anchor, not an expert policy.
+## `Game` 和 `Batch`
 
-`Game.hand_analysis(seat)` returns `(shanten, improving_tiles)`. The latter is a
-27-bit tile-kind mask. For training throughput,
-`Batch.hand_analysis_into(shanten, improving_tiles)` writes current-actor values
-to `int8[batch]` and `uint32[batch]` buffers. Ordinary shanten values are
-`SHANTEN_COMPLETE` (`-1`) through `SHANTEN_MAX` (`8`); terminal batch slots use
-`SHANTEN_TERMINAL` (`127`) and an empty mask.
-`Batch.hand_analysis_indices_into(indices, shanten, improving_tiles)` writes
-compact outputs for selected `uint32` batch rows and is the training API when
-only learner decisions need auxiliary labels.
+`Game` 提供单局接口：
 
-The evaluator measures conventional structural shanten, including standard
-hands, this ruleset's seven-pairs quad rule, exposed melds, and the missing
-suit. Once a blood-flow player has won, its locked old structure remains in the
-holding, so `-1` does not mean the player is one step from another payable win.
-Do not use this API as a post-win shaping target.
+- reset、阶段、当前决策和合法动作 mask；
+- `simple_rule_action` 和 `step_id`；
+- observation、事件和全知 tile count 写入；
+- 四家分数、缺门、暗手、锁牌、面子、弃牌、排名和终局原因；
+- 信息集重采样。
 
-`records` has 12 columns:
+`Batch` 提供对应的批量 `*_into` 接口，以及：
 
-| Column | Value |
-| --- | --- |
-| 0 | draw player, or `-1` |
-| 1 | drawn tile, or `-1` |
-| 2 | replacement draw flag |
-| 3 | discard player, or `-1` |
-| 4 | discarded tile, or `-1` |
-| 5..8 | score delta for seats 0..3 |
-| 9 | next actor, or `-1` |
-| 10 | next phase, or `-1` |
-| 11 | terminal flag |
+- 按索引重置、克隆和 swap-remove；
+- 批量信息集或 live-wall 重采样；
+- masked step 和融合 step；
+- 向听分析；
+- 只为指定绝对座位写入事件历史。
 
-## Event stream
+数组 dtype、shape、C-contiguous、对齐和内存不重叠是 API 合约。无效数组在状态推进前返回错误。Batch 执行 reset、mask 和 step 时释放 GIL，并在 batch 足够大时使用 Rayon。单局 `Game` 方法在持有 GIL 时执行。
 
-The extension exposes a fixed-width event stream for recurrent policies,
-replay, and diagnostics. One record is eight `int32` fields:
+## Step record
+
+`records` 的最后一维长度为 12：
+
+| 列 | 内容 |
+| ---: | --- |
+| `0` | 摸牌玩家，缺失时为 `-1` |
+| `1` | 摸到的牌，缺失时为 `-1` |
+| `2` | 是否为杠后补牌 |
+| `3` | 弃牌玩家，缺失时为 `-1` |
+| `4` | 弃牌，缺失时为 `-1` |
+| `5..8` | 绝对座位 `0..3` 的分数变化 |
+| `9` | 下一行动者，终局时为 `-1` |
+| `10` | 下一阶段，终局时为 `-1` |
+| `11` | 终局标记 |
+
+Step record 是权威环境数据。它不会按上一个观察者隐藏摸牌。策略输入必须使用观察者视角 observation，不能直接把 record 当作可见信息。
+
+## 向听分析
+
+`Game.hand_analysis(seat)` 返回 `(shanten, improving_tiles)`。`improving_tiles` 是 27 bit 牌种 mask。
+
+`Batch.hand_analysis_into` 写入当前行动者的 `int8[batch]` 向听数和 `uint32[batch]` 有效牌 mask。`Batch.hand_analysis_indices_into` 只分析指定 `uint32` 行。
+
+正常向听值范围为 `SHANTEN_COMPLETE` (`-1`) 到 `SHANTEN_MAX` (`8`)。终局 batch 行使用 `SHANTEN_TERMINAL` (`127`) 和空 mask。
+
+向听分析覆盖普通四面子一对、该游戏规则中的七对、公开面子和缺门。玩家已经胡牌后，旧结构仍保留在扩展持牌中。因此，`-1` 不表示距离下一次血流胡牌只差一步。
+
+## 事件流
+
+一个事件记录包含 8 个 `int32`：
 
 ```text
 [kind, actor_relative, target_relative, tile, flags, value, aux, reserved]
 ```
 
-`actor_relative` and `target_relative` use the same seat rotation as the
-observation. `-1` means that a field is not applicable. Event kinds are
-available as the `EventKind(IntEnum)` class and bit flags as
-`EventFlag(IntFlag)`. The values of both enums are the stable integer codes
-stored in the arrays.
+`actor_relative` 和 `target_relative` 使用 observation 的相对座位。`-1` 表示字段不适用。`EventKind(IntEnum)` 提供稳定的事件代码。
 
-| Kind | Fields |
+| Kind | 字段语义 |
 | --- | --- |
-| `ACTION` | `value=action_id`, `aux=phase`; visible only to the acting player |
-| `GAME_START` | `actor=dealer`, `flags=exchange_direction` |
-| `TURN_START` | initial dealer turn marker; `aux=1` |
-| `DRAW` | `actor=drawer`, `tile` is hidden from other players, `flags` contains replacement/last-wall, `value=wall_remaining` |
-| `DISCARD` | `actor`, `tile`, `flags` contains after-kong/opening-discard |
+| `ACTION` | `value=action_id`，`aux=phase`；只对行动者可见 |
+| `GAME_START` | `actor=dealer`，`flags=exchange_direction` |
+| `TURN_START` | 庄家首次回合标记，`aux=1` |
+| `DRAW` | `actor=drawer`；其他观察者看到 `tile=-1`；flags 可含补牌和最后一张；`value=wall_remaining` |
+| `DISCARD` | `actor`、`tile`；flags 可含杠后、开局首弃、摸切和碰后弃牌 |
 | `EXCHANGE_COMPLETE` | `flags=exchange_direction` |
-| `MISSING_REVEALED` | `actor=player`, `value=missing_suit` |
-| `MELD` | `actor`, `target=source` when applicable, `tile`, `flags=MeldKind` |
-| `HU` | `actor=winner`, `target=source` for discard/rob-kong, `tile`, `flags`, `value=multiplier`, `aux=PatternSet.bits()` |
-| `PAYMENT` | `actor=payer`, `target=payee`, `value=actual_amount` |
-| `GAME_END` | `flags` marks an empty wall when applicable |
+| `MISSING_REVEALED` | `actor=player`，`value=missing_suit` |
+| `MELD` | `actor`、可选 `target=source`、`tile`，`flags=MeldKind` |
+| `HU` | `actor=winner`、可选 `target=source`、`tile`、事件 flags、`value=multiplier`、`aux=PatternSet.bits()` |
+| `PAYMENT` | `actor=payer`、`target=payee`、`value=actual_amount` |
+| `GAME_END` | 牌墙耗尽时设置最后一张相关 flag |
 
-`Game.events_into(viewer, output)` copies the newest retained history into a
-caller-owned `int32[capacity, EVENT_RECORD_WIDTH]` buffer and returns its
-length. `Game.step_events_into` copies only events emitted by the most recent
-step. For a `Batch`, `events_into` and `step_events_into` write
-`int32[batch, capacity, EVENT_RECORD_WIDTH]` plus `uint16[batch]` lengths.
-The batch viewer is the current decision actor, or the dealer after terminal.
+事件 flag 必须结合 `kind` 解释。bit 4 和 bit 5 复用：
 
-The Rust side retains a 512-record ring per environment; `Game.event_dropped`
-and `Batch.event_dropped_into` report overwritten records.
-`Batch.step_and_observe_history_into` combines step, transition, observation,
-legal mask, and full viewer history into one GIL-free Rayon traversal. Each
-`history_seat_masks` byte is a four-bit absolute-seat mask; history is written
-only when the next actor's bit is present, and `event_lengths[row]` is zero
-otherwise. This avoids copying 192 records for rule-controlled decisions.
-`Batch.reset_and_observe_history_into` resets and refreshes only rows selected
-by `reset_flags`, leaving every other output row untouched.
+| 事件 | bit 4 | bit 5 |
+| --- | --- | --- |
+| `DISCARD` | 摸切 | 碰后立即弃牌 |
+| `HU` | 自摸 | 抢杠胡 |
 
-Array dtypes and shapes are part of the API. Batch calls reject non-contiguous
-views rather than copying them. The GIL is released while reset, mask, and step
-work runs in Rust; the Rust batch implementation uses Rayon for sufficiently
-large batches.
+当前 Python `EventFlag` 只把 bit 4 和 bit 5 命名为 `SELF_DRAW` 和 `ROB_KONG`。解析 `DISCARD` 时，应直接检查 `1 << 4` 和 `1 << 5`，不要套用这两个名字。其余公开 flag 为 `REPLACEMENT_DRAW`、`LAST_WALL_TILE`、`AFTER_KONG`、`OPENING_DISCARD`、`HEAVENLY` 和 `EARTHLY`。
 
-## Deterministic replay and information-set sampling
+`Game.events_into(viewer, output)` 写入最新保留历史并返回长度。`step_events_into` 只写最近一次 step 产生的事件。Batch 版本使用 `int32[batch, capacity, 8]` 和 `uint16[batch]` lengths。
 
-`ENGINE_RULES_VERSION` identifies the rule and initialization semantics used by
-a compact seed/action replay. A stored trajectory should reject a different
-version instead of attempting compatibility migration.
+Rust 每局保留 512 条环形记录。`event_dropped` 报告被覆盖的记录数。融合历史接口要求 capacity 在 `1..=512`，并只在下一行动者的绝对座位 bit 被 `history_seat_masks` 选中时写入历史；其他行的 length 为零。
 
-`Game.resample_information_set(seed)` returns an independent determinization
-whose current actor observation and legal mask are byte-identical to the source
-state. `Batch.resample_information_sets(indices, seeds)` combines indexed clone
-and resampling for selective Monte Carlo queries; repeated indices with paired
-seeds let candidate actions share the same hidden worlds. On ordinary turns,
-opponents' non-locked concealed tiles and the live wall are shuffled together.
-Already-selected exchange hands are fixed, and response-window hands are fixed
-because the pending Hu/Pong/Kong candidate mask itself depends on those hands.
-Response states still receive an independently shuffled future wall.
+## Observation
 
-For optional training-only Oracle Critics, `Game.oracle_tile_counts_into` and
-`Batch.oracle_tile_counts_into` write `uint8[..., 9, 27]`: four absolute-seat
-concealed hands, four corresponding locked subsets, and one unordered live-wall
-histogram. This buffer is perfect information and must never enter the Actor's
-deployment input. Calling it does not alter or extend the ordinary viewer
-observation.
+Observation 以指定 viewer 为相对座位 `0`，其下家依次为 `1`、`2`、`3`。Batch 默认使用当前行动者；终局没有行动者时使用庄家。
 
-Observations are rotated to the current actor: relative seat zero is the policy
-that acts next, followed by seats 1, 2, and 3 in turn order. A terminal game has
-no actor and uses the dealer as relative seat zero.
-`step_and_observe_history_into` writes the state and legal mask after applying
-the submitted actions.
+### `tile_obs`
 
-`tile_obs` has shape `[batch, 10, 27]` and contains tile counts:
+`Game.observe_into` 的 shape 为 `[10, 27]`，Batch 接口的 shape 为 `[batch, 10, 27]`：
 
-| Plane | Value |
-| --- | --- |
-| 0 | relative seat 0 concealed hand |
-| 1 | relative seat 0's tiles selected during exchange |
-| 2..5 | locked tiles for relative seats 0..3 |
-| 6..9 | discarded-tile histograms for relative seats 0..3 |
+| Plane | 内容 |
+| ---: | --- |
+| `0` | 相对座位 0 的暗手 |
+| `1` | 相对座位 0 已选择的换牌 |
+| `2..5` | 相对座位 `0..3` 的锁牌 |
+| `6..9` | 相对座位 `0..3` 的弃牌计数 |
 
-`melds` has shape `[batch, 4, 4, 3]`. Its axes are relative player, meld slot,
-and `[tile, kind, relative source]`; kind is `0` pong, `1` exposed kong, `2`
-added kong, or `3` concealed kong. `river` has shape `[batch, 108, 2]` and each
-chronological entry is `[tile, relative owner]`. Empty meld and river slots use
-`255` in every field.
+### `melds`
 
-`meta` has shape `[batch, META_OBSERVATION_WIDTH]`:
+`Game.observe_into` 的 shape 为 `[4, 4, 3]`，Batch 接口的 shape 为 `[batch, 4, 4, 3]`。最后一维为 `[tile, kind, source_relative]`。`kind` 的值为：`0` 碰、`1` 直杠、`2` 碰杠、`3` 暗杠。空槽全部填 `255`。
 
-| Index | Value |
-| --- | --- |
-| 0 | phase (`PHASE_*`) |
-| 1 | absolute actor, or `-1` |
-| 2 | relative dealer |
-| 3 | exchange direction (`1` left, `2` across, `3` right) |
-| 4 | wall tiles remaining |
-| 5 | current actor's drawn tile, or `-1` |
-| 6 | replacement-draw flag |
-| 7 | pending discard/kong source as a relative seat, or `-1` |
-| 8 | pending response tile, or `-1` |
-| 9 | chronological river length |
-| 10 | current actor's selected exchange-tile count |
-| 11 | current actor's exchange suit, or `-1` |
-| 12..15 | scores for relative seats 0..3 |
-| 16..19 | missing suits for relative seats 0..3, or `-1` |
-| 20..23 | has-won flags for relative seats 0..3 |
-| 24..27 | concealed tile counts for relative seats 0..3 |
-| 28 | terminal flag |
-| 29 | response flags: bit 0 rob-kong, bit 1 after-kong discard, bit 2 opening discard |
-| 30..33 | maximum completed-win multiplier for relative seats 0..3 |
+### `river`
 
-Only the current actor's concealed hand and pending exchange choices are
-included. Other concealed hands and their pending choices remain hidden;
-locked tiles, melds, and the river are public. Use the exported width constants
-when allocating buffers so schema extensions are caught by shape validation.
+`Game.observe_into` 的 shape 为 `[108, 2]`，Batch 接口的 shape 为 `[batch, 108, 2]`。每项为 `[tile, owner_relative]`，按时间顺序排列。空槽全部填 `255`。
 
-The transition record is authoritative engine data. In particular, its drawn
-tile is not filtered for a previous viewer. Treat the actor-relative observation
-as policy input and the record as environment/control data.
+### `meta`
+
+`Game.observe_into` 的 shape 为 `[META_OBSERVATION_WIDTH]`，Batch 接口的 shape 为 `[batch, META_OBSERVATION_WIDTH]`：
+
+| 索引 | 内容 |
+| ---: | --- |
+| `0` | 阶段 `PHASE_*` |
+| `1` | 绝对行动者；终局为 `-1` |
+| `2` | 相对庄家 |
+| `3` | 换牌方向：左 `1`、对家 `2`、右 `3` |
+| `4` | 剩余牌墙数 |
+| `5` | 当前 viewer 的摸牌；不可见或不存在时为 `-1` |
+| `6` | 杠后补牌标记 |
+| `7` | 待响应来源的相对座位；不存在时为 `-1` |
+| `8` | 待响应牌；不存在时为 `-1` |
+| `9` | 时间顺序牌河长度 |
+| `10` | 当前行动者已选择的换牌数 |
+| `11` | 当前行动者的换牌花色；不存在时为 `-1` |
+| `12..15` | 相对座位 `0..3` 的分数 |
+| `16..19` | 相对座位 `0..3` 的缺门；未公开时为 `-1` |
+| `20..23` | 相对座位 `0..3` 是否已经胡牌 |
+| `24..27` | 相对座位 `0..3` 的暗手张数 |
+| `28` | 终局标记 |
+| `29` | 响应 flags：bit 0 抢杠、bit 1 杠后弃牌、bit 2 开局首弃 |
+| `30..33` | 相对座位 `0..3` 的历史最高胡牌牌型倍率 |
+
+分配数组时必须使用模块公开的 width 常量。shape 校验会在 schema 变化时立即失败。
+
+## 重放和信息集采样
+
+`ENGINE_RULES_VERSION` 标识游戏规则执行和初始化语义。紧凑轨迹至少应保存该版本、seed 和动作序列。版本不同时应拒绝重放，不应猜测迁移。
+
+`Game.resample_information_set(seed)` 返回独立 determinization，并保持当前行动者的 observation 和 legal mask 不变。普通回合会共同重洗对手未锁暗牌和 live wall。换牌阶段会固定已经选择牌的玩家。响应阶段会固定四家暗手，因为待响应集合本身依赖暗手。
+
+`Batch.resample_information_sets(indices, seeds)` 合并按索引克隆和重采样。重复 index 配合成对 seed，可以让多个候选动作共享同一批隐藏世界。
+
+`resample_live_walls` 只重排尚未摸出的 live wall。它保留四家手牌和全部公开状态，不能替代完整信息集采样。
+
+## 全知 tile count
+
+`oracle_tile_counts_into` 写入 `uint8[..., 9, 27]`：四家绝对座位暗手、四家对应锁牌，以及一个无顺序 live-wall 直方图。
+
+该数组包含完美信息，只能用于模拟、诊断或显式的全知 Critic。它不能进入部署策略输入，也不会改变普通 observation。

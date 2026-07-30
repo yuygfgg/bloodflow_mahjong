@@ -1,0 +1,125 @@
+# Core Rust Crate
+
+`bloodflow-mahjong` 是确定性的血流麻将核心库。`Game` 执行游戏规则，`Batch` 批量执行独立牌局，内置策略从合法动作中选择一个动作。
+
+游戏规则见 [`../../GAME_RULES.md`](../../GAME_RULES.md)。确定性约定和信息边界见 [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md)。
+
+## 单局循环
+
+```rust
+use bloodflow_mahjong::{Game, GameError};
+
+fn play(seed: u64) -> Result<Game, GameError> {
+    let mut game = Game::new(seed);
+
+    while let Some(action) = game.simple_rule_action() {
+        game.step_id(action)?;
+    }
+
+    Ok(game)
+}
+```
+
+`Game::legal_actions()` 返回结构化动作。`Game::legal_action_mask()` 返回固定 115 维动作 mask。`step()` 接受 `Action`，`step_id()` 接受 `ActionId`。终局后，这些查询返回 `None`，继续 step 返回 `GameError::Finished`。
+
+非法动作不得修改状态。需要重放时，保存 `ENGINE_RULES_VERSION`、初始 seed 和完整动作 ID 序列。
+
+## 信息边界
+
+`Game` 是全知模拟状态。以下数据不应直接交给部署策略：
+
+- 其他玩家暗手；
+- 牌墙顺序；
+- 未公开的换牌选择；
+- 未经过观察者过滤的摸牌 transition。
+
+调用 `StepOutcome::for_player(viewer)` 过滤单步 transition。调用 `Game::observation_into` 和事件接口生成观察者视角数组。
+
+`resample_information_set(seed)` 从当前行动者的信息集中采样。`resample_live_wall(seed)` 只重排未来牌墙，不改变任何玩家手牌。两者目标不同，不能互换。
+
+## 手牌分析
+
+公开函数包括：
+
+- `is_winning`：判断指定持牌是否包含合法和牌结构；
+- `evaluate_win`：选择倍率最高的和牌拆分；
+- `analyze_shanten`：返回结构向听数和有效牌 mask；
+- `evaluate_max_wait`：返回查大叫所需的最大牌型倍率。
+
+向听数是传统结构指标。玩家已经胡牌后，旧结构仍保留在扩展持牌中。因此，`SHANTEN_COMPLETE` 不能解释为“距离下一次血流胡牌一步”。
+
+## 策略 API
+
+### `rule-fast`
+
+```rust
+let action = game.simple_rule_action();
+```
+
+该策略使用固定启发式、向听数和有效牌。`Batch::simple_rule_actions_into` 提供批量接口。Python 绑定也公开该策略。
+
+### `rule-ev`
+
+```rust
+use bloodflow_mahjong::{RuleEvConfig, RuleEvDefense};
+
+let config = RuleEvConfig::with_search_depth(1)
+    .expect("depth is in 0..=3")
+    .with_search_worlds(0)
+    .expect("world count is in 0..=256")
+    .with_defense(RuleEvDefense::Heuristic);
+let action = game.rule_ev_action_with_config(config);
+```
+
+`search_depth` 控制确定性手牌前瞻。`search_worlds` 控制信息集 Monte Carlo 根动作比较。两者是独立预算。`RuleEvConfig::STANDARD` 为 depth 1、worlds 0、启发式防守。
+
+`Batch::rule_ev_actions_into` 提供批量接口。feature `rule-ev-analysis` 只用于离线 trace 和搜索门控消融。
+
+### `rule-planner`
+
+```rust
+use bloodflow_mahjong::RulePlannerConfig;
+
+let config = RulePlannerConfig::STANDARD
+    .with_hand_changes(0)
+    .expect("hand changes are in 0..=2")
+    .with_draw_horizon(1)
+    .expect("draw horizon is in 0..=32")
+    .with_candidate_states(1)
+    .expect("candidate states are in 1..=200000")
+    .with_belief_worlds(64)
+    .expect("belief worlds are in 0..=256")
+    .with_response_worlds(0)
+    .expect("response worlds are in 0..=256")
+    .with_search_iterations(64)
+    .expect("iterations are in 0..=4096");
+let action = game.rule_planner_action_with_config(config);
+```
+
+planner 先评估手牌候选图和公开状态价值。`belief_worlds` 为危险度与 rollout 提供信息集粒子。`search_iterations` 非零时，策略在根节点对候选动作进行配对 rollout，并使用独立粒子流验证改动。
+
+planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者或 `rule-tournament` 管理。
+
+## Batch
+
+`Batch` 的高吞吐接口由调用者分配输出缓冲区。常用能力包括：
+
+- `legal_action_mask_words_into`；
+- `step_ids`、masked step 和 indexed step；
+- `observations_into` 和事件写入；
+- 融合 step、observation 与完整事件历史；
+- 按索引克隆和信息集重采样。
+
+方法会检查长度。Python 绑定还检查 dtype、shape、C-contiguous、对齐和重叠 view。
+
+## 功能和构建
+
+默认 feature 集为空。
+
+```bash
+cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
+cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
+  --all-targets --features rule-ev-analysis
+```
+
+crate 使用 `#![forbid(unsafe_code)]`。

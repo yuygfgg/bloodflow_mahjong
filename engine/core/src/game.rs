@@ -74,10 +74,20 @@ pub const EVENT_FLAG_SELF_DRAW: u8 = 1 << 4;
 pub const EVENT_FLAG_ROB_KONG: u8 = 1 << 5;
 pub const EVENT_FLAG_HEAVENLY: u8 = 1 << 6;
 pub const EVENT_FLAG_EARTHLY: u8 = 1 << 7;
+/// A discard used the tile drawn at the start of the same turn.
+///
+/// Event flags are interpreted by event kind. Bit four is also used by Hu
+/// events for self-draw, but the meanings cannot overlap in one record.
+pub const EVENT_FLAG_TSUMOGIRI: u8 = 1 << 4;
+/// A discard immediately followed a successful Pong.
+///
+/// Event flags are interpreted by event kind. Bit five is also used by Hu
+/// events for robbing a kong, but the meanings cannot overlap in one record.
+pub const EVENT_FLAG_AFTER_PONG: u8 = 1 << 5;
 
 const ALL_PLAYER_MASK: u8 = (1 << PLAYER_COUNT) - 1;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoredEvent {
     record: [i32; EVENT_RECORD_WIDTH],
     visible_to: u8,
@@ -145,6 +155,17 @@ pub struct DrawEvent {
 pub struct DiscardEvent {
     pub player: Seat,
     pub tile: Tile,
+}
+
+/// Public information retained for one chronological river entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct PublicDiscard {
+    pub(crate) player: Seat,
+    pub(crate) tile: Tile,
+    pub(crate) after_kong: bool,
+    pub(crate) after_pong: bool,
+    pub(crate) tsumogiri: bool,
+    pub(crate) hand_revision: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -288,7 +309,7 @@ pub enum GameError {
     InformationSetUnavailable,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Player {
     concealed: [u8; TILE_KIND_COUNT],
     locked: [u8; TILE_KIND_COUNT],
@@ -349,7 +370,7 @@ impl Player {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum TurnOrigin {
+pub(crate) enum TurnOrigin {
     Initial,
     Draw {
         tile: Tile,
@@ -360,7 +381,7 @@ enum TurnOrigin {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ReactionKind {
+pub(crate) enum ReactionKind {
     Discard {
         after_kong: bool,
         opening_discard: bool,
@@ -410,7 +431,7 @@ struct HiddenHandConstraint {
 /// This type intentionally exposes perfect information for simulation,
 /// testing, and replay. Policy code must use viewer-scoped observations and
 /// [`StepOutcome::for_player`] instead of forwarding raw state or transitions.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Game {
     players: [Player; PLAYER_COUNT],
     wall: [u8; WALL_TILE_COUNT],
@@ -423,7 +444,10 @@ pub struct Game {
     stage: Stage,
     discards: [u8; WALL_TILE_COUNT],
     discard_owners: [u8; WALL_TILE_COUNT],
+    discard_flags: [u8; WALL_TILE_COUNT],
+    discard_hand_revisions: [u8; WALL_TILE_COUNT],
     discard_len: u8,
+    hand_revisions: [u8; PLAYER_COUNT],
     // A discard remains in the river after a discard win, while the winner's
     // recorded hand also contains that same physical tile. One entry is kept
     // for every such hand reference so public tile counts can remove it.
@@ -478,7 +502,10 @@ impl Game {
             },
             discards: [0; WALL_TILE_COUNT],
             discard_owners: [0; WALL_TILE_COUNT],
+            discard_flags: [0; WALL_TILE_COUNT],
+            discard_hand_revisions: [0; WALL_TILE_COUNT],
             discard_len: 0,
+            hand_revisions: [0; PLAYER_COUNT],
             discard_win_references: [0; TILE_KIND_COUNT],
             transition_draw: None,
             transition_discard: None,
@@ -543,7 +570,6 @@ impl Game {
             .decision()
             .ok_or(GameError::InformationSetUnavailable)?
             .actor;
-        let mut sampled = self.clone();
         let mut fixed_players = seat_bit(viewer);
         match self.stage {
             Stage::Exchange { .. } => {
@@ -563,6 +589,128 @@ impl Game {
             Stage::Finished => return Err(GameError::InformationSetUnavailable),
         }
 
+        self.resample_hidden_information(seed, fixed_players, &[[0; TILE_KIND_COUNT]; PLAYER_COUNT])
+    }
+
+    /// Samples a response state conditioned only on the current actor's
+    /// observation.
+    ///
+    /// Unlike [`Game::resample_information_set`], this operation does not
+    /// preserve hidden response masks or accepted winners from the
+    /// authoritative state. It samples every other non-public tile and then
+    /// rebuilds the response window from the sampled hands. The current actor
+    /// and that actor's legal actions remain fixed.
+    pub(crate) fn resample_current_actor_response_information_set(
+        &self,
+        seed: u64,
+    ) -> Result<Self, GameError> {
+        let actor = self
+            .decision()
+            .ok_or(GameError::InformationSetUnavailable)?
+            .actor;
+        let mut minimum_concealed = [[0; TILE_KIND_COUNT]; PLAYER_COUNT];
+        if let Stage::HuResponse {
+            source,
+            tile,
+            kind: ReactionKind::AddedKong,
+            ..
+        } = self.stage
+        {
+            // The proposed fourth tile is hidden, but its existence is public
+            // and is required for `complete_added_kong` after all players pass.
+            minimum_concealed[source.index()][tile.index()] = 1;
+        }
+
+        const REJECTION_ATTEMPTS: u64 = 256;
+        const REJECTION_SEED_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
+        for attempt in 0..REJECTION_ATTEMPTS {
+            let candidate_seed = seed.wrapping_add(attempt.wrapping_mul(REJECTION_SEED_STRIDE));
+            let mut sampled = self.resample_hidden_information(
+                candidate_seed,
+                seat_bit(actor),
+                &minimum_concealed,
+            )?;
+            if let Stage::MeldResponse { source, tile, .. } = self.stage
+                && seats_after(source)
+                    .into_iter()
+                    .any(|seat| sampled.can_player_win_with_added_tile(seat, tile))
+            {
+                // Reaching MeldResponse publicly establishes that no hand can
+                // claim Hu on the pending discard. Reject worlds which would
+                // have entered HuResponse instead.
+                continue;
+            }
+            sampled.stage = match self.stage {
+                Stage::HuResponse {
+                    source, tile, kind, ..
+                } => {
+                    let actor_offset = relative_seat(source, actor);
+                    let mut remaining = seat_bit(actor);
+                    let mut winners = 0;
+                    for seat in seats_after(source) {
+                        if seat == actor || !sampled.can_player_win_with_added_tile(seat, tile) {
+                            continue;
+                        }
+                        if relative_seat(source, seat) < actor_offset {
+                            // Earlier eligible responders have already acted. Hu
+                            // is the neutral completion model for a legal win.
+                            winners |= seat_bit(seat);
+                        } else {
+                            remaining |= seat_bit(seat);
+                        }
+                    }
+                    Stage::HuResponse {
+                        source,
+                        tile,
+                        remaining,
+                        winners,
+                        kind,
+                    }
+                }
+                Stage::MeldResponse { source, tile, .. } => {
+                    let actor_offset = relative_seat(source, actor);
+                    let mut remaining = seat_bit(actor);
+                    for seat in seats_after(source) {
+                        if seat == actor || relative_seat(source, seat) < actor_offset {
+                            continue;
+                        }
+                        let player = &sampled.players[seat.index()];
+                        if player.missing == Some(tile.suit()) || player.meld_count >= 4 {
+                            continue;
+                        }
+                        if sampled.can_pong(seat, tile) || player.concealed[tile.index()] >= 3 {
+                            remaining |= seat_bit(seat);
+                        }
+                    }
+                    Stage::MeldResponse {
+                        source,
+                        tile,
+                        remaining,
+                    }
+                }
+                Stage::Exchange { .. }
+                | Stage::ChooseMissing { .. }
+                | Stage::Turn { .. }
+                | Stage::Finished => return Err(GameError::InformationSetUnavailable),
+            };
+            debug_assert_eq!(
+                sampled.decision().map(|decision| decision.actor),
+                Some(actor)
+            );
+            debug_assert_eq!(sampled.legal_action_mask(), self.legal_action_mask());
+            return Ok(sampled);
+        }
+        Err(GameError::InformationSetUnavailable)
+    }
+
+    fn resample_hidden_information(
+        &self,
+        seed: u64,
+        fixed_players: u8,
+        minimum_concealed: &[[u8; TILE_KIND_COUNT]; PLAYER_COUNT],
+    ) -> Result<Self, GameError> {
+        let mut sampled = self.clone();
+
         let mut unknown = Vec::with_capacity(self.wall_remaining() + 42);
         let mut movable_counts = [0_usize; PLAYER_COUNT];
         for seat in Seat::ALL {
@@ -570,12 +718,15 @@ impl Game {
                 continue;
             }
             let player = &mut sampled.players[seat.index()];
-            for tile_index in 0..TILE_KIND_COUNT {
-                let movable =
-                    player.concealed[tile_index].saturating_sub(player.locked[tile_index]);
+            for (tile_index, &minimum) in minimum_concealed[seat.index()].iter().enumerate() {
+                let fixed = player.locked[tile_index].max(minimum);
+                if fixed > player.concealed[tile_index] {
+                    return Err(GameError::InformationSetUnavailable);
+                }
+                let movable = player.concealed[tile_index] - fixed;
                 movable_counts[seat.index()] += movable as usize;
                 unknown.extend(core::iter::repeat_n(tile_index as u8, movable as usize));
-                player.concealed[tile_index] = player.locked[tile_index];
+                player.concealed[tile_index] = fixed;
             }
         }
         unknown.extend(
@@ -893,6 +1044,17 @@ impl Game {
         self.wall_tail.saturating_sub(self.wall_head) as usize
     }
 
+    /// Returns one head-wall tile from an authoritative sampled world.
+    ///
+    /// This crate-private accessor is for information-set projections. Public
+    /// policies must not inspect it on the authoritative game.
+    pub(crate) fn live_wall_tile(&self, offset: usize) -> Option<Tile> {
+        let index = self.wall_head as usize + offset;
+        (index < self.wall_tail as usize)
+            .then(|| Tile::new(self.wall[index]))
+            .flatten()
+    }
+
     pub fn current_draw(&self) -> Option<DrawEvent> {
         match self.stage {
             Stage::Turn {
@@ -1131,6 +1293,24 @@ impl Game {
                 Tile::new(self.discards[index]).expect("stored tile is valid"),
             )
         })
+    }
+
+    pub(crate) fn public_discards(&self) -> impl Iterator<Item = PublicDiscard> + '_ {
+        (0..self.discard_len as usize).map(|index| {
+            let flags = self.discard_flags[index];
+            PublicDiscard {
+                player: Seat::new(self.discard_owners[index]).expect("stored seat is valid"),
+                tile: Tile::new(self.discards[index]).expect("stored tile is valid"),
+                after_kong: flags & EVENT_FLAG_AFTER_KONG != 0,
+                after_pong: flags & EVENT_FLAG_AFTER_PONG != 0,
+                tsumogiri: flags & EVENT_FLAG_TSUMOGIRI != 0,
+                hand_revision: self.discard_hand_revisions[index],
+            }
+        })
+    }
+
+    pub(crate) const fn public_hand_revision(&self, player: Seat) -> u8 {
+        self.hand_revisions[player.index()]
     }
 
     /// Counts tiles known to `viewer` from private and public information.
@@ -1591,15 +1771,6 @@ impl Game {
 
     fn discard(&mut self, actor: Seat, tile: Tile, origin: TurnOrigin) -> Result<(), GameError> {
         self.players[actor.index()].concealed[tile.index()] -= 1;
-        let discard_index = self.discard_len as usize;
-        self.discards[discard_index] = tile.as_u8();
-        self.discard_owners[discard_index] = actor.as_u8();
-        self.discard_len += 1;
-        self.transition_discard = Some(DiscardEvent {
-            player: actor,
-            tile,
-        });
-
         let after_kong = matches!(
             origin,
             TurnOrigin::Draw {
@@ -1607,7 +1778,8 @@ impl Game {
                 ..
             }
         );
-        let opening_discard = actor == self.dealer && self.discard_len == 1;
+        let tsumogiri = matches!(origin, TurnOrigin::Draw { tile: drawn, .. } if drawn == tile);
+        let opening_discard = actor == self.dealer && self.discard_len == 0;
         let mut discard_flags = 0;
         if after_kong {
             discard_flags |= EVENT_FLAG_AFTER_KONG;
@@ -1615,6 +1787,23 @@ impl Game {
         if opening_discard {
             discard_flags |= EVENT_FLAG_OPENING_DISCARD;
         }
+        if tsumogiri {
+            discard_flags |= EVENT_FLAG_TSUMOGIRI;
+        }
+        if origin == TurnOrigin::AfterPong {
+            discard_flags |= EVENT_FLAG_AFTER_PONG;
+        }
+
+        let discard_index = self.discard_len as usize;
+        self.discards[discard_index] = tile.as_u8();
+        self.discard_owners[discard_index] = actor.as_u8();
+        self.discard_flags[discard_index] = discard_flags;
+        self.discard_hand_revisions[discard_index] = self.hand_revisions[actor.index()];
+        self.discard_len += 1;
+        self.transition_discard = Some(DiscardEvent {
+            player: actor,
+            tile,
+        });
         self.push_event(
             EventKind::Discard,
             Some(actor),
@@ -1698,6 +1887,7 @@ impl Game {
             source,
         });
         debug_assert!(added);
+        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -1725,6 +1915,7 @@ impl Game {
             source,
         });
         debug_assert!(added);
+        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -1752,6 +1943,7 @@ impl Game {
             source: actor,
         });
         debug_assert!(added);
+        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -1803,6 +1995,7 @@ impl Game {
             .find(|meld| meld.kind == MeldKind::Pong && meld.tile == tile)
             .expect("legal added kong has matching pong");
         meld.kind = MeldKind::AddedKong;
+        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -1873,6 +2066,7 @@ impl Game {
     fn resolve_discard_wins(&mut self, source: Seat, tile: Tile, winners: u8, kind: ReactionKind) {
         if kind == ReactionKind::AddedKong {
             self.remove_lost_tile_preserving_locks(source, tile);
+            self.mark_public_hand_change(source);
         }
 
         let mut last_winner = source;
@@ -1942,6 +2136,11 @@ impl Game {
         }
         player.has_won = true;
         player.max_win_multiplier = player.max_win_multiplier.max(evaluation.shape_multiplier);
+        self.mark_public_hand_change(actor);
+    }
+
+    fn mark_public_hand_change(&mut self, actor: Seat) {
+        self.hand_revisions[actor.index()] = self.hand_revisions[actor.index()].saturating_add(1);
     }
 
     fn can_player_win(&self, actor: Seat, required: Option<Tile>) -> bool {
@@ -3617,6 +3816,32 @@ mod tests {
         }
     }
 
+    fn observation_for(
+        game: &Game,
+        viewer: Seat,
+    ) -> (
+        [u8; TILE_OBSERVATION_WIDTH],
+        [u8; MELD_OBSERVATION_WIDTH],
+        [u8; RIVER_OBSERVATION_WIDTH],
+        [i32; META_OBSERVATION_WIDTH],
+    ) {
+        let mut observation = (
+            [0; TILE_OBSERVATION_WIDTH],
+            [0; MELD_OBSERVATION_WIDTH],
+            [0; RIVER_OBSERVATION_WIDTH],
+            [0; META_OBSERVATION_WIDTH],
+        );
+        game.observation_into(
+            viewer,
+            &mut observation.0,
+            &mut observation.1,
+            &mut observation.2,
+            &mut observation.3,
+        )
+        .unwrap();
+        observation
+    }
+
     #[test]
     fn deal_is_deterministic_and_conserves_tiles() {
         let left = Game::new(42);
@@ -4296,6 +4521,209 @@ mod tests {
             sampled.step_id(action).unwrap();
         }
         assert_eq!(sampled.phase(), Phase::Finished);
+    }
+
+    #[test]
+    fn response_sampling_ignores_authoritative_hidden_response_masks() {
+        let source = Seat::EAST;
+        let actor = Seat::ALL[2];
+        let earlier = Seat::ALL[1];
+        let later = Seat::ALL[3];
+        let mut left = constructed_game();
+        let pending_tile = make_plain_wait(&mut left.players[actor.index()]);
+        let _ = make_plain_wait(&mut left.players[earlier.index()]);
+        for rank in 1..=9 {
+            add_tile(
+                &mut left.players[later.index()],
+                tile(Suit::Characters, rank),
+                1,
+            );
+        }
+        for rank in 1..=4 {
+            add_tile(
+                &mut left.players[later.index()],
+                tile(Suit::Bamboo, rank),
+                1,
+            );
+        }
+        for rank in 1..=9 {
+            add_tile(&mut left.players[source.index()], tile(Suit::Dots, rank), 1);
+        }
+        for rank in 1..=4 {
+            add_tile(
+                &mut left.players[source.index()],
+                tile(Suit::Characters, rank),
+                1,
+            );
+        }
+        set_wall(
+            &mut left,
+            &[
+                tile(Suit::Characters, 5),
+                tile(Suit::Bamboo, 5),
+                tile(Suit::Dots, 5),
+            ],
+        );
+        left.stage = Stage::HuResponse {
+            source,
+            tile: pending_tile,
+            remaining: seat_bit(actor) | seat_bit(later),
+            winners: seat_bit(earlier),
+            kind: ReactionKind::Discard {
+                after_kong: false,
+                opening_discard: false,
+            },
+        };
+
+        let mut right = left.clone();
+        let earlier_concealed = right.players[earlier.index()].concealed;
+        right.players[earlier.index()].concealed = right.players[later.index()].concealed;
+        right.players[later.index()].concealed = earlier_concealed;
+        right.stage = Stage::HuResponse {
+            source,
+            tile: pending_tile,
+            remaining: seat_bit(actor),
+            winners: 0,
+            kind: ReactionKind::Discard {
+                after_kong: false,
+                opening_discard: false,
+            },
+        };
+
+        let left_observation = observation_for(&left, actor);
+        let right_observation = observation_for(&right, actor);
+        assert_eq!(left_observation, right_observation);
+        let config = crate::RulePlannerConfig::FAST
+            .with_draw_horizon(0)
+            .unwrap()
+            .with_candidate_states(1)
+            .unwrap()
+            .with_response_worlds(2)
+            .unwrap();
+        assert_eq!(
+            left.rule_planner_action_with_config(config),
+            right.rule_planner_action_with_config(config)
+        );
+        for seed in 0..32 {
+            let sampled = left
+                .resample_current_actor_response_information_set(seed)
+                .unwrap();
+            assert_eq!(observation_for(&sampled, actor), left_observation);
+            assert_eq!(sampled.legal_action_mask(), left.legal_action_mask());
+        }
+
+        let sampled_left = left
+            .resample_current_actor_response_information_set(0x1234)
+            .unwrap();
+        let sampled_right = right
+            .resample_current_actor_response_information_set(0x1234)
+            .unwrap();
+        for seat in Seat::ALL {
+            assert_eq!(
+                sampled_left.players[seat.index()].concealed,
+                sampled_right.players[seat.index()].concealed
+            );
+        }
+        assert_eq!(sampled_left.wall, sampled_right.wall);
+        assert_eq!(sampled_left.stage, sampled_right.stage);
+        assert_eq!(sampled_left.legal_action_mask(), left.legal_action_mask());
+        assert_eq!(sampled_right.legal_action_mask(), right.legal_action_mask());
+    }
+
+    #[test]
+    fn response_sampling_preserves_added_kong_completion() {
+        let source = Seat::EAST;
+        let actor = Seat::ALL[1];
+        let mut game = constructed_game();
+        let kong_tile = make_plain_wait(&mut game.players[actor.index()]);
+        assert!(game.players[source.index()].add_meld(Meld {
+            tile: kong_tile,
+            kind: MeldKind::Pong,
+            source: Seat::ALL[3],
+        }));
+        add_tile(&mut game.players[source.index()], kong_tile, 1);
+        let supplement = tile(Suit::Characters, 9);
+        set_wall(&mut game, &[supplement]);
+        game.stage = Stage::HuResponse {
+            source,
+            tile: kong_tile,
+            remaining: seat_bit(actor),
+            winners: 0,
+            kind: ReactionKind::AddedKong,
+        };
+
+        let mut sampled = game
+            .resample_current_actor_response_information_set(0x5678)
+            .unwrap();
+        while sampled.phase() == Phase::HuResponse {
+            sampled.step(Action::Pass).unwrap();
+        }
+
+        assert_eq!(sampled.meld(source, 0).unwrap().kind, MeldKind::AddedKong);
+        assert_eq!(
+            sampled.current_draw(),
+            Some(DrawEvent {
+                player: source,
+                tile: supplement,
+                replacement: true,
+            })
+        );
+        assert_eq!(sampled.score(source), STARTING_SCORE + 3 * SCORE_UNIT);
+        for payer in seats_after(source) {
+            assert_eq!(sampled.score(payer), STARTING_SCORE - SCORE_UNIT);
+        }
+    }
+
+    #[test]
+    fn meld_response_sampling_is_conditioned_on_no_hu() {
+        let source = Seat::EAST;
+        let actor = Seat::ALL[1];
+        let pending_tile = tile(Suit::Bamboo, 5);
+        let mut game = constructed_game();
+        let player = &mut game.players[actor.index()];
+        player.missing = Some(Suit::Dots);
+        add_tile(player, pending_tile, 2);
+        add_tile(player, tile(Suit::Dots, 1), 1);
+        for rank in 1..=9 {
+            add_tile(player, tile(Suit::Characters, rank), 1);
+        }
+        add_tile(player, tile(Suit::Bamboo, 1), 1);
+        let _ = make_plain_wait(&mut game.players[Seat::ALL[2].index()]);
+        let _ = make_plain_wait(&mut game.players[Seat::ALL[3].index()]);
+        set_wall(
+            &mut game,
+            &[
+                tile(Suit::Characters, 1),
+                tile(Suit::Characters, 2),
+                tile(Suit::Characters, 3),
+                tile(Suit::Bamboo, 6),
+                tile(Suit::Bamboo, 7),
+                tile(Suit::Bamboo, 8),
+                tile(Suit::Dots, 2),
+                tile(Suit::Dots, 3),
+                tile(Suit::Dots, 4),
+            ],
+        );
+        game.stage = Stage::MeldResponse {
+            source,
+            tile: pending_tile,
+            remaining: seat_bit(actor),
+        };
+        let expected_observation = observation_for(&game, actor);
+        let expected_legal = game.legal_action_mask();
+
+        for seed in 0..32 {
+            let sampled = game
+                .resample_current_actor_response_information_set(seed)
+                .unwrap();
+            assert_eq!(observation_for(&sampled, actor), expected_observation);
+            assert_eq!(sampled.legal_action_mask(), expected_legal);
+            assert!(
+                seats_after(source)
+                    .into_iter()
+                    .all(|seat| !sampled.can_player_win_with_added_tile(seat, pending_tile))
+            );
+        }
     }
 
     #[test]

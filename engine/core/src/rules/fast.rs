@@ -3,6 +3,8 @@ use crate::types::{Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Ti
 use crate::{ACTION_SPACE_SIZE, ActionId, analyze_shanten};
 use rayon::prelude::*;
 
+use super::hand::{hand_structure_score, suit_structure_score};
+
 /// Sentinel written for terminal batch slots by
 /// [`Batch::simple_rule_actions_into`].
 pub const SIMPLE_RULE_ACTION_TERMINAL: u8 = u8::MAX;
@@ -229,46 +231,6 @@ fn remaining_improving_copies(mask: u32, exposure: &[u8; TILE_KIND_COUNT]) -> u1
     mask_tiles(mask)
         .map(|tile| u16::from(4_u8.saturating_sub(exposure[tile.index()].min(4))))
         .sum()
-}
-
-fn hand_structure_score(counts: &[u8; TILE_KIND_COUNT]) -> i32 {
-    Suit::ALL
-        .into_iter()
-        .map(|suit| suit_structure_score(counts, suit))
-        .sum()
-}
-
-fn suit_structure_score(counts: &[u8; TILE_KIND_COUNT], suit: Suit) -> i32 {
-    let start = suit as usize * 9;
-    let suit_counts = &counts[start..start + 9];
-    let mut score = 0_i32;
-
-    for (rank, &count) in suit_counts.iter().enumerate() {
-        let count = i32::from(count);
-        score += count * (4 - (rank as i32 - 4).abs());
-        if count >= 2 {
-            score += 8;
-        }
-        if count >= 3 {
-            score += 12;
-        }
-        if count == 4 {
-            score += 2;
-        }
-    }
-    for rank in 0..8 {
-        score += 3 * i32::from(suit_counts[rank].min(suit_counts[rank + 1]));
-    }
-    for rank in 0..7 {
-        score += 2 * i32::from(suit_counts[rank].min(suit_counts[rank + 2]));
-        score += 12
-            * i32::from(
-                suit_counts[rank]
-                    .min(suit_counts[rank + 1])
-                    .min(suit_counts[rank + 2]),
-            );
-    }
-    score
 }
 
 fn public_exposure(game: &Game, actor: Seat) -> [u8; TILE_KIND_COUNT] {

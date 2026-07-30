@@ -1,13 +1,16 @@
 //! Balanced tournament evaluation for deterministic rule policies.
 
 use std::num::NonZeroUsize;
-use std::time::Instant;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::{Duration, Instant};
 
 use bloodflow_mahjong::{
-    Game, RuleEvConfig, RuleEvDefense, RuleEvSearchGate, Seat, reset_rule_ev_search_stats,
-    rule_ev_search_stats,
+    Action, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense, RuleEvSearchGate,
+    RulePlannerConfig, Seat, reset_rule_ev_search_stats, reset_rule_planner_search_stats,
+    rule_ev_search_stats, rule_planner_search_stats,
 };
-use clap::{Parser, ValueEnum};
+use clap::{Parser, ValueEnum, error::ErrorKind};
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rayon::prelude::*;
@@ -20,20 +23,21 @@ const ELO_SCALE: f64 = 400.0 / std::f64::consts::LN_10;
 const PL_RIDGE: f64 = 1e-8;
 const PL_ITERATIONS: usize = 32;
 const PL_TOLERANCE: f64 = 1e-10;
+const ELO_ZERO_TOLERANCE: f64 = 1e-8;
 const BOOTSTRAP_DOMAIN: u64 = 0x3c6e_f372_fe94_f82b;
 
 // Every two-versus-two assignment appears once. Within a seed block, each
 // policy controls each seat three times.
-const RULE_EV_SEAT_MASKS: [u8; 6] = [0b0011, 0b0101, 0b1001, 0b0110, 0b1010, 0b1100];
+const POLICY_A_SEAT_MASKS: [u8; 6] = [0b0011, 0b0101, 0b1001, 0b0110, 0b1010, 0b1100];
 
-// Rank-order patterns with exactly two rule_ev players. Bit zero is first
+// Rank-order patterns with exactly two policy-A players. Bit zero is first
 // place, bit one is second place, and so on.
 const RANK_PATTERNS: [u8; 6] = [0b0011, 0b0101, 0b1001, 0b0110, 0b1010, 0b1100];
 
 #[derive(Clone, Debug, Eq, Parser, PartialEq)]
 #[command(
     name = "rule-tournament",
-    about = "Run balanced rule-EV versus rule policy tournament blocks."
+    about = "Run balanced two-policy tournament blocks."
 )]
 struct Config {
     #[arg(long, default_value_t = DEFAULT_BLOCKS)]
@@ -42,18 +46,79 @@ struct Config {
     root_seed: u64,
     #[arg(long, default_value_t = DEFAULT_BOOTSTRAP_SAMPLES)]
     bootstrap_samples: NonZeroUsize,
+    /// Maximum games evaluated concurrently. Nested search defaults to one.
+    #[arg(long)]
+    parallel_games: Option<NonZeroUsize>,
+    #[arg(long, value_enum, default_value = "rule-ev")]
+    policy_a: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
-    candidate_depth: u8,
+    a_lookahead_depth: u8,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2))]
+    a_hand_changes: u8,
+    #[arg(long, default_value_t = 27, value_parser = clap::value_parser!(u8).range(0..=32))]
+    a_draw_horizon: u8,
+    #[arg(long, default_value_t = 4_096, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+    a_candidate_states: u32,
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
-    candidate_worlds: u16,
+    a_belief_worlds: u16,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    a_response_worlds: u16,
+    #[arg(
+        long,
+        visible_alias = "a-search-budget",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u16).range(0..=4_096)
+    )]
+    a_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
-    candidate_defense: Defense,
+    a_defense: Defense,
     #[arg(long, value_enum, default_value = "world")]
-    candidate_search_gate: SearchGate,
+    a_search_gate: SearchGate,
     #[arg(long, value_enum, default_value = "rule-fast")]
-    opponent: Opponent,
+    policy_b: PolicyKind,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
+    b_lookahead_depth: u8,
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2))]
+    b_hand_changes: u8,
+    #[arg(long, default_value_t = 27, value_parser = clap::value_parser!(u8).range(0..=32))]
+    b_draw_horizon: u8,
+    #[arg(long, default_value_t = 4_096, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+    b_candidate_states: u32,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    b_belief_worlds: u16,
+    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    b_response_worlds: u16,
+    #[arg(
+        long,
+        visible_alias = "b-search-budget",
+        default_value_t = 0,
+        value_parser = clap::value_parser!(u16).range(0..=4_096)
+    )]
+    b_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
-    opponent_defense: Defense,
+    b_defense: Defense,
+    #[arg(long, value_enum, default_value = "world")]
+    b_search_gate: SearchGate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PolicyKind {
+    #[value(name = "rule-fast")]
+    Fast,
+    #[value(name = "rule-ev")]
+    Ev,
+    #[value(name = "rule-planner")]
+    Planner,
+}
+
+impl PolicyKind {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Fast => "rule-fast",
+            Self::Ev => "rule-ev",
+            Self::Planner => "rule-planner",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -97,45 +162,31 @@ impl From<SearchGate> for RuleEvSearchGate {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum Opponent {
-    RuleFast,
-    #[value(name = "rule-ev-0")]
-    RuleEv0,
-    #[value(name = "rule-ev-1")]
-    RuleEv1,
-    #[value(name = "rule-ev-2")]
-    RuleEv2,
-    #[value(name = "rule-ev-3")]
-    RuleEv3,
-}
-
-impl Opponent {
-    fn name(self) -> String {
+impl SearchGate {
+    const fn name(self) -> &'static str {
         match self {
-            Self::RuleFast => "rule_fast".into(),
-            Self::RuleEv0 => "rule_ev_d0".into(),
-            Self::RuleEv1 => "rule_ev_d1".into(),
-            Self::RuleEv2 => "rule_ev_d2".into(),
-            Self::RuleEv3 => "rule_ev_d3".into(),
-        }
-    }
-
-    fn search_depth(self) -> Option<u8> {
-        match self {
-            Self::RuleFast => None,
-            Self::RuleEv0 => Some(0),
-            Self::RuleEv1 => Some(1),
-            Self::RuleEv2 => Some(2),
-            Self::RuleEv3 => Some(3),
+            Self::World => "world",
+            Self::ScenarioStrict => "scenario-strict",
+            Self::ScenarioRelaxed => "scenario-relaxed",
         }
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum OpponentPolicy {
-    RuleFast,
-    RuleEv(RuleEvConfig),
+enum Policy {
+    Fast,
+    Ev(RuleEvConfig),
+    Planner(RulePlannerConfig),
+}
+
+impl Policy {
+    fn action(self, game: &Game) -> Option<bloodflow_mahjong::ActionId> {
+        match self {
+            Self::Fast => game.simple_rule_action(),
+            Self::Ev(config) => game.rule_ev_action_with_config(config),
+            Self::Planner(config) => game.rule_planner_action_with_config(config),
+        }
+    }
 }
 
 impl Default for Config {
@@ -144,27 +195,110 @@ impl Default for Config {
             blocks: DEFAULT_BLOCKS,
             root_seed: DEFAULT_ROOT_SEED,
             bootstrap_samples: DEFAULT_BOOTSTRAP_SAMPLES,
-            candidate_depth: RuleEvConfig::STANDARD.search_depth(),
-            candidate_worlds: 0,
-            candidate_defense: Defense::Heuristic,
-            candidate_search_gate: SearchGate::World,
-            opponent: Opponent::RuleFast,
-            opponent_defense: Defense::Heuristic,
+            parallel_games: None,
+            policy_a: PolicyKind::Ev,
+            a_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
+            a_hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
+            a_draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
+            a_candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
+            a_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            a_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
+            a_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
+            a_defense: Defense::Heuristic,
+            a_search_gate: SearchGate::World,
+            policy_b: PolicyKind::Fast,
+            b_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
+            b_hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
+            b_draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
+            b_candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
+            b_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            b_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
+            b_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
+            b_defense: Defense::Heuristic,
+            b_search_gate: SearchGate::World,
         }
     }
 }
 
 #[derive(Clone, Copy, Debug)]
 struct GameResult {
-    rule_ev_seat_mask: u8,
+    policy_a_seat_mask: u8,
     ranks: [u8; 4],
     score_deltas: [i64; 4],
     actions: u32,
+    decisions: [DecisionStats; 2],
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DecisionStats {
+    turns: u64,
+    turn_hu_available: u64,
+    turn_hu_taken: u64,
+    concealed_kong_available: u64,
+    concealed_kong_taken: u64,
+    added_kong_available: u64,
+    added_kong_taken: u64,
+    hu_responses: u64,
+    hu_response_taken: u64,
+    meld_responses: u64,
+    pong_available: u64,
+    pong_taken: u64,
+    exposed_kong_available: u64,
+    exposed_kong_taken: u64,
+    response_passes: u64,
+}
+
+impl DecisionStats {
+    fn observe(&mut self, legal: &LegalActions, action: Action) {
+        match legal.decision.phase {
+            Phase::Turn => {
+                self.turns += 1;
+                self.turn_hu_available += u64::from(legal.can_hu);
+                self.turn_hu_taken += u64::from(matches!(action, Action::Hu));
+                self.concealed_kong_available += u64::from(legal.concealed_kong_mask != 0);
+                self.concealed_kong_taken += u64::from(matches!(action, Action::ConcealedKong(_)));
+                self.added_kong_available += u64::from(legal.added_kong_mask != 0);
+                self.added_kong_taken += u64::from(matches!(action, Action::AddedKong(_)));
+            }
+            Phase::HuResponse => {
+                self.hu_responses += 1;
+                self.hu_response_taken += u64::from(matches!(action, Action::Hu));
+                self.response_passes += u64::from(matches!(action, Action::Pass));
+            }
+            Phase::MeldResponse => {
+                self.meld_responses += 1;
+                self.pong_available += u64::from(legal.can_pong);
+                self.pong_taken += u64::from(matches!(action, Action::Pong));
+                self.exposed_kong_available += u64::from(legal.can_exposed_kong);
+                self.exposed_kong_taken += u64::from(matches!(action, Action::ExposedKong));
+                self.response_passes += u64::from(matches!(action, Action::Pass));
+            }
+            Phase::Exchange | Phase::ChooseMissing | Phase::Finished => {}
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        self.turns += other.turns;
+        self.turn_hu_available += other.turn_hu_available;
+        self.turn_hu_taken += other.turn_hu_taken;
+        self.concealed_kong_available += other.concealed_kong_available;
+        self.concealed_kong_taken += other.concealed_kong_taken;
+        self.added_kong_available += other.added_kong_available;
+        self.added_kong_taken += other.added_kong_taken;
+        self.hu_responses += other.hu_responses;
+        self.hu_response_taken += other.hu_response_taken;
+        self.meld_responses += other.meld_responses;
+        self.pong_available += other.pong_available;
+        self.pong_taken += other.pong_taken;
+        self.exposed_kong_available += other.exposed_kong_available;
+        self.exposed_kong_taken += other.exposed_kong_taken;
+        self.response_passes += other.response_passes;
+    }
 }
 
 #[derive(Clone, Debug)]
 struct BlockResult {
-    games: [GameResult; RULE_EV_SEAT_MASKS.len()],
+    games: [GameResult; POLICY_A_SEAT_MASKS.len()],
     rank_pattern_counts: [u8; RANK_PATTERNS.len()],
 }
 
@@ -180,11 +314,23 @@ struct PolicySummary {
 #[derive(Clone, Copy, Debug)]
 struct TournamentSummary {
     elo_like_delta: f64,
-    elo_like_ci95: [f64; 2],
-    stronger_probability: f64,
+    uncertainty: Option<TournamentUncertainty>,
     cross_policy_win_rate: f64,
-    rule_ev: PolicySummary,
-    rule_fast: PolicySummary,
+    policy_a: PolicySummary,
+    policy_b: PolicySummary,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TournamentUncertainty {
+    ci95: [f64; 2],
+    stronger_probability: f64,
+}
+
+#[derive(Debug, Default)]
+struct TournamentProgress {
+    active_games: AtomicUsize,
+    completed_games: AtomicUsize,
+    actions: AtomicU64,
 }
 
 fn mix64(mut value: u64) -> u64 {
@@ -194,35 +340,46 @@ fn mix64(mut value: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn play_game(
+fn play_game(seed: u64, policy_a_seat_mask: u8, policy_a: Policy, policy_b: Policy) -> GameResult {
+    play_game_with_progress(seed, policy_a_seat_mask, policy_a, policy_b, None)
+}
+
+fn play_game_with_progress(
     seed: u64,
-    rule_ev_seat_mask: u8,
-    candidate: RuleEvConfig,
-    opponent: OpponentPolicy,
+    policy_a_seat_mask: u8,
+    policy_a: Policy,
+    policy_b: Policy,
+    progress: Option<&TournamentProgress>,
 ) -> GameResult {
-    debug_assert_eq!(rule_ev_seat_mask.count_ones(), 2);
+    debug_assert_eq!(policy_a_seat_mask.count_ones(), 2);
+    if let Some(progress) = progress {
+        progress.active_games.fetch_add(1, Ordering::Relaxed);
+    }
     let mut game = Game::new(seed);
     let initial_scores = Seat::ALL.map(|seat| game.score(seat));
+    let mut decisions = [DecisionStats::default(); 2];
 
     for action_index in 0..MAX_ACTIONS_PER_GAME {
-        let decision = game
-            .decision()
+        let legal = game
+            .legal_actions()
             .expect("a non-terminal game always has a decision");
-        let rule_ev_controls_actor = rule_ev_seat_mask & (1 << decision.actor.index()) != 0;
-        let action = if rule_ev_controls_actor {
-            game.rule_ev_action_with_config(candidate)
+        let policy_a_controls_actor = policy_a_seat_mask & (1 << legal.decision.actor.index()) != 0;
+        let action = if policy_a_controls_actor {
+            policy_a.action(&game)
         } else {
-            match opponent {
-                OpponentPolicy::RuleFast => game.simple_rule_action(),
-                OpponentPolicy::RuleEv(config) => game.rule_ev_action_with_config(config),
-            }
+            policy_b.action(&game)
         }
         .expect("a non-terminal rule policy always returns an action");
+        let policy_index = if policy_a_controls_actor { 0 } else { 1 };
+        decisions[policy_index].observe(&legal, action.action());
         let outcome = game.step_id(action).unwrap_or_else(|error| {
             panic!(
-                "rule policy selected an illegal action: seed={seed}, mask={rule_ev_seat_mask:#06b}, error={error}"
+                "rule policy selected an illegal action: seed={seed}, mask={policy_a_seat_mask:#06b}, error={error}"
             )
         });
+        if let Some(progress) = progress {
+            progress.actions.fetch_add(1, Ordering::Relaxed);
+        }
         if !outcome.terminal {
             continue;
         }
@@ -232,21 +389,27 @@ fn play_game(
             ranks[seat.index()] = (index + 1) as u8;
         }
         let score_deltas = Seat::ALL.map(|seat| game.score(seat) - initial_scores[seat.index()]);
-        return GameResult {
-            rule_ev_seat_mask,
+        let result = GameResult {
+            policy_a_seat_mask,
             ranks,
             score_deltas,
             actions: (action_index + 1) as u32,
+            decisions,
         };
+        if let Some(progress) = progress {
+            progress.active_games.fetch_sub(1, Ordering::Relaxed);
+            progress.completed_games.fetch_add(1, Ordering::Relaxed);
+        }
+        return result;
     }
 
-    panic!("game exceeded the action limit: seed={seed}, mask={rule_ev_seat_mask:#06b}");
+    panic!("game exceeded the action limit: seed={seed}, mask={policy_a_seat_mask:#06b}");
 }
 
 fn rank_pattern(game: &GameResult) -> u8 {
     let mut pattern = 0_u8;
     for seat in 0..4 {
-        if game.rule_ev_seat_mask & (1 << seat) != 0 {
+        if game.policy_a_seat_mask & (1 << seat) != 0 {
             pattern |= 1 << (game.ranks[seat] - 1);
         }
     }
@@ -260,8 +423,7 @@ fn pattern_index(pattern: u8) -> usize {
         .expect("two-versus-two results have a known rank pattern")
 }
 
-fn play_block(seed: u64, candidate: RuleEvConfig, opponent: OpponentPolicy) -> BlockResult {
-    let games = RULE_EV_SEAT_MASKS.map(|mask| play_game(seed, mask, candidate, opponent));
+fn summarize_block(games: [GameResult; POLICY_A_SEAT_MASKS.len()]) -> BlockResult {
     let mut rank_pattern_counts = [0_u8; RANK_PATTERNS.len()];
     for game in &games {
         rank_pattern_counts[pattern_index(rank_pattern(game))] += 1;
@@ -272,12 +434,12 @@ fn play_block(seed: u64, candidate: RuleEvConfig, opponent: OpponentPolicy) -> B
     }
 }
 
-fn rule_ev_probability(rating: f64, remaining_ev: u32, remaining_fast: u32) -> f64 {
-    match (remaining_ev, remaining_fast) {
+fn policy_a_probability(rating: f64, remaining_a: u32, remaining_b: u32) -> f64 {
+    match (remaining_a, remaining_b) {
         (0, _) => 0.0,
         (_, 0) => 1.0,
         _ => {
-            let log_odds = rating + f64::from(remaining_ev).ln() - f64::from(remaining_fast).ln();
+            let log_odds = rating + f64::from(remaining_a).ln() - f64::from(remaining_b).ln();
             if log_odds >= 0.0 {
                 1.0 / (1.0 + (-log_odds).exp())
             } else {
@@ -300,11 +462,11 @@ fn fit_pl_rating(pattern_counts: &[u64; RANK_PATTERNS.len()]) -> f64 {
             let weight = count as f64;
             for position in 0..3 {
                 let remaining = pattern >> position;
-                let remaining_ev = remaining.count_ones();
-                let remaining_fast = 4 - position as u32 - remaining_ev;
-                let probability = rule_ev_probability(rating, remaining_ev, remaining_fast);
-                let winner_is_ev = f64::from((remaining & 1) != 0);
-                gradient += weight * (winner_is_ev - probability);
+                let remaining_a = remaining.count_ones();
+                let remaining_b = 4 - position as u32 - remaining_a;
+                let probability = policy_a_probability(rating, remaining_a, remaining_b);
+                let winner_is_a = f64::from((remaining & 1) != 0);
+                gradient += weight * (winner_is_a - probability);
                 hessian -= weight * probability * (1.0 - probability);
             }
         }
@@ -354,7 +516,23 @@ fn quantile_sorted(values: &[f64], probability: f64) -> f64 {
     values[low] * (1.0 - fraction) + values[high] * fraction
 }
 
-fn summarize_policy(blocks: &[BlockResult], rule_ev: bool) -> PolicySummary {
+fn positive_probability(values: &[f64]) -> f64 {
+    let positive_mass: f64 = values
+        .iter()
+        .map(|&value| {
+            if value > ELO_ZERO_TOLERANCE {
+                1.0
+            } else if value < -ELO_ZERO_TOLERANCE {
+                0.0
+            } else {
+                0.5
+            }
+        })
+        .sum();
+    positive_mass / values.len() as f64
+}
+
+fn summarize_policy(blocks: &[BlockResult], policy_a: bool) -> PolicySummary {
     let mut seat_games = 0_u64;
     let mut rank_sum = 0_u64;
     let mut score_sum = 0_i128;
@@ -362,7 +540,7 @@ fn summarize_policy(blocks: &[BlockResult], rule_ev: bool) -> PolicySummary {
     let mut lasts = 0_u64;
     for game in blocks.iter().flat_map(|block| &block.games) {
         for seat in 0..4 {
-            if (game.rule_ev_seat_mask & (1 << seat) != 0) != rule_ev {
+            if (game.policy_a_seat_mask & (1 << seat) != 0) != policy_a {
                 continue;
             }
             let rank = game.ranks[seat];
@@ -387,15 +565,15 @@ fn cross_policy_win_rate(blocks: &[BlockResult]) -> f64 {
     let mut wins = 0_u64;
     let mut comparisons = 0_u64;
     for game in blocks.iter().flat_map(|block| &block.games) {
-        for rule_ev_seat in 0..4 {
-            if game.rule_ev_seat_mask & (1 << rule_ev_seat) == 0 {
+        for policy_a_seat in 0..4 {
+            if game.policy_a_seat_mask & (1 << policy_a_seat) == 0 {
                 continue;
             }
-            for rule_fast_seat in 0..4 {
-                if game.rule_ev_seat_mask & (1 << rule_fast_seat) != 0 {
+            for policy_b_seat in 0..4 {
+                if game.policy_a_seat_mask & (1 << policy_b_seat) != 0 {
                     continue;
                 }
-                wins += u64::from(game.ranks[rule_ev_seat] < game.ranks[rule_fast_seat]);
+                wins += u64::from(game.ranks[policy_a_seat] < game.ranks[policy_b_seat]);
                 comparisons += 1;
             }
         }
@@ -409,20 +587,24 @@ fn summarize_tournament(
     bootstrap_seed: u64,
 ) -> TournamentSummary {
     let rating = fit_pl_rating(&aggregate_patterns(blocks)) * ELO_SCALE;
-    let mut bootstrap = bootstrap_ratings(blocks, bootstrap_samples, bootstrap_seed);
-    let stronger_probability =
-        bootstrap.iter().filter(|&&sample| sample > 0.0).count() as f64 / bootstrap.len() as f64;
-    bootstrap.sort_by(f64::total_cmp);
+    let uncertainty = (blocks.len() >= 2).then(|| {
+        let mut bootstrap = bootstrap_ratings(blocks, bootstrap_samples, bootstrap_seed);
+        let stronger_probability = positive_probability(&bootstrap);
+        bootstrap.sort_by(f64::total_cmp);
+        TournamentUncertainty {
+            ci95: [
+                quantile_sorted(&bootstrap, 0.025),
+                quantile_sorted(&bootstrap, 0.975),
+            ],
+            stronger_probability,
+        }
+    });
     TournamentSummary {
         elo_like_delta: rating,
-        elo_like_ci95: [
-            quantile_sorted(&bootstrap, 0.025),
-            quantile_sorted(&bootstrap, 0.975),
-        ],
-        stronger_probability,
+        uncertainty,
         cross_policy_win_rate: cross_policy_win_rate(blocks),
-        rule_ev: summarize_policy(blocks, true),
-        rule_fast: summarize_policy(blocks, false),
+        policy_a: summarize_policy(blocks, true),
+        policy_b: summarize_policy(blocks, false),
     }
 }
 
@@ -437,73 +619,315 @@ fn print_policy(name: &str, summary: PolicySummary) {
     );
 }
 
-fn run(config: Config) {
+fn aggregate_decisions(blocks: &[BlockResult]) -> [DecisionStats; 2] {
+    let mut totals = [DecisionStats::default(); 2];
+    for game in blocks.iter().flat_map(|block| &block.games) {
+        totals[0].merge(game.decisions[0]);
+        totals[1].merge(game.decisions[1]);
+    }
+    totals
+}
+
+fn print_decisions(name: &str, stats: DecisionStats) {
+    println!(
+        "Decisions {name}  turns {}  Hu turn {}/{} response {}/{}  kong concealed {}/{} added {}/{} exposed {}/{}  pong {}/{}  response-pass {}",
+        stats.turns,
+        stats.turn_hu_taken,
+        stats.turn_hu_available,
+        stats.hu_response_taken,
+        stats.hu_responses,
+        stats.concealed_kong_taken,
+        stats.concealed_kong_available,
+        stats.added_kong_taken,
+        stats.added_kong_available,
+        stats.exposed_kong_taken,
+        stats.exposed_kong_available,
+        stats.pong_taken,
+        stats.pong_available,
+        stats.response_passes,
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PolicySettings {
+    argument_prefix: &'static str,
+    kind: PolicyKind,
+    lookahead_depth: u8,
+    hand_changes: u8,
+    draw_horizon: u8,
+    candidate_states: u32,
+    belief_worlds: u16,
+    response_worlds: u16,
+    search_iterations: u16,
+    defense: Defense,
+    search_gate: SearchGate,
+}
+
+fn invalid_policy_value(
+    settings: PolicySettings,
+    argument: &str,
+    value: impl std::fmt::Display,
+    expected: &str,
+) -> clap::Error {
+    clap::Error::raw(
+        ErrorKind::InvalidValue,
+        format!(
+            "invalid value '{value}' for '--{}-{argument}' with '{}': expected {expected}",
+            settings.argument_prefix,
+            settings.kind.name(),
+        ),
+    )
+}
+
+fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Error> {
+    match settings.kind {
+        PolicyKind::Fast => Ok((Policy::Fast, "rule_fast".into())),
+        PolicyKind::Ev => {
+            let policy = RuleEvConfig::with_search_depth(settings.lookahead_depth)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "lookahead-depth",
+                        settings.lookahead_depth,
+                        "an integer from 0 through 3",
+                    )
+                })?
+                .with_search_worlds(settings.search_iterations)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "search-iterations",
+                        settings.search_iterations,
+                        "an integer from 0 through 256",
+                    )
+                })?
+                .with_defense(settings.defense.into())
+                .with_search_gate(settings.search_gate.into());
+            Ok((
+                Policy::Ev(policy),
+                format!(
+                    "rule_ev_d{}_w{}_{}_{}",
+                    settings.lookahead_depth,
+                    settings.search_iterations,
+                    settings.defense.name(),
+                    settings.search_gate.name(),
+                ),
+            ))
+        }
+        PolicyKind::Planner => {
+            let policy = RulePlannerConfig::STANDARD
+                .with_hand_changes(settings.hand_changes)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "hand-changes",
+                        settings.hand_changes,
+                        "an integer from 0 through 2",
+                    )
+                })?
+                .with_draw_horizon(settings.draw_horizon)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "draw-horizon",
+                        settings.draw_horizon,
+                        "an integer from 0 through 32",
+                    )
+                })?
+                .with_candidate_states(settings.candidate_states)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "candidate-states",
+                        settings.candidate_states,
+                        "an integer from 1 through 200000",
+                    )
+                })?
+                .with_belief_worlds(settings.belief_worlds)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "belief-worlds",
+                        settings.belief_worlds,
+                        "an integer from 0 through 256",
+                    )
+                })?
+                .with_response_worlds(settings.response_worlds)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "response-worlds",
+                        settings.response_worlds,
+                        "an integer from 0 through 256",
+                    )
+                })?
+                .with_search_iterations(settings.search_iterations)
+                .ok_or_else(|| {
+                    invalid_policy_value(
+                        settings,
+                        "search-iterations",
+                        settings.search_iterations,
+                        "an integer from 0 through 4096",
+                    )
+                })?;
+            Ok((
+                Policy::Planner(policy),
+                format!(
+                    "rule_planner_h{}_d{}_c{}_b{}_r{}_i{}",
+                    settings.hand_changes,
+                    settings.draw_horizon,
+                    settings.candidate_states,
+                    settings.belief_worlds,
+                    settings.response_worlds,
+                    settings.search_iterations,
+                ),
+            ))
+        }
+    }
+}
+
+fn run(config: Config) -> Result<(), clap::Error> {
     let block_count = config.blocks.get();
     let bootstrap_samples = config.bootstrap_samples.get();
     let games = block_count
-        .checked_mul(RULE_EV_SEAT_MASKS.len())
+        .checked_mul(POLICY_A_SEAT_MASKS.len())
         .expect("game count overflowed usize");
-    let candidate_defense = RuleEvDefense::from(config.candidate_defense);
-    let candidate_search_gate = RuleEvSearchGate::from(config.candidate_search_gate);
-    let candidate = RuleEvConfig::with_search_depth(config.candidate_depth)
-        .expect("argument parsing validates candidate depth")
-        .with_search_worlds(config.candidate_worlds)
-        .expect("argument parsing validates candidate worlds")
-        .with_defense(candidate_defense)
-        .with_search_gate(candidate_search_gate);
-    let defense_name = config.candidate_defense.name();
-    let gate_name = match config.candidate_search_gate {
-        SearchGate::World => "world",
-        SearchGate::ScenarioStrict => "scenario-strict",
-        SearchGate::ScenarioRelaxed => "scenario-relaxed",
-    };
-    let candidate_name = format!(
-        "rule_ev_d{}_w{}_{}_{}",
-        config.candidate_depth, config.candidate_worlds, defense_name, gate_name,
-    );
-    let opponent_name = match config.opponent.search_depth() {
-        None => config.opponent.name(),
-        Some(search_depth) => format!(
-            "rule_ev_d{}_{}",
-            search_depth,
-            config.opponent_defense.name(),
-        ),
-    };
-    let opponent = match config.opponent.search_depth() {
-        None => OpponentPolicy::RuleFast,
-        Some(search_depth) => OpponentPolicy::RuleEv(
-            RuleEvConfig::with_search_depth(search_depth)
-                .expect("the CLI only exposes valid opponent depths")
-                .with_defense(config.opponent_defense.into()),
-        ),
-    };
+    let nested_search = (config.policy_a != PolicyKind::Fast
+        && (config.a_search_iterations != 0
+            || config.a_belief_worlds != 0
+            || config.a_response_worlds != 0))
+        || (config.policy_b != PolicyKind::Fast
+            && (config.b_search_iterations != 0
+                || config.b_belief_worlds != 0
+                || config.b_response_worlds != 0));
+    let parallel_games = config
+        .parallel_games
+        .map_or_else(
+            || {
+                if nested_search {
+                    1
+                } else {
+                    rayon::current_num_threads()
+                }
+            },
+            NonZeroUsize::get,
+        )
+        .min(games);
+    let (policy_a, policy_a_name) = build_policy(PolicySettings {
+        argument_prefix: "a",
+        kind: config.policy_a,
+        lookahead_depth: config.a_lookahead_depth,
+        hand_changes: config.a_hand_changes,
+        draw_horizon: config.a_draw_horizon,
+        candidate_states: config.a_candidate_states,
+        belief_worlds: config.a_belief_worlds,
+        response_worlds: config.a_response_worlds,
+        search_iterations: config.a_search_iterations,
+        defense: config.a_defense,
+        search_gate: config.a_search_gate,
+    })?;
+    let (policy_b, policy_b_name) = build_policy(PolicySettings {
+        argument_prefix: "b",
+        kind: config.policy_b,
+        lookahead_depth: config.b_lookahead_depth,
+        hand_changes: config.b_hand_changes,
+        draw_horizon: config.b_draw_horizon,
+        candidate_states: config.b_candidate_states,
+        belief_worlds: config.b_belief_worlds,
+        response_worlds: config.b_response_worlds,
+        search_iterations: config.b_search_iterations,
+        defense: config.b_defense,
+        search_gate: config.b_search_gate,
+    })?;
     println!(
-        "Rule tournament  candidate {}  opponent {}  blocks {}  games {}  root-seed {}  bootstrap {}  rayon-threads {}",
-        candidate_name,
-        opponent_name,
+        "Rule tournament  policy-a {}  policy-b {}  blocks {}  games {}  root-seed {}  bootstrap {}  rayon-threads {}  parallel-games {}",
+        policy_a_name,
+        policy_b_name,
         block_count,
         games,
         config.root_seed,
         bootstrap_samples,
         rayon::current_num_threads(),
+        parallel_games,
     );
 
-    // Initialize lazily built hand-analysis tables outside the measurement.
-    let _ = play_block(
+    // Initialize shared hand-analysis tables without serially evaluating an
+    // expensive policy before the tournament's parallel game schedule starts.
+    let _ = play_game(
         mix64(config.root_seed ^ BOOTSTRAP_DOMAIN),
-        candidate,
-        opponent,
+        POLICY_A_SEAT_MASKS[0],
+        Policy::Fast,
+        Policy::Fast,
     );
     reset_rule_ev_search_stats();
+    reset_rule_planner_search_stats();
 
     let started = Instant::now();
-    let blocks: Vec<_> = (0..block_count)
-        .into_par_iter()
-        .map(|block| {
-            play_block(
-                mix64(config.root_seed.wrapping_add(block as u64)),
-                candidate,
-                opponent,
+    let progress = TournamentProgress::default();
+    let finished = AtomicBool::new(false);
+    let game_results: Vec<_> = std::thread::scope(|scope| {
+        let monitor = scope.spawn(|| {
+            loop {
+                std::thread::park_timeout(Duration::from_secs(5));
+                let done = progress.completed_games.load(Ordering::Relaxed);
+                let active = progress.active_games.load(Ordering::Relaxed);
+                let actions = progress.actions.load(Ordering::Relaxed);
+                let elapsed = started.elapsed().as_secs_f64();
+                let eta = (done != 0 && done < games)
+                    .then(|| elapsed * (games - done) as f64 / done as f64);
+                eprintln!(
+                    "Progress {done}/{games} ({:.1}%)  active {active}  actions {actions} ({:.1}/s)  elapsed {}  ETA {}",
+                    100.0 * done as f64 / games as f64,
+                    actions as f64 / elapsed.max(f64::EPSILON),
+                    format_duration(elapsed),
+                    eta.map_or_else(|| "--:--".into(), format_duration),
+                );
+                if finished.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+        });
+        let next_game = AtomicUsize::new(0);
+        let results: Vec<OnceLock<_>> = (0..games).map(|_| OnceLock::new()).collect();
+        (0..parallel_games).into_par_iter().for_each(|_| {
+            loop {
+                let game_index = next_game.fetch_add(1, Ordering::Relaxed);
+                if game_index >= games {
+                    return;
+                }
+                let block = game_index / POLICY_A_SEAT_MASKS.len();
+                let assignment = game_index % POLICY_A_SEAT_MASKS.len();
+                let result = play_game_with_progress(
+                    mix64(config.root_seed.wrapping_add(block as u64)),
+                    POLICY_A_SEAT_MASKS[assignment],
+                    policy_a,
+                    policy_b,
+                    Some(&progress),
+                );
+                assert!(
+                    results[game_index].set(result).is_ok(),
+                    "a tournament game is evaluated once"
+                );
+            }
+        });
+        finished.store(true, Ordering::Release);
+        monitor.thread().unpark();
+        results
+            .into_iter()
+            .map(|result| {
+                result
+                    .into_inner()
+                    .expect("every tournament game completed")
+            })
+            .collect()
+    });
+    let blocks: Vec<_> = game_results
+        .chunks_exact(POLICY_A_SEAT_MASKS.len())
+        .map(|games| {
+            summarize_block(
+                games
+                    .try_into()
+                    .expect("the flat game schedule contains complete blocks"),
             )
         })
         .collect();
@@ -513,7 +937,8 @@ fn run(config: Config) {
         .flat_map(|block| &block.games)
         .map(|game| u64::from(game.actions))
         .sum();
-    let search_stats = rule_ev_search_stats();
+    let rule_ev_stats = rule_ev_search_stats();
+    let planner_stats = rule_planner_search_stats();
 
     let statistics_started = Instant::now();
     let summary = summarize_tournament(
@@ -523,20 +948,30 @@ fn run(config: Config) {
     );
     let statistics_elapsed = statistics_started.elapsed().as_secs_f64();
 
+    if let Some(uncertainty) = summary.uncertainty {
+        println!(
+            "{} Elo-like delta vs {} {:+.2}  CI95 [{:+.2}, {:+.2}]  P(stronger) {:.4}  cross-policy-win {:.4}",
+            policy_a_name,
+            policy_b_name,
+            summary.elo_like_delta,
+            uncertainty.ci95[0],
+            uncertainty.ci95[1],
+            uncertainty.stronger_probability,
+            summary.cross_policy_win_rate,
+        );
+    } else {
+        println!(
+            "{} Elo-like delta vs {} {:+.2}  uncertainty unavailable (need at least 2 blocks)  cross-policy-win {:.4}",
+            policy_a_name, policy_b_name, summary.elo_like_delta, summary.cross_policy_win_rate,
+        );
+    }
+    print_policy(&policy_a_name, summary.policy_a);
+    print_policy(&policy_b_name, summary.policy_b);
+    let decision_stats = aggregate_decisions(&blocks);
+    print_decisions(&policy_a_name, decision_stats[0]);
+    print_decisions(&policy_b_name, decision_stats[1]);
     println!(
-        "{} Elo-like delta vs {} {:+.2}  CI95 [{:+.2}, {:+.2}]  P(stronger) {:.4}  cross-policy-win {:.4}",
-        candidate_name,
-        opponent_name,
-        summary.elo_like_delta,
-        summary.elo_like_ci95[0],
-        summary.elo_like_ci95[1],
-        summary.stronger_probability,
-        summary.cross_policy_win_rate,
-    );
-    print_policy(&candidate_name, summary.rule_ev);
-    print_policy(&opponent_name, summary.rule_fast);
-    println!(
-        "Throughput  play {:.3}s  statistics {:.3}s  games/s {:.0}  actions/s {:.0}  actions {}",
+        "Throughput  play {:.3}s  statistics {:.3}s  games/s {:.3}  actions/s {:.1}  actions {}",
         play_elapsed,
         statistics_elapsed,
         games as f64 / play_elapsed,
@@ -545,28 +980,92 @@ fn run(config: Config) {
     );
     println!(
         "Search  decisions {}  overrides {} ({:.2}%)  rollouts {}",
-        search_stats.decisions,
-        search_stats.overrides,
-        if search_stats.decisions == 0 {
+        rule_ev_stats.decisions + planner_stats.decisions,
+        rule_ev_stats.overrides + planner_stats.overrides,
+        if rule_ev_stats.decisions + planner_stats.decisions == 0 {
             0.0
         } else {
-            100.0 * search_stats.overrides as f64 / search_stats.decisions as f64
+            100.0 * (rule_ev_stats.overrides + planner_stats.overrides) as f64
+                / (rule_ev_stats.decisions + planner_stats.decisions) as f64
         },
-        search_stats.rollouts,
+        rule_ev_stats.rollouts + planner_stats.rollouts,
     );
     println!(
-        "RESULT {}-vs-{} Elo {:+.2} [{:+.2},{:+.2}] P {:+.4}",
-        candidate_name,
-        opponent_name,
-        summary.elo_like_delta,
-        summary.elo_like_ci95[0],
-        summary.elo_like_ci95[1],
-        summary.stronger_probability,
+        "Planner search  proposals {}  validation-rejected {}  accepted {}",
+        planner_stats.proposals,
+        planner_stats.validation_rejections,
+        planner_stats
+            .proposals
+            .saturating_sub(planner_stats.validation_rejections),
     );
+    println!(
+        "Planner  turns {}  overrides {} ({:.2}%)  mean-hazard {:.3} points/candidate  won {:.3}  unwon {:.3}",
+        planner_stats.planned_turns,
+        planner_stats.turn_overrides,
+        if planner_stats.planned_turns == 0 {
+            0.0
+        } else {
+            100.0 * planner_stats.turn_overrides as f64 / planner_stats.planned_turns as f64
+        },
+        if planner_stats.hazard_candidates == 0 {
+            0.0
+        } else {
+            planner_stats.hazard_loss_millipoints as f64
+                / 1_000.0
+                / planner_stats.hazard_candidates as f64
+        },
+        if planner_stats.hazard_candidates == 0 {
+            0.0
+        } else {
+            planner_stats.hazard_won_loss_millipoints as f64
+                / 1_000.0
+                / planner_stats.hazard_candidates as f64
+        },
+        if planner_stats.hazard_candidates == 0 {
+            0.0
+        } else {
+            planner_stats
+                .hazard_loss_millipoints
+                .saturating_sub(planner_stats.hazard_won_loss_millipoints) as f64
+                / 1_000.0
+                / planner_stats.hazard_candidates as f64
+        },
+    );
+    if let Some(uncertainty) = summary.uncertainty {
+        println!(
+            "RESULT {}-vs-{} Elo {:+.2} [{:+.2},{:+.2}] P {:+.4}",
+            policy_a_name,
+            policy_b_name,
+            summary.elo_like_delta,
+            uncertainty.ci95[0],
+            uncertainty.ci95[1],
+            uncertainty.stronger_probability,
+        );
+    } else {
+        println!(
+            "RESULT {}-vs-{} Elo {:+.2} uncertainty-unavailable",
+            policy_a_name, policy_b_name, summary.elo_like_delta,
+        );
+    }
+    Ok(())
+}
+
+fn format_duration(seconds: f64) -> String {
+    let total = seconds.max(0.0).round() as u64;
+    let hours = total / 3_600;
+    let minutes = total / 60 % 60;
+    let seconds = total % 60;
+    if hours == 0 {
+        format!("{minutes:02}:{seconds:02}")
+    } else {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    }
 }
 
 fn main() {
-    run(Config::parse());
+    if let Err(error) = run(Config::parse()) {
+        error.exit();
+    }
 }
 
 #[cfg(test)]
@@ -576,15 +1075,15 @@ mod tests {
     #[test]
     fn schedule_is_balanced() {
         let mut appearances = [0_u8; 4];
-        for &mask in &RULE_EV_SEAT_MASKS {
+        for &mask in &POLICY_A_SEAT_MASKS {
             assert_eq!(mask.count_ones(), 2);
             for (seat, count) in appearances.iter_mut().enumerate() {
                 *count += u8::from(mask & (1 << seat) != 0);
             }
         }
         assert_eq!(appearances, [3; 4]);
-        for (left_index, &left) in RULE_EV_SEAT_MASKS.iter().enumerate() {
-            for &right in RULE_EV_SEAT_MASKS.iter().skip(left_index + 1) {
+        for (left_index, &left) in POLICY_A_SEAT_MASKS.iter().enumerate() {
+            for &right in POLICY_A_SEAT_MASKS.iter().skip(left_index + 1) {
                 assert_ne!(left, right);
             }
         }
@@ -626,6 +1125,28 @@ mod tests {
     }
 
     #[test]
+    fn stronger_probability_splits_zero_mass_evenly() {
+        assert_eq!(positive_probability(&[0.0]), 0.5);
+        assert_eq!(positive_probability(&[-1.0, 0.0, 1.0]), 0.5);
+    }
+
+    #[test]
+    fn one_block_does_not_claim_bootstrap_uncertainty() {
+        let block = BlockResult {
+            games: POLICY_A_SEAT_MASKS.map(|policy_a_seat_mask| GameResult {
+                policy_a_seat_mask,
+                ranks: [1, 2, 3, 4],
+                score_deltas: [0; 4],
+                actions: 0,
+                decisions: [DecisionStats::default(); 2],
+            }),
+            rank_pattern_counts: [1; RANK_PATTERNS.len()],
+        };
+
+        assert!(summarize_tournament(&[block], 16, 7).uncertainty.is_none());
+    }
+
+    #[test]
     fn arguments_have_defaults_and_named_overrides() {
         assert_eq!(
             Config::try_parse_from(["rule-tournament"]).unwrap(),
@@ -640,38 +1161,91 @@ mod tests {
                 "34",
                 "--bootstrap-samples",
                 "56",
-                "--candidate-depth",
+                "--policy-a",
+                "rule-planner",
+                "--a-hand-changes",
                 "2",
-                "--candidate-worlds",
+                "--a-draw-horizon",
+                "19",
+                "--a-candidate-states",
+                "2048",
+                "--a-belief-worlds",
                 "8",
-                "--candidate-defense",
+                "--a-search-iterations",
+                "16",
+                "--policy-b",
+                "rule-ev",
+                "--b-lookahead-depth",
+                "0",
+                "--b-search-budget",
+                "12",
+                "--b-defense",
                 "none",
-                "--candidate-search-gate",
+                "--b-search-gate",
                 "scenario-strict",
-                "--opponent",
-                "rule-ev-0",
-                "--opponent-defense",
-                "heuristic",
             ])
             .unwrap(),
             Config {
                 blocks: NonZeroUsize::new(12).unwrap(),
                 root_seed: 34,
                 bootstrap_samples: NonZeroUsize::new(56).unwrap(),
-                candidate_depth: 2,
-                candidate_worlds: 8,
-                candidate_defense: Defense::None,
-                candidate_search_gate: SearchGate::ScenarioStrict,
-                opponent: Opponent::RuleEv0,
-                opponent_defense: Defense::Heuristic,
+                parallel_games: None,
+                policy_a: PolicyKind::Planner,
+                a_lookahead_depth: 1,
+                a_hand_changes: 2,
+                a_draw_horizon: 19,
+                a_candidate_states: 2_048,
+                a_belief_worlds: 8,
+                a_response_worlds: 0,
+                a_search_iterations: 16,
+                a_defense: Defense::Heuristic,
+                a_search_gate: SearchGate::World,
+                policy_b: PolicyKind::Ev,
+                b_lookahead_depth: 0,
+                b_hand_changes: 1,
+                b_draw_horizon: 27,
+                b_candidate_states: 4_096,
+                b_belief_worlds: 0,
+                b_response_worlds: 0,
+                b_search_iterations: 12,
+                b_defense: Defense::None,
+                b_search_gate: SearchGate::ScenarioStrict,
             }
         );
     }
 
     #[test]
     fn clap_rejects_out_of_range_values() {
-        assert!(Config::try_parse_from(["rule-tournament", "--candidate-depth", "4"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--candidate-worlds", "257"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--a-lookahead-depth", "4"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--a-hand-changes", "3"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--b-draw-horizon", "33"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--a-candidate-states", "0"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--a-belief-worlds", "257"]).is_err());
+        assert!(Config::try_parse_from(["rule-tournament", "--a-response-worlds", "257"]).is_err());
+        assert!(
+            Config::try_parse_from(["rule-tournament", "--b-search-iterations", "4097"]).is_err()
+        );
         assert!(Config::try_parse_from(["rule-tournament", "--blocks", "0"]).is_err());
+    }
+
+    #[test]
+    fn policy_specific_range_errors_are_clap_errors() {
+        let error = build_policy(PolicySettings {
+            argument_prefix: "a",
+            kind: PolicyKind::Ev,
+            lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
+            hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
+            draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
+            candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
+            belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
+            search_iterations: 257,
+            defense: Defense::Heuristic,
+            search_gate: SearchGate::World,
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind(), ErrorKind::InvalidValue);
+        assert!(error.to_string().contains("--a-search-iterations"));
     }
 }
