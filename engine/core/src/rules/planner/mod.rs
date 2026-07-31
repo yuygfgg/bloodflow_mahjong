@@ -1,5 +1,6 @@
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use crate::ActionId;
 use crate::game::{
     Game, LegalActions, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, Phase,
     RIVER_OBSERVATION_WIDTH, TILE_OBSERVATION_WIDTH,
@@ -13,7 +14,6 @@ use crate::rules::{
 #[cfg(feature = "planner-analysis")]
 use crate::types::PLAYER_COUNT;
 use crate::types::{Seat, Tile};
-use crate::{ActionId, BeliefResidualError, BeliefResidualEvaluator};
 
 mod belief;
 mod graph;
@@ -36,7 +36,6 @@ const MAX_CANDIDATE_STATES: u32 = 200_000;
 const MAX_BELIEF_WORLDS: u16 = 256;
 const MAX_RESPONSE_WORLDS: u16 = 256;
 const MAX_SEARCH_ITERATIONS: u16 = 4_096;
-pub const RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS: u16 = 9;
 const MAX_ROLLOUT_ACTIONS: usize = 1_024;
 const SEARCH_SEED_DOMAIN: u64 = 0x6b82_12f4_c938_d0a7;
 const BELIEF_SEED_DOMAIN: u64 = 0xd14f_3a6c_92e7_580b;
@@ -201,7 +200,6 @@ pub struct RulePlannerSearchAnalysis {
     baseline: ActionId,
     outcome: RulePlannerSearchOutcome,
     rollouts: u64,
-    belief_residual_fallback: Option<bool>,
 }
 
 impl RulePlannerSearchAnalysis {
@@ -210,13 +208,7 @@ impl RulePlannerSearchAnalysis {
             baseline,
             outcome,
             rollouts,
-            belief_residual_fallback: None,
         }
-    }
-
-    const fn with_belief_residual(mut self, fallback: bool) -> Self {
-        self.belief_residual_fallback = Some(fallback);
-        self
     }
 
     const fn action(self) -> ActionId {
@@ -241,13 +233,6 @@ impl RulePlannerSearchAnalysis {
     #[cfg(any(feature = "planner-analysis", test))]
     pub const fn rollouts(self) -> u64 {
         self.rollouts
-    }
-
-    /// Returns `None` when no learned residual was evaluated. `Some(true)`
-    /// identifies an atomic selection-and-validation fallback.
-    #[cfg(any(feature = "planner-analysis", test))]
-    pub const fn belief_residual_fallback(self) -> Option<bool> {
-        self.belief_residual_fallback
     }
 }
 
@@ -437,17 +422,6 @@ impl Default for RulePlannerConfig {
     }
 }
 
-fn validate_belief_residual_config(config: RulePlannerConfig) -> Result<(), BeliefResidualError> {
-    let actual = config.search_iterations();
-    if actual < RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS {
-        return Err(BeliefResidualError::SearchIterations {
-            actual,
-            minimum: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS,
-        });
-    }
-    Ok(())
-}
-
 impl Game {
     pub fn rule_planner_action(&self) -> Option<ActionId> {
         self.rule_planner_action_with_config(RulePlannerConfig::STANDARD)
@@ -463,47 +437,6 @@ impl Game {
             &legal,
             config.without_search(),
         ))
-    }
-
-    /// Runs paired root search with a learned residual added to the hand-written
-    /// posterior log weight. Non-search decisions do not call the evaluator.
-    pub fn rule_planner_action_with_config_and_belief_residual(
-        &self,
-        config: RulePlannerConfig,
-        evaluator: &dyn BeliefResidualEvaluator,
-    ) -> Result<Option<ActionId>, BeliefResidualError> {
-        self.rule_planner_analysis_with_config_and_belief_residual_inner(config, evaluator)
-            .map(|analysis| analysis.map(RulePlannerAnalysis::action))
-    }
-
-    /// Runs paired root search with a learned belief residual and returns its
-    /// structured search diagnostic.
-    #[cfg(feature = "planner-analysis")]
-    pub fn rule_planner_analysis_with_config_and_belief_residual(
-        &self,
-        config: RulePlannerConfig,
-        evaluator: &dyn BeliefResidualEvaluator,
-    ) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
-        self.rule_planner_analysis_with_config_and_belief_residual_inner(config, evaluator)
-    }
-
-    fn rule_planner_analysis_with_config_and_belief_residual_inner(
-        &self,
-        config: RulePlannerConfig,
-        evaluator: &dyn BeliefResidualEvaluator,
-    ) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
-        validate_belief_residual_config(config)?;
-        let Some(legal) = self.legal_actions() else {
-            return Ok(None);
-        };
-        if legal.decision.phase == Phase::Turn && !legal.can_hu {
-            return search::paired_policy_improvement_analysis_with_residual(
-                self, &legal, config, evaluator,
-            );
-        }
-        Ok(Some(RulePlannerAnalysis::without_search(
-            planner_action_without_search(self, &legal, config.without_search()),
-        )))
     }
 
     /// Runs a planner root-belief ablation.
@@ -877,19 +810,6 @@ fn mix_search_seed(mut value: u64) -> u64 {
 mod tests {
     use super::*;
 
-    struct UnexpectedResidual;
-
-    impl BeliefResidualEvaluator for UnexpectedResidual {
-        fn evaluate_residuals(
-            &self,
-            _public: &crate::BeliefPublicFeatures,
-            _candidates: &[crate::BeliefCandidateFeatures],
-            _output: &mut [f32],
-        ) -> Result<(), BeliefResidualError> {
-            panic!("an invalid residual search budget must fail before evaluation")
-        }
-    }
-
     #[test]
     fn config_rejects_out_of_range_budgets() {
         assert!(
@@ -921,23 +841,6 @@ mod tests {
             RulePlannerConfig::STANDARD
                 .with_search_iterations(MAX_SEARCH_ITERATIONS + 1)
                 .is_none()
-        );
-    }
-
-    #[test]
-    fn learned_residual_rejects_an_insufficient_search_budget() {
-        let actual = RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS - 1;
-        let config = RulePlannerConfig::ROLLOUT
-            .with_search_iterations(actual)
-            .expect("budget below the learned minimum is a valid base configuration");
-
-        assert_eq!(
-            Game::new(17)
-                .rule_planner_action_with_config_and_belief_residual(config, &UnexpectedResidual),
-            Err(BeliefResidualError::SearchIterations {
-                actual,
-                minimum: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS,
-            }),
         );
     }
 

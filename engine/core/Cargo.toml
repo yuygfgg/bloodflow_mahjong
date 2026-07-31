@@ -27,7 +27,6 @@ name = "ffi-throughput-benchmark"
 path = "benchmarks/ffi_throughput.rs"
 
 [features]
-belief-training = []
 planner-analysis = []
 
 [dependencies]

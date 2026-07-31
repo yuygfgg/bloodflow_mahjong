@@ -9,7 +9,6 @@
 use rayon::prelude::*;
 
 use crate::types::PLAYER_COUNT;
-use crate::{BeliefResidualError, BeliefResidualEvaluator};
 
 use super::{
     belief::{RootBeliefMode, RootBeliefParticle, RootBeliefSampler},
@@ -85,26 +84,8 @@ pub(super) fn paired_policy_improvement(
         config,
         RootBeliefMode::Posterior,
         RolloutModels::Current,
-        None,
     )
-    .expect("root search without a learned evaluator cannot fail")
     .map(RulePlannerAnalysis::action)
-}
-
-pub(super) fn paired_policy_improvement_analysis_with_residual(
-    game: &Game,
-    legal: &LegalActions,
-    config: RulePlannerConfig,
-    evaluator: &dyn BeliefResidualEvaluator,
-) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
-    paired_policy_improvement_analysis_inner(
-        game,
-        legal,
-        config,
-        RootBeliefMode::Posterior,
-        RolloutModels::Current,
-        Some(evaluator),
-    )
 }
 
 #[cfg(feature = "planner-analysis")]
@@ -115,8 +96,7 @@ pub(super) fn paired_policy_improvement_analysis(
     root_belief: RootBeliefMode,
     rollout_models: RolloutModels,
 ) -> Option<RulePlannerAnalysis> {
-    paired_policy_improvement_analysis_inner(game, legal, config, root_belief, rollout_models, None)
-        .expect("planner analysis without a learned evaluator cannot fail")
+    paired_policy_improvement_analysis_inner(game, legal, config, root_belief, rollout_models)
 }
 
 fn paired_policy_improvement_analysis_inner(
@@ -125,58 +105,29 @@ fn paired_policy_improvement_analysis_inner(
     config: RulePlannerConfig,
     root_belief: RootBeliefMode,
     rollout_models: RolloutModels,
-    evaluator: Option<&dyn BeliefResidualEvaluator>,
-) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
+) -> Option<RulePlannerAnalysis> {
     let baseline = planner_action_without_search(game, legal, config.without_search());
-    let Some(legal_mask) = game.legal_action_mask() else {
-        return Ok(None);
-    };
+    let legal_mask = game.legal_action_mask()?;
     let mut actions: Vec<_> = legal_mask.iter().collect();
     if actions.len() <= 1 {
-        return Ok(actions
+        return actions
             .into_iter()
             .next()
-            .map(RulePlannerAnalysis::without_search));
+            .map(RulePlannerAnalysis::without_search);
     }
-    let Some(baseline_index) = actions.iter().position(|&action| action == baseline) else {
-        return Ok(None);
-    };
+    let baseline_index = actions.iter().position(|&action| action == baseline)?;
     actions.swap(0, baseline_index);
 
     let world_count = usize::from(config.search_iterations());
     if world_count < MIN_EFFECTIVE_WORLDS as usize {
-        return Ok(Some(RulePlannerAnalysis::without_search(baseline)));
+        return Some(RulePlannerAnalysis::without_search(baseline));
     }
 
     let actor = legal.decision.actor;
     let base_seed = public_state_hash(game, actor);
-    let Some(selection_sampler) =
-        RootBeliefSampler::new(game, actor, base_seed ^ SELECTION_WORLD_DOMAIN)
-    else {
-        return Ok(None);
-    };
-    let mut selection_particles = selection_sampler.sample_batch(world_count, root_belief);
-    let mut belief_residual_fallback = None;
-    let learned_validation_particles = if let Some(evaluator) = evaluator {
-        let Some(validation_sampler) =
-            RootBeliefSampler::new(game, actor, base_seed ^ VALIDATION_WORLD_DOMAIN)
-        else {
-            return Ok(None);
-        };
-        let mut validation_particles = validation_sampler.sample_batch(world_count, root_belief);
-        let mut batches = [
-            selection_particles.as_mut_slice(),
-            validation_particles.as_mut_slice(),
-        ];
-        selection_sampler.apply_residuals(evaluator, &mut batches)?;
-        belief_residual_fallback = Some(apply_joint_weight_fallback(
-            &mut selection_particles,
-            &mut validation_particles,
-        ));
-        Some(validation_particles)
-    } else {
-        None
-    };
+    let selection_sampler =
+        RootBeliefSampler::new(game, actor, base_seed ^ SELECTION_WORLD_DOMAIN)?;
+    let selection_particles = selection_sampler.sample_batch(world_count, root_belief);
     SEARCH_DECISIONS.fetch_add(1, AtomicOrdering::Relaxed);
     let selection = evaluate_selection(selection_particles, actor, &actions, rollout_models);
     let model_count = rollout_models.len();
@@ -185,27 +136,18 @@ fn paired_policy_improvement_analysis_inner(
 
     let candidate_index = select_candidate(&selection, actions.len());
     let Some(candidate_index) = candidate_index.filter(|&index| index != 0) else {
-        return Ok(Some(search_analysis(
+        return Some(search_analysis(
             baseline,
             RulePlannerSearchOutcome::NoProposal,
             rollouts,
-            belief_residual_fallback,
-        )));
+        ));
     };
     let candidate = actions[candidate_index];
     SEARCH_PROPOSALS.fetch_add(1, AtomicOrdering::Relaxed);
 
-    let validation_particles = match learned_validation_particles {
-        Some(particles) => particles,
-        None => {
-            let Some(validation_sampler) =
-                RootBeliefSampler::new(game, actor, base_seed ^ VALIDATION_WORLD_DOMAIN)
-            else {
-                return Ok(None);
-            };
-            validation_sampler.sample_batch(world_count, root_belief)
-        }
-    };
+    let validation_sampler =
+        RootBeliefSampler::new(game, actor, base_seed ^ VALIDATION_WORLD_DOMAIN)?;
+    let validation_particles = validation_sampler.sample_batch(world_count, root_belief);
     let validation = evaluate_validation(
         validation_particles,
         actor,
@@ -224,25 +166,15 @@ fn paired_policy_improvement_analysis_inner(
         SEARCH_VALIDATION_REJECTIONS.fetch_add(1, AtomicOrdering::Relaxed);
         RulePlannerSearchOutcome::Rejected(candidate)
     };
-    Ok(Some(search_analysis(
-        baseline,
-        outcome,
-        rollouts,
-        belief_residual_fallback,
-    )))
+    Some(search_analysis(baseline, outcome, rollouts))
 }
 
 fn search_analysis(
     baseline: ActionId,
     outcome: RulePlannerSearchOutcome,
     rollouts: u64,
-    belief_residual_fallback: Option<bool>,
 ) -> RulePlannerAnalysis {
     let search = RulePlannerSearchAnalysis::new(baseline, outcome, rollouts);
-    let search = match belief_residual_fallback {
-        Some(fallback) => search.with_belief_residual(fallback),
-        None => search,
-    };
     RulePlannerAnalysis::from_search(search)
 }
 
@@ -329,43 +261,6 @@ fn evaluate_validation(
             })
         })
         .collect()
-}
-
-fn joint_weights_have_support(
-    selection: &[RootBeliefParticle],
-    validation: &[RootBeliefParticle],
-) -> bool {
-    [selection, validation].into_iter().all(|particles| {
-        effective_worlds(particles.iter().map(|particle| particle.log_likelihood))
-            .is_some_and(|count| count >= MIN_EFFECTIVE_WORLDS)
-    })
-}
-
-/// Revert both particle streams when either stream has insufficient posterior
-/// support. Selection and validation must use the same belief distribution.
-fn apply_joint_weight_fallback(
-    selection: &mut [RootBeliefParticle],
-    validation: &mut [RootBeliefParticle],
-) -> bool {
-    if joint_weights_have_support(selection, validation) {
-        return false;
-    }
-    selection
-        .iter_mut()
-        .for_each(RootBeliefParticle::use_handwritten_weight);
-    validation
-        .iter_mut()
-        .for_each(RootBeliefParticle::use_handwritten_weight);
-    true
-}
-
-fn effective_worlds(log_likelihoods: impl Iterator<Item = f64>) -> Option<f64> {
-    let log_likelihoods: Vec<_> = log_likelihoods.collect();
-    if !log_likelihoods.iter().any(|weight| weight.is_finite()) {
-        return None;
-    }
-    let weights = normalized_log_weights(log_likelihoods.into_iter())?;
-    Some(effective_worlds_from_normalized(&weights))
 }
 
 fn effective_worlds_from_normalized(weights: &[f64]) -> f64 {
@@ -472,9 +367,8 @@ fn normalized_log_weights(log_weights: impl Iterator<Item = f64>) -> Option<Vec<
         .max_by(f64::total_cmp);
     let Some(maximum) = maximum else {
         // Preserve the planner's established emergency behavior when the
-        // proposal misses all posterior support. `effective_worlds` detects
-        // this case before normalization, so learned-weight ESS cannot mistake
-        // the uniform fallback for valid support.
+        // proposal misses all posterior support. With no finite evidence, all
+        // sampled worlds receive equal mass.
         return Some(vec![1.0 / log_weights.len() as f64; log_weights.len()]);
     };
     let mut weights: Vec<_> = log_weights
@@ -537,26 +431,6 @@ fn terminal_utility(game: &Game, actor: Seat) -> i64 {
 mod tests {
     use super::*;
 
-    struct ZeroResidual;
-
-    impl BeliefResidualEvaluator for ZeroResidual {
-        fn evaluate_residuals(
-            &self,
-            _public: &crate::BeliefPublicFeatures,
-            candidates: &[crate::BeliefCandidateFeatures],
-            output: &mut [f32],
-        ) -> Result<(), BeliefResidualError> {
-            if candidates.len() != output.len() {
-                return Err(BeliefResidualError::BatchLength {
-                    candidates: candidates.len(),
-                    outputs: output.len(),
-                });
-            }
-            output.fill(0.0);
-            Ok(())
-        }
-    }
-
     fn late_turn(seed: u64, remaining: usize) -> Game {
         let mut game = Game::new(seed);
         for _ in 0..MAX_ROLLOUT_ACTIONS {
@@ -575,109 +449,10 @@ mod tests {
         panic!("setup did not reach a late turn")
     }
 
-    #[cfg(feature = "planner-analysis")]
-    fn late_searchable_turn(seed: u64, remaining: usize) -> Game {
-        let mut game = Game::new(seed);
-        for _ in 0..MAX_ROLLOUT_ACTIONS {
-            let legal = game.legal_actions().expect("setup game is non-terminal");
-            if game.wall_remaining() <= remaining
-                && legal.decision.phase == Phase::Turn
-                && !legal.can_hu
-                && game
-                    .legal_action_mask()
-                    .is_some_and(|mask| mask.iter().count() > 1)
-            {
-                return game;
-            }
-            let action = game
-                .simple_rule_action()
-                .expect("the setup policy handles every non-terminal phase");
-            game.step_id(action).expect("the setup action is legal");
-        }
-        panic!("setup did not reach a searchable late turn")
-    }
-
     fn synthetic_world(offset: f64, gains: [[f64; 2]; 2]) -> EvaluatedWorld {
         EvaluatedWorld {
             log_likelihood: 0.0,
             utilities: vec![offset, offset, offset + gains[1][0], offset + gains[1][1]],
-        }
-    }
-
-    fn belief_particles(log_likelihoods: &[f64]) -> Vec<RootBeliefParticle> {
-        log_likelihoods
-            .iter()
-            .enumerate()
-            .map(|(index, &log_likelihood)| {
-                RootBeliefParticle::new_for_test(
-                    Game::new(0x4d58_0000 + index as u64),
-                    log_likelihood,
-                    -10.0,
-                )
-            })
-            .collect()
-    }
-
-    fn concentrated_log_weights(count: usize) -> Vec<f64> {
-        (0..count)
-            .map(|index| if index == 0 { 100.0 } else { 0.0 })
-            .collect()
-    }
-
-    #[test]
-    fn joint_belief_keeps_learned_weights_when_both_streams_have_support() {
-        let learned: Vec<_> = (0..16).map(|index| -(index as f64) * 0.01).collect();
-        let mut selection = belief_particles(&learned);
-        let mut validation = belief_particles(&learned);
-
-        assert!(joint_weights_have_support(&selection, &validation));
-        assert!(!apply_joint_weight_fallback(
-            &mut selection,
-            &mut validation
-        ));
-        assert_eq!(
-            selection
-                .iter()
-                .map(|particle| particle.log_likelihood)
-                .collect::<Vec<_>>(),
-            learned,
-        );
-        assert_eq!(
-            validation
-                .iter()
-                .map(|particle| particle.log_likelihood)
-                .collect::<Vec<_>>(),
-            learned,
-        );
-        assert_ne!(learned, vec![-10.0; 16]);
-    }
-
-    #[test]
-    fn joint_belief_falls_back_both_streams_when_either_ess_is_low() {
-        let uniform = vec![0.0; 16];
-        for (selection_logs, validation_logs) in [
-            (concentrated_log_weights(16), uniform.clone()),
-            (uniform.clone(), concentrated_log_weights(16)),
-        ] {
-            let mut selection = belief_particles(&selection_logs);
-            let mut validation = belief_particles(&validation_logs);
-
-            assert!(!joint_weights_have_support(&selection, &validation));
-            assert!(apply_joint_weight_fallback(&mut selection, &mut validation));
-            assert_eq!(
-                selection
-                    .iter()
-                    .map(|particle| particle.log_likelihood)
-                    .collect::<Vec<_>>(),
-                vec![-10.0; 16],
-            );
-            assert_eq!(
-                validation
-                    .iter()
-                    .map(|particle| particle.log_likelihood)
-                    .collect::<Vec<_>>(),
-                vec![-10.0; 16],
-            );
         }
     }
 
@@ -691,7 +466,6 @@ mod tests {
         let fallback = normalized_log_weights([f64::NEG_INFINITY; 8].into_iter())
             .expect("zero posterior mass keeps the planner emergency fallback");
         assert_eq!(fallback, vec![0.125; 8]);
-        assert!(effective_worlds([f64::NEG_INFINITY; 8].into_iter()).is_none());
     }
 
     #[test]
@@ -839,26 +613,12 @@ mod tests {
     fn root_search_returns_a_legal_action() {
         let game = late_turn(91, 2);
         let config = RulePlannerConfig::ROLLOUT
-            .with_search_iterations(RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS)
+            .with_search_iterations(8)
             .expect("test search budget is supported");
         let action = game
             .rule_planner_action_with_config(config)
             .expect("a turn has a planner action");
         assert!(game.is_legal_action(action.action()));
-    }
-
-    #[test]
-    fn zero_residual_preserves_the_handwritten_search_decision() {
-        let game = late_turn(91, 2);
-        let config = RulePlannerConfig::ROLLOUT
-            .with_search_iterations(RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS)
-            .expect("test search budget is supported");
-
-        assert_eq!(
-            game.rule_planner_action_with_config_and_belief_residual(config, &ZeroResidual)
-                .expect("zero residual evaluation succeeds"),
-            game.rule_planner_action_with_config(config),
-        );
     }
 
     #[cfg(feature = "planner-analysis")]
@@ -918,34 +678,7 @@ mod tests {
             assert_eq!(search.outcome().proposal(), expected_proposal);
             assert_eq!(search.outcome().accepted(), expected_accepted);
             assert_eq!(search.rollouts(), 17);
-            assert_eq!(search.belief_residual_fallback(), None);
         }
-
-        let residual =
-            RulePlannerSearchAnalysis::new(baseline, RulePlannerSearchOutcome::NoProposal, 19)
-                .with_belief_residual(true);
-        assert_eq!(residual.belief_residual_fallback(), Some(true));
-    }
-
-    #[cfg(feature = "planner-analysis")]
-    #[test]
-    fn learned_residual_returns_structured_search_metadata() {
-        let game = late_searchable_turn(132, 12);
-        let config = RulePlannerConfig::ROLLOUT
-            .with_search_iterations(RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS)
-            .expect("minimum residual search budget is supported");
-
-        let analysis = game
-            .rule_planner_analysis_with_config_and_belief_residual(config, &ZeroResidual)
-            .expect("zero residual evaluation succeeds")
-            .expect("a turn has a planner analysis");
-        let search = analysis.search().expect("a multi-action turn runs search");
-        assert!(search.belief_residual_fallback().is_some());
-        assert_eq!(
-            Some(analysis.action()),
-            game.rule_planner_action_with_config_and_belief_residual(config, &ZeroResidual)
-                .expect("the action wrapper succeeds"),
-        );
     }
 
     #[cfg(feature = "planner-analysis")]

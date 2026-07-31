@@ -68,8 +68,6 @@ CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入�
 
 `continuation` 只改变 planner 根搜索的终局续局策略。`current` 保留生产路径中的 `Simple` 和 `Direct` 两个代理模型。`oracle-continuation` 根据当前 2v2 seat mask，把本局已知的 `rule-fast`、`rule-ev` 或 planner baseline 分配到四个座位。每个座位只读取自己的合法 observation。planner baseline 保留手牌图、belief 和 response 配置，但关闭 paired root search，避免 rollout 内递归搜索。该模式会读取对手策略身份，只能用于诊断 continuation mismatch。
 
-`belief-model` 只能与 `posterior + current` 组合使用。模型 manifest 记录 beta 校准时每条 proposal 流的粒子数。对应侧的 `search-iterations` 必须与该数值完全相同；CLI 会拒绝未校准的粒子预算。
-
 以下组合分别对应三项主要消融：
 
 | 名称 | `root-belief` | `continuation` |

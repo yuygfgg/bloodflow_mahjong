@@ -13,7 +13,6 @@ path = "src/main.rs"
 
 [dependencies]
 bloodflow-mahjong = { path = "../../core", features = ["planner-analysis"] }
-bloodflow-mahjong-model-runtime = { path = "../../model-runtime" }
 clap.workspace = true
 rand = "0.9"
 rand_chacha = "0.9"

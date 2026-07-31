@@ -1,20 +1,17 @@
 //! Balanced tournament evaluation for deterministic rule policies.
 
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use bloodflow_mahjong::{
-    Action, ActionId, BeliefResidualError, Game, LegalActions, Phase,
-    RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS, RuleEvConfig, RuleEvDefense,
+    Action, ActionId, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense,
     RulePlannerAnalysisOptions, RulePlannerConfig, RulePlannerContinuation,
     RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
     RulePlannerSearchAnalysis, RulePlannerSearchOutcome, Seat, reset_rule_planner_search_stats,
     rule_planner_search_stats,
 };
-use bloodflow_mahjong_model_runtime::CandleBeliefModel;
 use clap::{Parser, ValueEnum, error::ErrorKind};
 use rand::{Rng as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -70,9 +67,6 @@ struct Config {
     a_root_belief: PlannerRootBelief,
     #[arg(long, value_enum, default_value = "current")]
     a_continuation: PlannerContinuation,
-    /// Learned belief artifact directory. Only rule-planner uses this option.
-    #[arg(long)]
-    a_belief_model: Option<PathBuf>,
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
     a_response_worlds: u16,
     #[arg(
@@ -100,9 +94,6 @@ struct Config {
     b_root_belief: PlannerRootBelief,
     #[arg(long, value_enum, default_value = "current")]
     b_continuation: PlannerContinuation,
-    /// Learned belief artifact directory. Only rule-planner uses this option.
-    #[arg(long)]
-    b_belief_model: Option<PathBuf>,
     #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
     b_response_worlds: u16,
     #[arg(
@@ -212,7 +203,6 @@ enum Policy {
         config: RulePlannerConfig,
         root_belief: PlannerRootBelief,
         continuation: PlannerContinuation,
-        belief_model: Option<Arc<CandleBeliefModel>>,
     },
 }
 
@@ -244,33 +234,19 @@ impl Policy {
         &self,
         game: &Game,
         continuation_profile: RulePlannerContinuationProfile,
-    ) -> Result<Option<PolicyDecision>, BeliefResidualError> {
+    ) -> Option<PolicyDecision> {
         match self {
-            Self::Fast => Ok(game
+            Self::Fast => game
                 .simple_rule_action()
-                .map(PolicyDecision::without_search)),
-            Self::Ev(config) => Ok(game
+                .map(PolicyDecision::without_search),
+            Self::Ev(config) => game
                 .rule_ev_action_with_config(*config)
-                .map(PolicyDecision::without_search)),
+                .map(PolicyDecision::without_search),
             Self::Planner {
                 config,
                 root_belief,
                 continuation,
-                belief_model,
             } => {
-                if let Some(model) = belief_model {
-                    return game
-                        .rule_planner_analysis_with_config_and_belief_residual(
-                            *config,
-                            model.as_ref(),
-                        )
-                        .map(|analysis| {
-                            analysis.map(|analysis| PolicyDecision {
-                                action: analysis.action(),
-                                search: analysis.search(),
-                            })
-                        });
-                }
                 let continuation = match continuation {
                     PlannerContinuation::Current => RulePlannerContinuation::Current,
                     PlannerContinuation::OracleContinuation => {
@@ -279,12 +255,11 @@ impl Policy {
                 };
                 let options = RulePlannerAnalysisOptions::new((*root_belief).into())
                     .with_continuation(continuation);
-                Ok(game
-                    .rule_planner_analysis_with_options(*config, options)
+                game.rule_planner_analysis_with_options(*config, options)
                     .map(|analysis| PolicyDecision {
                         action: analysis.action(),
                         search: analysis.search(),
-                    }))
+                    })
             }
         }
     }
@@ -305,7 +280,6 @@ impl Default for Config {
             a_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
             a_root_belief: PlannerRootBelief::Posterior,
             a_continuation: PlannerContinuation::Current,
-            a_belief_model: None,
             a_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
             a_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
             a_defense: Defense::Heuristic,
@@ -317,7 +291,6 @@ impl Default for Config {
             b_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
             b_root_belief: PlannerRootBelief::Posterior,
             b_continuation: PlannerContinuation::Current,
-            b_belief_model: None,
             b_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
             b_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
             b_defense: Defense::Heuristic,
@@ -342,8 +315,6 @@ struct PlannerSearchStats {
     validation_rejections: u64,
     overrides: u64,
     rollouts: u64,
-    belief_residual_decisions: u64,
-    belief_residual_fallbacks: u64,
 }
 
 impl PlannerSearchStats {
@@ -353,10 +324,6 @@ impl PlannerSearchStats {
         };
         self.decisions += 1;
         self.rollouts += search.rollouts();
-        if let Some(fallback) = search.belief_residual_fallback() {
-            self.belief_residual_decisions += 1;
-            self.belief_residual_fallbacks += u64::from(fallback);
-        }
         match search.outcome() {
             RulePlannerSearchOutcome::NoProposal => {}
             RulePlannerSearchOutcome::Rejected(_) => {
@@ -376,8 +343,6 @@ impl PlannerSearchStats {
         self.validation_rejections += other.validation_rejections;
         self.overrides += other.overrides;
         self.rollouts += other.rollouts;
-        self.belief_residual_decisions += other.belief_residual_decisions;
-        self.belief_residual_fallbacks += other.belief_residual_fallbacks;
     }
 }
 
@@ -543,7 +508,7 @@ fn play_game(
     policy_a_seat_mask: u8,
     policy_a: &Policy,
     policy_b: &Policy,
-) -> Result<GameResult, BeliefResidualError> {
+) -> GameResult {
     play_game_with_progress(seed, policy_a_seat_mask, policy_a, policy_b, None)
 }
 
@@ -567,7 +532,7 @@ fn play_game_with_progress(
     policy_a: &Policy,
     policy_b: &Policy,
     progress: Option<&TournamentProgress>,
-) -> Result<GameResult, BeliefResidualError> {
+) -> GameResult {
     debug_assert_eq!(policy_a_seat_mask.count_ones(), 2);
     let active_game = ActiveGame::new(progress);
     let mut game = Game::new(seed);
@@ -585,7 +550,7 @@ fn play_game_with_progress(
             policy_a.decide(&game, continuation_profile)
         } else {
             policy_b.decide(&game, continuation_profile)
-        }?
+        }
         .expect("a non-terminal rule policy always returns an action");
         let policy_index = if policy_a_controls_actor { 0 } else { 1 };
         decisions[policy_index].observe(&legal, decision.action.action());
@@ -616,7 +581,7 @@ fn play_game_with_progress(
             searches,
         };
         active_game.complete();
-        return Ok(result);
+        return result;
     }
 
     panic!("game exceeded the action limit: seed={seed}, mask={policy_a_seat_mask:#06b}");
@@ -887,14 +852,6 @@ fn print_searches(name: &str, stats: PlannerSearchStats) {
         },
         stats.rollouts,
     );
-    if stats.belief_residual_decisions != 0 {
-        println!(
-            "Belief residual {name}  decisions {}  ESS-fallbacks {} ({:.2}%)",
-            stats.belief_residual_decisions,
-            stats.belief_residual_fallbacks,
-            100.0 * stats.belief_residual_fallbacks as f64 / stats.belief_residual_decisions as f64,
-        );
-    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -929,41 +886,7 @@ fn invalid_policy_value(
     )
 }
 
-fn validate_belief_model_settings(
-    settings: PolicySettings,
-    has_belief_model: bool,
-) -> Result<(), clap::Error> {
-    if !has_belief_model {
-        return Ok(());
-    }
-    if settings.search_iterations < RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS {
-        return Err(invalid_policy_value(
-            settings,
-            "search-iterations",
-            settings.search_iterations,
-            format!(
-                "at least {RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS} when a belief model is configured"
-            ),
-        ));
-    }
-    if settings.root_belief != PlannerRootBelief::Posterior
-        || settings.continuation != PlannerContinuation::Current
-    {
-        return Err(clap::Error::raw(
-            ErrorKind::ArgumentConflict,
-            format!(
-                "--{}-belief-model requires posterior root belief and current continuation",
-                settings.argument_prefix,
-            ),
-        ));
-    }
-    Ok(())
-}
-
-fn build_policy(
-    settings: PolicySettings,
-    belief_model: Option<Arc<CandleBeliefModel>>,
-) -> Result<(Policy, String), clap::Error> {
+fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Error> {
     match settings.kind {
         PolicyKind::Fast => Ok((Policy::Fast, "rule_fast".into())),
         PolicyKind::Ev => {
@@ -987,20 +910,6 @@ fn build_policy(
             ))
         }
         PolicyKind::Planner => {
-            validate_belief_model_settings(settings, belief_model.is_some())?;
-            if let Some(model) = belief_model.as_ref()
-                && model.calibration_particle_count() != usize::from(settings.search_iterations)
-            {
-                return Err(invalid_policy_value(
-                    settings,
-                    "search-iterations",
-                    settings.search_iterations,
-                    format!(
-                        "exactly {} for this belief artifact",
-                        model.calibration_particle_count()
-                    ),
-                ));
-            }
             let policy = RulePlannerConfig::STANDARD
                 .with_hand_changes(settings.hand_changes)
                 .ok_or_else(|| {
@@ -1061,10 +970,9 @@ fn build_policy(
                     config: policy,
                     root_belief: settings.root_belief,
                     continuation: settings.continuation,
-                    belief_model: belief_model.clone(),
                 },
                 format!(
-                    "rule_planner_h{}_d{}_c{}_b{}_r{}_i{}{}{}{}",
+                    "rule_planner_h{}_d{}_c{}_b{}_r{}_i{}{}{}",
                     settings.hand_changes,
                     settings.draw_horizon,
                     settings.candidate_states,
@@ -1073,32 +981,10 @@ fn build_policy(
                     settings.search_iterations,
                     settings.root_belief.name_suffix(),
                     settings.continuation.name_suffix(),
-                    belief_model.as_ref().map_or_else(String::new, |model| {
-                        format!(
-                            "_belief_beta_{:.3}_sha_{}",
-                            model.beta(),
-                            model.fingerprint(),
-                        )
-                    }),
                 ),
             ))
         }
     }
-}
-
-fn load_belief_model(
-    path: Option<&PathBuf>,
-) -> Result<Option<Arc<CandleBeliefModel>>, clap::Error> {
-    path.map(|path| {
-        let model = CandleBeliefModel::load(path).map_err(|error| {
-            clap::Error::raw(
-                ErrorKind::Io,
-                format!("cannot load belief model '{}': {error}", path.display()),
-            )
-        })?;
-        Ok(Arc::new(model))
-    })
-    .transpose()
 }
 
 fn run(config: Config) -> Result<(), clap::Error> {
@@ -1156,24 +1042,8 @@ fn run(config: Config) -> Result<(), clap::Error> {
         search_iterations: config.b_search_iterations,
         defense: config.b_defense,
     };
-    if config.policy_a != PolicyKind::Planner && config.a_belief_model.is_some() {
-        return Err(clap::Error::raw(
-            ErrorKind::ArgumentConflict,
-            "--a-belief-model requires --policy-a rule-planner",
-        ));
-    }
-    if config.policy_b != PolicyKind::Planner && config.b_belief_model.is_some() {
-        return Err(clap::Error::raw(
-            ErrorKind::ArgumentConflict,
-            "--b-belief-model requires --policy-b rule-planner",
-        ));
-    }
-    validate_belief_model_settings(settings_a, config.a_belief_model.is_some())?;
-    validate_belief_model_settings(settings_b, config.b_belief_model.is_some())?;
-    let model_a = load_belief_model(config.a_belief_model.as_ref())?;
-    let model_b = load_belief_model(config.b_belief_model.as_ref())?;
-    let (policy_a, policy_a_name) = build_policy(settings_a, model_a)?;
-    let (policy_b, policy_b_name) = build_policy(settings_b, model_b)?;
+    let (policy_a, policy_a_name) = build_policy(settings_a)?;
+    let (policy_b, policy_b_name) = build_policy(settings_b)?;
     println!(
         "Rule tournament  policy-a {}  policy-b {}  blocks {}  games {}  root-seed {}  bootstrap {}  rayon-threads {}  parallel-games {}",
         policy_a_name,
@@ -1194,8 +1064,7 @@ fn run(config: Config) -> Result<(), clap::Error> {
         POLICY_A_SEAT_MASKS[0],
         &fast,
         &fast,
-    )
-    .expect("rule-fast warm-up cannot evaluate a belief residual");
+    );
     reset_rule_planner_search_stats();
 
     let started = Instant::now();
@@ -1223,34 +1092,30 @@ fn run(config: Config) -> Result<(), clap::Error> {
                 }
             }
         });
-        let monitor_completion =
-            MonitorCompletion::new(&finished, monitor.thread().clone());
+        let monitor_completion = MonitorCompletion::new(&finished, monitor.thread().clone());
         let next_game = AtomicUsize::new(0);
-        let results: Vec<OnceLock<GameResult>> =
-            (0..games).map(|_| OnceLock::new()).collect();
-        (0..parallel_games).into_par_iter().try_for_each(
-            |_| -> Result<(), BeliefResidualError> {
-                loop {
-                    let game_index = next_game.fetch_add(1, Ordering::Relaxed);
-                    if game_index >= games {
-                        return Ok(());
-                    }
-                    let block = game_index / POLICY_A_SEAT_MASKS.len();
-                    let assignment = game_index % POLICY_A_SEAT_MASKS.len();
-                    let result = play_game_with_progress(
-                        mix64(config.root_seed.wrapping_add(block as u64)),
-                        POLICY_A_SEAT_MASKS[assignment],
-                        &policy_a,
-                        &policy_b,
-                        Some(&progress),
-                    )?;
-                    assert!(
-                        results[game_index].set(result).is_ok(),
-                        "a tournament game is evaluated once"
-                    );
+        let results: Vec<OnceLock<GameResult>> = (0..games).map(|_| OnceLock::new()).collect();
+        (0..parallel_games).into_par_iter().for_each(|_| {
+            loop {
+                let game_index = next_game.fetch_add(1, Ordering::Relaxed);
+                if game_index >= games {
+                    return;
                 }
-            },
-        )?;
+                let block = game_index / POLICY_A_SEAT_MASKS.len();
+                let assignment = game_index % POLICY_A_SEAT_MASKS.len();
+                let result = play_game_with_progress(
+                    mix64(config.root_seed.wrapping_add(block as u64)),
+                    POLICY_A_SEAT_MASKS[assignment],
+                    &policy_a,
+                    &policy_b,
+                    Some(&progress),
+                );
+                assert!(
+                    results[game_index].set(result).is_ok(),
+                    "a tournament game is evaluated once"
+                );
+            }
+        });
         let completed = results
             .into_iter()
             .map(|result| {
@@ -1260,14 +1125,8 @@ fn run(config: Config) -> Result<(), clap::Error> {
             })
             .collect();
         drop(monitor_completion);
-        Ok::<_, BeliefResidualError>(completed)
-    })
-    .map_err(|error| {
-        clap::Error::raw(
-            ErrorKind::Io,
-            format!("learned belief inference failed: {error}"),
-        )
-    })?;
+        completed
+    });
     let blocks: Vec<_> = game_results
         .chunks_exact(POLICY_A_SEAT_MASKS.len())
         .map(|games| {
@@ -1493,8 +1352,6 @@ mod tests {
                 validation_rejections: 1,
                 overrides: 1,
                 rollouts: 30,
-                belief_residual_decisions: 2,
-                belief_residual_fallbacks: 1,
             },
             PlannerSearchStats {
                 decisions: 5,
@@ -1502,8 +1359,6 @@ mod tests {
                 validation_rejections: 3,
                 overrides: 1,
                 rollouts: 50,
-                belief_residual_decisions: 5,
-                belief_residual_fallbacks: 4,
             },
         ];
         let block = BlockResult {
@@ -1566,7 +1421,6 @@ mod tests {
                 a_belief_worlds: 8,
                 a_root_belief: PlannerRootBelief::OracleHidden,
                 a_continuation: PlannerContinuation::OracleContinuation,
-                a_belief_model: None,
                 a_response_worlds: 0,
                 a_search_iterations: 16,
                 a_defense: Defense::Heuristic,
@@ -1578,7 +1432,6 @@ mod tests {
                 b_belief_worlds: 0,
                 b_root_belief: PlannerRootBelief::Posterior,
                 b_continuation: PlannerContinuation::Current,
-                b_belief_model: None,
                 b_response_worlds: 0,
                 b_search_iterations: 0,
                 b_defense: Defense::None,
@@ -1616,16 +1469,13 @@ mod tests {
             search_iterations: 256,
             defense: Defense::Heuristic,
         };
-        let with_budget = build_policy(settings, None).unwrap();
-        let without_budget = build_policy(
-            PolicySettings {
-                search_iterations: 0,
-                root_belief: PlannerRootBelief::Posterior,
-                continuation: PlannerContinuation::Current,
-                ..settings
-            },
-            None,
-        )
+        let with_budget = build_policy(settings).unwrap();
+        let without_budget = build_policy(PolicySettings {
+            search_iterations: 0,
+            root_belief: PlannerRootBelief::Posterior,
+            continuation: PlannerContinuation::Current,
+            ..settings
+        })
         .unwrap();
 
         assert_eq!(with_budget.1, without_budget.1);
@@ -1633,54 +1483,6 @@ mod tests {
             (Policy::Ev(left), Policy::Ev(right)) => assert_eq!(left, right),
             _ => panic!("both policies must be rule-ev"),
         }
-    }
-
-    #[test]
-    fn belief_model_requires_minimum_search_iterations() {
-        let settings = PolicySettings {
-            argument_prefix: "a",
-            kind: PolicyKind::Planner,
-            lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
-            draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
-            candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
-            belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
-            root_belief: PlannerRootBelief::Posterior,
-            continuation: PlannerContinuation::Current,
-            response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
-            search_iterations: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS - 1,
-            defense: Defense::Heuristic,
-        };
-
-        let error = validate_belief_model_settings(settings, true).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("when a belief model is configured")
-        );
-        validate_belief_model_settings(
-            PolicySettings {
-                search_iterations: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS,
-                ..settings
-            },
-            true,
-        )
-        .unwrap();
-    }
-
-    #[test]
-    fn cli_rejects_belief_model_budget_before_loading_artifact() {
-        let error = run(Config {
-            blocks: NonZeroUsize::new(1).unwrap(),
-            policy_a: PolicyKind::Planner,
-            a_belief_model: Some(PathBuf::from("artifact-must-not-be-loaded")),
-            a_search_iterations: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS - 1,
-            ..Config::default()
-        })
-        .unwrap_err();
-
-        assert_eq!(error.kind(), ErrorKind::InvalidValue);
-        assert!(error.to_string().contains("--a-search-iterations"));
     }
 
     #[test]
@@ -1709,7 +1511,6 @@ mod tests {
             config: RulePlannerConfig::FAST,
             root_belief: PlannerRootBelief::OracleHidden,
             continuation: PlannerContinuation::OracleContinuation,
-            belief_model: None,
         };
 
         for mask in POLICY_A_SEAT_MASKS {

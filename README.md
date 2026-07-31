@@ -22,7 +22,7 @@ CLI 沿用 `rule-fast`、`rule-ev` 和 `rule-planner` 作为策略标识符。�
 - 固定种子、115 维动作空间、观察者视角事件和批量环境；
 - 三种 Rust 策略，以及任意两种策略之间的平衡测评。
 
-Python 扩展仍可用于模拟和批量数组接口。可选的 belief residual 使用 Rust 生成训练数据、PyTorch 训练模型，并通过 Candle 在 Rust planner 中执行 CPU 推理。Rust 引擎始终负责游戏规则、合法动作和最终搜索决策。
+Python 扩展仍可用于模拟和批量数组接口。Rust 引擎始终负责游戏规则、合法动作和最终搜索决策。
 
 ## 仓库结构
 
@@ -32,21 +32,14 @@ Python 扩展仍可用于模拟和批量数组接口。可选的 belief residual
 | [`IMPLEMENTATION.md`](IMPLEMENTATION.md) | 确定性约定、状态机和信息边界 |
 | [`engine/core`](engine/core/) | 权威游戏状态、计分、分析、批量环境和内置策略 |
 | [`engine/pybind`](engine/pybind/) | PyO3 和 NumPy 兼容接口 |
-| [`engine/model-runtime`](engine/model-runtime/) | belief residual 的 Candle CPU 运行时 |
-| [`engine/tools/belief-dataset`](engine/tools/belief-dataset/) | belief residual 数据生成器 |
 | [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种内置策略的平衡测评工具 |
-| [`learning/belief`](learning/belief/) | belief residual 的 PyTorch 模型、目标和训练器 |
-| [`BELIEF_RESIDUAL.md`](BELIEF_RESIDUAL.md) | 数据生成、训练、校验和使用手册 |
-| [`NEURAL_PLANNER.md`](NEURAL_PLANNER.md) | 神经网络增强 `rule-planner` 的实施方案 |
 
-Rust workspace 包含五个 package：
+Rust workspace 包含三个 package：
 
 | Package | Crate 或二进制 | 用途 |
 | --- | --- | --- |
 | `bloodflow-mahjong` | `bloodflow_mahjong` | Rust 库和诊断 benchmark |
-| `bloodflow-mahjong-model-runtime` | `belief-model-check` | Candle 模型运行时和模型校验 CLI |
 | `bloodflow-mahjong-pybind` | `bloodflow_mahjong` | Python 扩展模块 |
-| `bloodflow-mahjong-belief-dataset` | `belief-dataset` | belief residual 数据生成 CLI |
 | `bloodflow-mahjong-rule-tournament` | `rule-tournament` | 策略锦标赛 CLI |
 
 ## 快速开始
