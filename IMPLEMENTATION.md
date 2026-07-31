@@ -108,7 +108,7 @@
 | 策略 | 核心方法 | 计算预算 |
 | --- | --- | --- |
 | `rule-fast` | 固定启发式、向听数和有效牌 | 无可调搜索预算 |
-| `rule-ev` | 手牌价值、危险度和有限前瞻 | depth `0..3`；信息集 worlds `0..256` |
+| `rule-ev` | 手牌价值、危险度和确定性有限前瞻 | depth `0..3` |
 | `rule-planner` | 手牌候选图、公开价值、信念世界和配对 rollout | hand changes `0..2`、draw horizon `0..32`、candidate states `1..200000`、belief/response worlds `0..256`、iterations `0..4096` |
 
 三种策略必须返回 legal mask 中的动作。策略不得读取对手身份。策略测评必须使用独立 seed block；单次点估计不能证明强弱。

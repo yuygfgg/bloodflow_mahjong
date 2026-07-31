@@ -6,9 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bloodflow_mahjong::{
-    Action, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense, RuleEvSearchGate,
-    RulePlannerConfig, Seat, reset_rule_ev_search_stats, reset_rule_planner_search_stats,
-    rule_ev_search_stats, rule_planner_search_stats,
+    Action, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense, RulePlannerConfig, Seat,
+    reset_rule_planner_search_stats, rule_planner_search_stats,
 };
 use clap::{Parser, ValueEnum, error::ErrorKind};
 use rand::{Rng as _, SeedableRng};
@@ -72,8 +71,6 @@ struct Config {
     a_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     a_defense: Defense,
-    #[arg(long, value_enum, default_value = "world")]
-    a_search_gate: SearchGate,
     #[arg(long, value_enum, default_value = "rule-fast")]
     policy_b: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
@@ -97,8 +94,6 @@ struct Config {
     b_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     b_defense: Defense,
-    #[arg(long, value_enum, default_value = "world")]
-    b_search_gate: SearchGate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -145,33 +140,6 @@ impl Defense {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SearchGate {
-    World,
-    ScenarioStrict,
-    ScenarioRelaxed,
-}
-
-impl From<SearchGate> for RuleEvSearchGate {
-    fn from(value: SearchGate) -> Self {
-        match value {
-            SearchGate::World => Self::WorldClustered,
-            SearchGate::ScenarioStrict => Self::ScenarioStrict,
-            SearchGate::ScenarioRelaxed => Self::ScenarioRelaxed,
-        }
-    }
-}
-
-impl SearchGate {
-    const fn name(self) -> &'static str {
-        match self {
-            Self::World => "world",
-            Self::ScenarioStrict => "scenario-strict",
-            Self::ScenarioRelaxed => "scenario-relaxed",
-        }
-    }
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Policy {
     Fast,
@@ -205,7 +173,6 @@ impl Default for Config {
             a_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
             a_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
             a_defense: Defense::Heuristic,
-            a_search_gate: SearchGate::World,
             policy_b: PolicyKind::Fast,
             b_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
             b_hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
@@ -215,7 +182,6 @@ impl Default for Config {
             b_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
             b_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
             b_defense: Defense::Heuristic,
-            b_search_gate: SearchGate::World,
         }
     }
 }
@@ -660,7 +626,6 @@ struct PolicySettings {
     response_worlds: u16,
     search_iterations: u16,
     defense: Defense,
-    search_gate: SearchGate,
 }
 
 fn invalid_policy_value(
@@ -692,25 +657,13 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                         "an integer from 0 through 3",
                     )
                 })?
-                .with_search_worlds(settings.search_iterations)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        settings,
-                        "search-iterations",
-                        settings.search_iterations,
-                        "an integer from 0 through 256",
-                    )
-                })?
-                .with_defense(settings.defense.into())
-                .with_search_gate(settings.search_gate.into());
+                .with_defense(settings.defense.into());
             Ok((
                 Policy::Ev(policy),
                 format!(
-                    "rule_ev_d{}_w{}_{}_{}",
+                    "rule_ev_d{}_{}",
                     settings.lookahead_depth,
-                    settings.search_iterations,
                     settings.defense.name(),
-                    settings.search_gate.name(),
                 ),
             ))
         }
@@ -792,11 +745,11 @@ fn run(config: Config) -> Result<(), clap::Error> {
     let games = block_count
         .checked_mul(POLICY_A_SEAT_MASKS.len())
         .expect("game count overflowed usize");
-    let nested_search = (config.policy_a != PolicyKind::Fast
+    let nested_search = (config.policy_a == PolicyKind::Planner
         && (config.a_search_iterations != 0
             || config.a_belief_worlds != 0
             || config.a_response_worlds != 0))
-        || (config.policy_b != PolicyKind::Fast
+        || (config.policy_b == PolicyKind::Planner
             && (config.b_search_iterations != 0
                 || config.b_belief_worlds != 0
                 || config.b_response_worlds != 0));
@@ -824,7 +777,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         response_worlds: config.a_response_worlds,
         search_iterations: config.a_search_iterations,
         defense: config.a_defense,
-        search_gate: config.a_search_gate,
     })?;
     let (policy_b, policy_b_name) = build_policy(PolicySettings {
         argument_prefix: "b",
@@ -837,7 +789,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         response_worlds: config.b_response_worlds,
         search_iterations: config.b_search_iterations,
         defense: config.b_defense,
-        search_gate: config.b_search_gate,
     })?;
     println!(
         "Rule tournament  policy-a {}  policy-b {}  blocks {}  games {}  root-seed {}  bootstrap {}  rayon-threads {}  parallel-games {}",
@@ -859,7 +810,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         Policy::Fast,
         Policy::Fast,
     );
-    reset_rule_ev_search_stats();
     reset_rule_planner_search_stats();
 
     let started = Instant::now();
@@ -937,7 +887,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         .flat_map(|block| &block.games)
         .map(|game| u64::from(game.actions))
         .sum();
-    let rule_ev_stats = rule_ev_search_stats();
     let planner_stats = rule_planner_search_stats();
 
     let statistics_started = Instant::now();
@@ -979,19 +928,18 @@ fn run(config: Config) -> Result<(), clap::Error> {
         action_count,
     );
     println!(
-        "Search  decisions {}  overrides {} ({:.2}%)  rollouts {}",
-        rule_ev_stats.decisions + planner_stats.decisions,
-        rule_ev_stats.overrides + planner_stats.overrides,
-        if rule_ev_stats.decisions + planner_stats.decisions == 0 {
+        "Planner search  decisions {}  overrides {} ({:.2}%)  rollouts {}",
+        planner_stats.decisions,
+        planner_stats.overrides,
+        if planner_stats.decisions == 0 {
             0.0
         } else {
-            100.0 * (rule_ev_stats.overrides + planner_stats.overrides) as f64
-                / (rule_ev_stats.decisions + planner_stats.decisions) as f64
+            100.0 * planner_stats.overrides as f64 / planner_stats.decisions as f64
         },
-        rule_ev_stats.rollouts + planner_stats.rollouts,
+        planner_stats.rollouts,
     );
     println!(
-        "Planner search  proposals {}  validation-rejected {}  accepted {}",
+        "Planner validation  proposals {}  rejected {}  accepted {}",
         planner_stats.proposals,
         planner_stats.validation_rejections,
         planner_stats
@@ -1177,12 +1125,8 @@ mod tests {
                 "rule-ev",
                 "--b-lookahead-depth",
                 "0",
-                "--b-search-budget",
-                "12",
                 "--b-defense",
                 "none",
-                "--b-search-gate",
-                "scenario-strict",
             ])
             .unwrap(),
             Config {
@@ -1199,7 +1143,6 @@ mod tests {
                 a_response_worlds: 0,
                 a_search_iterations: 16,
                 a_defense: Defense::Heuristic,
-                a_search_gate: SearchGate::World,
                 policy_b: PolicyKind::Ev,
                 b_lookahead_depth: 0,
                 b_hand_changes: 1,
@@ -1207,9 +1150,8 @@ mod tests {
                 b_candidate_states: 4_096,
                 b_belief_worlds: 0,
                 b_response_worlds: 0,
-                b_search_iterations: 12,
+                b_search_iterations: 0,
                 b_defense: Defense::None,
-                b_search_gate: SearchGate::ScenarioStrict,
             }
         );
     }
@@ -1229,8 +1171,8 @@ mod tests {
     }
 
     #[test]
-    fn policy_specific_range_errors_are_clap_errors() {
-        let error = build_policy(PolicySettings {
+    fn rule_ev_ignores_planner_search_budget() {
+        let settings = PolicySettings {
             argument_prefix: "a",
             kind: PolicyKind::Ev,
             lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
@@ -1239,13 +1181,16 @@ mod tests {
             candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
             belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
             response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
-            search_iterations: 257,
+            search_iterations: 256,
             defense: Defense::Heuristic,
-            search_gate: SearchGate::World,
+        };
+        let with_budget = build_policy(settings).unwrap();
+        let without_budget = build_policy(PolicySettings {
+            search_iterations: 0,
+            ..settings
         })
-        .unwrap_err();
+        .unwrap();
 
-        assert_eq!(error.kind(), ErrorKind::InvalidValue);
-        assert!(error.to_string().contains("--a-search-iterations"));
+        assert_eq!(with_budget, without_budget);
     }
 }

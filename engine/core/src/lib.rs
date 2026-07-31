@@ -33,15 +33,7 @@ pub use hand::{
     ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten, evaluate_max_wait, evaluate_shanten,
     evaluate_win, is_winning,
 };
-pub use rules::ev::{
-    RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense, RuleEvSearchStats,
-    reset_rule_ev_search_stats, rule_ev_search_stats,
-};
-#[cfg(feature = "rule-ev-analysis")]
-pub use rules::ev::{
-    RuleEvSearchAction, RuleEvSearchCandidateSet, RuleEvSearchGate, RuleEvSearchTrace,
-    RuleEvSearchTraceConfig, RuleEvSearchTraceError,
-};
+pub use rules::ev::{RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense};
 pub use rules::fast::SIMPLE_RULE_ACTION_TERMINAL;
 pub use rules::planner::{
     RulePlannerConfig, RulePlannerSearchStats, reset_rule_planner_search_stats,

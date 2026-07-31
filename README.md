@@ -33,6 +33,7 @@ Python 扩展仍可用于模拟和批量数组接口。`training/` 下的神经�
 | [`engine/core`](engine/core/) | 权威游戏状态、计分、分析、批量环境和内置策略 |
 | [`engine/pybind`](engine/pybind/) | PyO3 和 NumPy 兼容接口 |
 | [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种内置策略的平衡测评工具 |
+| [`NEURAL_PLANNER.md`](NEURAL_PLANNER.md) | 神经网络增强 `rule-planner` 的实施方案 |
 | [`TRAINING.md`](TRAINING.md) | 保留的 Python 训练实验文档 |
 
 Rust workspace 包含三个 package：
@@ -88,7 +89,7 @@ fn main() -> Result<(), GameError> {
 | CLI 标识符 | 设计 | 公开接口 |
 | --- | --- | --- |
 | `rule-fast` | 低成本、确定性的基准策略 | Rust `Game` 和 `Batch`；Python `Game` 和 `Batch` |
-| `rule-ev` | 手牌价值、防守启发式和可选的信息集搜索 | Rust `Game` 和 `Batch` |
+| `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust `Game` 和 `Batch` |
 | `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust `Game` |
 
 三种策略在锦标赛中地位相同。任意一侧都可以选择任意策略。增加计算预算不等于策略必然更强；预算比较必须使用独立 seed block 和置信区间。

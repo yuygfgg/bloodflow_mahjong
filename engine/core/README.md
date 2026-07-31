@@ -65,15 +65,13 @@ use bloodflow_mahjong::{RuleEvConfig, RuleEvDefense};
 
 let config = RuleEvConfig::with_search_depth(1)
     .expect("depth is in 0..=3")
-    .with_search_worlds(0)
-    .expect("world count is in 0..=256")
     .with_defense(RuleEvDefense::Heuristic);
 let action = game.rule_ev_action_with_config(config);
 ```
 
-`search_depth` 控制确定性手牌前瞻。`search_worlds` 控制信息集 Monte Carlo 根动作比较。两者是独立预算。`RuleEvConfig::STANDARD` 为 depth 1、worlds 0、启发式防守。
+`search_depth` 控制确定性手牌前瞻。该前瞻枚举公开有效牌和后续弃牌。它不采样隐藏牌，也不读取权威牌墙。`RuleEvConfig::STANDARD` 使用 depth 1 和启发式防守。
 
-`Batch::rule_ev_actions_into` 提供批量接口。feature `rule-ev-analysis` 只用于离线 trace 和搜索门控消融。
+`Batch::rule_ev_actions_into` 提供批量接口。隐藏世界搜索只由 `rule-planner` 实现。
 
 ### `rule-planner`
 
@@ -112,14 +110,10 @@ planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者�
 
 方法会检查长度。Python 绑定还检查 dtype、shape、C-contiguous、对齐和重叠 view。
 
-## 功能和构建
-
-默认 feature 集为空。
+## 构建
 
 ```bash
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
-cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
-  --all-targets --features rule-ev-analysis
 ```
 
 crate 使用 `#![forbid(unsafe_code)]`。

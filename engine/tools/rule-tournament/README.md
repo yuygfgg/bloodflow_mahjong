@@ -57,13 +57,12 @@ A 侧参数使用 `--a-*`，B 侧使用 `--b-*`。两侧参数完全对称。
 | `candidate-states` | 忽略 | 忽略 | 候选图状态上限 `1..200000` |
 | `belief-worlds` | 忽略 | 忽略 | 信念粒子数 `0..256` |
 | `response-worlds` | 忽略 | 忽略 | 响应分析世界数 `0..256` |
-| `search-iterations` | 忽略 | 信息集搜索 world 数 `0..256` | 配对 rollout iteration 数 `0..4096` |
+| `search-iterations` | 忽略 | 忽略 | 配对 rollout iteration 数 `0..4096` |
 | `defense` | 忽略 | `none` 或 `heuristic` | 忽略 |
-| `search-gate` | 忽略 | `world`、`scenario-strict` 或 `scenario-relaxed` | 忽略 |
 
-CLI 为两侧提供统一参数集，因此与所选策略无关的参数不会进入动作配置。特别注意：`search-iterations` 对 `rule-ev` 实际表示 world 数，对 `rule-planner` 才表示 iteration 数。这是现有 CLI 的兼容命名。
+CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`search-iterations` 只影响 `rule-planner`；`rule-fast` 和 `rule-ev` 会忽略该参数。
 
-无关参数仍可能参与 CLI 的自动并发判断。例如，为非 planner 策略设置非零 `belief-worlds` 可能让工具采用内层搜索的保守并发默认值。不要为无关参数传值；需要固定调度时显式设置 `--parallel-games`。
+只有 `rule-planner` 的 `belief-worlds`、`response-worlds` 和 `search-iterations` 会影响内层搜索的自动并发判断。需要固定调度时，显式设置 `--parallel-games`。
 
 查看当前二进制的完整默认值：
 
@@ -90,7 +89,6 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
   --a-search-iterations 64 \
   --policy-b rule-ev \
   --b-lookahead-depth 1 \
-  --b-search-iterations 0 \
   --b-defense heuristic
 ```
 
@@ -106,7 +104,7 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
 - `cross-policy-win`：同局内 A 座位名次优于 B 座位的两两比例；
 - `mean-rank`、`mean-score`、`first` 和 `last`：每种策略的 seat-game 汇总；`mean-score` 是相对每局初始分数的平均变化，不是终局绝对分数；
 - `Decisions`：胡、碰、杠和过的选择计数；
-- `Search` 和 `Planner`：搜索提议、验证拒绝、改动和 rollout 计数；
+- `Planner search`、`Planner validation` 和 `Planner`：搜索决策、验证拒绝、改动和 rollout 计数；
 - `Throughput`：牌局、动作和统计耗时。
 
 `Elo-like delta` 不是跨规则、跨阵容或跨版本通用的外部等级分。它只描述本次二对二实验。只有在新 seed 上复现且置信区间稳定时，才能把正点估计解释为可靠提升。
