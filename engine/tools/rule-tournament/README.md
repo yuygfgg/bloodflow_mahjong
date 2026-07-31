@@ -12,7 +12,7 @@
 
 一个 block 使用一个牌局 seed，并运行两种策略各占两个座位的全部 6 种分配。一个 block 内：
 
-- 每种策略共获得 12 个 seat-game；
+- 每种策略共获得 12 个 seat-game（一个策略在一个座位的整局成绩）；
 - 每种策略在每个绝对座位出现 3 次；
 - 六局共享初始牌序，用于降低座位和发牌噪声。
 
@@ -62,7 +62,7 @@ A 侧参数使用 `--a-*`，B 侧使用 `--b-*`。两侧参数完全对称。
 | `search-iterations` | 忽略 | 忽略 | 配对 rollout iteration 数 `0..4096` |
 | `defense` | 忽略 | `none` 或 `heuristic` | 忽略 |
 
-CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`search-iterations` 只影响 `rule-planner`；`rule-fast` 和 `rule-ev` 会忽略该参数。
+CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`search-iterations` 只影响 `rule-planner`；`rule-fast` 和 `rule-ev` 会忽略该参数。配对 rollout 指固定其余三个座位的行动不变、只改进当前座位的动作，再用独立粒子流验证改动。
 
 `root-belief` 只改变 planner 根搜索的粒子分布。`posterior` 是生产模式。`uniform` 对合法隐藏世界等权。`oracle-hidden` 固定权威状态中的真实暗手和剩余牌组成，并为每个粒子独立重排未来牌墙。该模式读取隐藏信息，只能用于诊断 belief 的信息价值，不能作为可部署策略或正式 Elo 成绩。
 
@@ -109,6 +109,22 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
 ```
 
 该命令用于统计验证，不是快速测试。`--parallel-games` 同时增加局级并行和内层搜索竞争。过高的值可能降低吞吐。当前 32 线程机器上，`2` 快于 `1` 和 `4`；其他机器仍应先测量吞吐。
+
+## 输出示例
+
+`--blocks 1 --bootstrap-samples 100`，`rule-ev` 对 `rule-fast`输出：
+
+```text
+Rule tournament  policy-a rule_ev_d1_heuristic  policy-b rule_fast  blocks 1  games 6  root-seed 20260729  bootstrap 100  rayon-threads 12  parallel-games 6
+Progress 6/6 (100.0%)  active 0  actions 665 (2835.3/s)  elapsed 00:00  ETA --:--
+rule_ev_d1_heuristic Elo-like delta vs rule_fast +64.47  uncertainty unavailable (need at least 2 blocks)  cross-policy-win 0.5833
+rule_ev_d1_heuristic seat-games       12  mean-rank 2.33333  mean-score +1516.67  first 0.2500  last 0.1667
+rule_fast seat-games       12  mean-rank 2.66667  mean-score -1516.67  first 0.2500  last 0.3333
+Decisions rule_ev_d1_heuristic  turns 172  Hu turn 16/16 response 86/86  kong concealed 0/0 added 2/9 exposed 0/0  pong 7/15  response-pass 8
+Decisions rule_fast  turns 190  Hu turn 21/21 response 86/86  kong concealed 0/0 added 6/6 exposed 1/1  pong 19/20  response-pass 0
+Throughput  play 0.235s  statistics 0.000s  games/s 25.576  actions/s 2834.7  actions 665
+RESULT rule_ev_d1_heuristic-vs-rule_fast Elo +64.47 uncertainty-unavailable
+```
 
 ## 输出解释
 

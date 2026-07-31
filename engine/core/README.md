@@ -1,8 +1,8 @@
 # Core Rust Crate
 
-`bloodflow-mahjong` 是确定性的血流麻将核心库。`Game` 执行游戏规则，`Batch` 批量执行独立牌局，内置策略从合法动作中选择一个动作。
+`bloodflow-mahjong` 为血流麻将引擎核心库：`Game` 执行游戏规则，`Batch` 批量执行独立牌局，使用内置策略从合法动作中选择一个动作。
 
-游戏规则见 [`../../GAME_RULES.md`](../../GAME_RULES.md)。确定性约定和信息边界见 [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md)。
+游戏规则见 [`../../GAME_RULES.md`](../../GAME_RULES.md)，确定性约定和信息边界见 [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md)。
 
 ## 单局循环
 
@@ -20,9 +20,20 @@ fn play(seed: u64) -> Result<Game, GameError> {
 }
 ```
 
-`Game::legal_actions()` 返回结构化动作。`Game::legal_action_mask()` 返回固定 115 维动作 mask。`step()` 接受 `Action`，`step_id()` 接受 `ActionId`。终局后，这些查询返回 `None`，继续 step 返回 `GameError::Finished`。
+`Game::legal_actions()` 返回结构化动作，`Game::legal_action_mask()` 返回固定 115 维动作 mask。`step()` 接受 `Action`，`step_id()` 接受 `ActionId`。终局后这些查询返回 `None`，继续 step 返回 `GameError::Finished`。
 
 非法动作不得修改状态。需要重放时，保存 `ENGINE_RULES_VERSION`、初始 seed 和完整动作 ID 序列。
+
+## 手牌分析
+
+公开函数包括：
+
+- `is_winning`：判断指定持牌是否包含合法和牌结构；
+- `evaluate_win`：选择倍率最高的和牌拆分；
+- `analyze_shanten`：返回结构向听数和有效牌 mask；
+- `evaluate_max_wait`：返回查大叫所需的最大牌型与根倍率，不计算状态/事件番。
+
+向听数表示还差几次有效进张才能听牌的结构指标；`SHANTEN_COMPLETE`（`-1`）表示当前结构已经完成。玩家和牌后，旧结构仍保留在扩展持牌中，因此 `-1` 不代表距离下一次血流和牌只有一步。
 
 ## 信息边界
 
@@ -37,18 +48,9 @@ fn play(seed: u64) -> Result<Game, GameError> {
 
 `resample_information_set(seed)` 从当前行动者的信息集中采样。`resample_live_wall(seed)` 只重排未来牌墙，不改变任何玩家手牌。两者目标不同，不能互换。
 
-## 手牌分析
-
-公开函数包括：
-
-- `is_winning`：判断指定持牌是否包含合法和牌结构；
-- `evaluate_win`：选择倍率最高的和牌拆分；
-- `analyze_shanten`：返回结构向听数和有效牌 mask；
-- `evaluate_max_wait`：返回查大叫所需的最大牌型与根倍率；不计算状态/事件番。
-
-向听数是传统结构指标。玩家已经胡牌后，旧结构仍保留在扩展持牌中。因此，`SHANTEN_COMPLETE` 不能解释为“距离下一次血流胡牌一步”。
-
 ## 策略 API
+
+三种策略按计算预算递进：`rule-fast` 是轻量基准，`rule-ev` 是中等预算，`rule-planner` 的预算最高。
 
 ### `rule-fast`
 
@@ -69,7 +71,7 @@ let config = RuleEvConfig::with_search_depth(1)
 let action = game.rule_ev_action_with_config(config);
 ```
 
-`search_depth` 控制确定性手牌前瞻。该前瞻枚举公开有效牌和后续弃牌。它不采样隐藏牌，也不读取权威牌墙。`RuleEvConfig::STANDARD` 使用 depth 1 和启发式防守。
+`search_depth` 控制确定性手牌前瞻：枚举公开有效牌和后续弃牌，不采样隐藏牌，也不读取权威牌墙。`RuleEvConfig::STANDARD` 使用 depth 1 和启发式防守。
 
 `Batch::rule_ev_actions_into` 提供批量接口。隐藏世界搜索只由 `rule-planner` 实现。
 
@@ -94,15 +96,17 @@ let config = RulePlannerConfig::STANDARD
 let action = game.rule_planner_action_with_config(config);
 ```
 
-planner 先评估手牌候选图和公开状态价值。`belief_worlds` 为危险度与 rollout 提供信息集粒子。`search_iterations` 非零时，策略在根节点对候选动作进行配对 rollout，并使用独立粒子流验证改动。
+planner 先评估手牌候选图和公开状态价值，再决定动作。`belief_worlds` 控制危险度和 rollout 使用的信息集粒子数。`search_iterations` 非零时，策略对候选动作做配对 rollout——固定其余三座位的行动不变，只改进当前动作——并用独立粒子流验证改动。
 
 planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者或 `rule-tournament` 管理。
 
-feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAnalysisOptions`、冻结 continuation profile 和两组 `Game::rule_planner_analysis_*` 接口。`with_config` 接口保留当前生产 continuation。`with_options` 接口可以独立选择根 belief 和 continuation model。结构化结果包含 baseline、proposal、validation 结果和真实执行的 rollout 计数。
+#### 分析接口
 
-`RulePlannerContinuationProfile` 为四个座位分别指定 `Fast`、`Ev` 或 `PlannerBaseline`。profile 是封闭策略集合，不接受任意回调。`PlannerBaseline` 会关闭 paired root search，但保留其余 planner 配置。该限制使一次根策略改进具有固定 continuation，并防止 rollout 内递归搜索。每个 continuation 策略只读取当前行动者的普通 observation 输入。
+feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAnalysisOptions`、冻结 continuation profile 和两组 `Game::rule_planner_analysis_*` 接口。`with_config` 接口保留当前生产 continuation；`with_options` 接口可以独立选择根 belief 和 continuation model。结构化结果包含 baseline、proposal、validation 结果和真实执行的 rollout 计数。
 
-`OracleHidden` 会读取权威隐藏状态。`KnownPolicies` continuation 会读取评测器提供的策略身份。两者都只能用于诊断，不能用于部署或正式策略成绩。
+`RulePlannerContinuationProfile` 为四个座位分别指定 `Fast`、`Ev` 或 `PlannerBaseline`。profile 是封闭策略集合，不接受任意回调；`PlannerBaseline` 会关闭 paired root search，但保留其余 planner 配置。这样保证一次根策略改进具有固定 continuation，并防止 rollout 内递归搜索。每个 continuation 策略只读取当前行动者的普通 observation 输入。
+
+`OracleHidden` 读取权威隐藏状态，`KnownPolicies` 读取评测器提供的策略身份。两者只能用于诊断，不能用于部署或正式策略成绩。
 
 ## Batch
 
@@ -123,5 +127,3 @@ cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
   --all-targets --features planner-analysis
 ```
-
-crate 使用 `#![forbid(unsafe_code)]`。

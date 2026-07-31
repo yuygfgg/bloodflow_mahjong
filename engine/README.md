@@ -1,7 +1,5 @@
 # Rust Workspace
 
-本目录是项目当前维护的实现。Rust 引擎执行 [`GAME_RULES.md`](../GAME_RULES.md) 定义的游戏规则。内置策略只负责选择动作。
-
 ## Workspace 成员
 
 | 目录 | Package | 产物 |
@@ -50,7 +48,7 @@ cargo build --release --workspace --all-targets
 
 ## 策略测评
 
-`rule-tournament` 支持三种内置策略的任意两两组合。每个 block 运行 6 局平衡座位分配，并按 block bootstrap 置信区间。
+`rule-tournament` 支持三种内置策略的任意两两组合。每个 block 运行 6 局平衡座位分配，并按 block bootstrap 置信区间（以整个 block 为重采样单位）。
 
 ```bash
 cargo run --release -p bloodflow-mahjong-rule-tournament -- \
@@ -84,9 +82,4 @@ benchmark 只用于定位性能变化。策略强弱必须通过平衡锦标赛�
 
 ## Python 绑定
 
-```bash
-maturin develop --release --manifest-path pybind/Cargo.toml
-python -m pytest pybind/tests
-```
-
-绑定需要 Python 3.10 或更高版本。它只公开 `rule-fast` 策略，不公开 `rule-ev` 或 `rule-planner`。完整数组接口见 [`pybind/README.md`](pybind/README.md)。
+安装、数组格式和示例见 [`pybind/README.md`](pybind/README.md)。绑定需要 Python 3.10 或更高版本，只公开 `rule-fast` 策略，不公开 `rule-ev` 或 `rule-planner`。
