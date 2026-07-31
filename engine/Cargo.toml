@@ -1,13 +1,19 @@
 [workspace]
 members = [
     "core",
+    "model-runtime",
     "pybind",
+    "tools/belief-dataset",
     "tools/rule-tournament",
 ]
 resolver = "3"
 
 [workspace.dependencies]
 clap = { version = "4.5", features = ["derive"] }
+safetensors = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
 
 [profile.release]
 codegen-units = 1

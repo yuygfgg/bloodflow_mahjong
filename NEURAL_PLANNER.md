@@ -1,6 +1,6 @@
 # 神经网络增强 `rule-planner` 的实施方案
 
-本文定义后续神经网络工作的主线。该主线保留 Rust `rule-planner` 的信息集搜索，用神经网络逐步替换可学习的评分组件。该主线不恢复旧的 Python 端到端策略梯度训练。
+本文定义后续神经网络工作的主线。该主线保留 Rust `rule-planner` 的信息集搜索，用神经网络逐步替换可学习的评分组件。
 
 本文统一使用以下术语：
 
@@ -12,8 +12,36 @@
 - **validation particles**：用于独立验证根动作改动的隐藏世界。
 - **teacher**：使用高计算预算的冻结 planner。
 - **student**：只读取合法可见信息的神经网络策略。
+- **artifact**：可部署模型目录。目录包含模型权重、版本清单和 golden 校验样本。
+- **残差**：在现有手写后验对数权重上增加的神经网络输出。
 
-## 决策
+本文使用以下固定译法。命令行和代码中的英文名称保持不变：
+
+| 英文名称 | 本文译法 | 含义 |
+| --- | --- | --- |
+| root | 根节点 | 当前行动前、需要比较候选动作的牌局状态 |
+| hidden world | 隐藏世界 | 与当前信息集一致的对手暗手和剩余牌组成 |
+| posterior | 后验 | 加入公开动作历史后的隐藏世界权重 |
+| selection | 选择粒子流 | 用于提出根动作改动的粒子流 |
+| validation | 验证粒子流 | 用于独立确认根动作改动的粒子流 |
+| ESS | 有效样本量 | 衡量归一化粒子权重是否集中 |
+| artifact | 模型包 | 包含权重、清单和 golden 校验样本的目录 |
+| golden | 参考向量 | 用于检查 Python 与 Rust 数值一致性的固定输入输出 |
+
+## 当前实现边界
+
+截至 2026-07-31，代码只实现 learned belief residual 的首版链路。policy、rollout、leaf value、root prior 和 DAgger 仍属于长期方案，不应被描述为已完成。
+
+- 事件历史容量固定为 `192` 条。每条事件使用 Rust 定义的 8 个字段；`event_len` 标记有效前缀，padding 不表示真实事件。
+- 训练入口是 `learning.belief.train`。训练使用 PyTorch 和分组的 contrastive density-ratio objective。默认优化器是 AdamW。训练输出不是 Python checkpoint，而是 `safetensors` 权重和固定 golden 样本。
+- `engine/model-runtime` 使用 Candle 在 CPU 上执行同一网络。首版不使用 ONNX、TorchScript、Python callback 或 GPU Rust 推理。
+- 模型只修正 planner 根节点的隐藏世界后验。对候选世界的手写 log weight 加上 `beta * neural_residual`，然后由 Rust 在粒子之间重新归一化。模型不决定合法动作，不替换 rollout continuation，不改变 root action prior，也不替换独立验证。
+- 选择粒子流和验证粒子流先分别计算带残差的权重和 ESS。任一粒子流的 ESS 小于 `8` 时，两条粒子流都原子地回退到手写 posterior；不能让一条流使用神经权重而另一条流使用手写权重。锦标赛会报告 residual decision 和 ESS fallback 计数。
+- 模型包加载必须通过 `manifest.json`、模型 SHA-256、golden SHA-256、参考向量 shape/finite 检查和 Candle golden 数值校验。校验失败时加载失败，不静默回退。
+
+首版链路已经完成端到端冒烟，但 pilot 数据量和对局数不足以证明 Elo 提升。任何强度结论必须来自独立 seed 的正式锦标赛。
+
+## 长期架构决策
 
 后续系统采用以下分工：
 
@@ -38,11 +66,13 @@ Rust 模型运行时
 
 Rust 始终负责游戏规则、合法动作、随机种子、信息边界和最终搜索决策。Python 不复制游戏状态机，也不自行重建合法牌局。
 
+当前代码只启用下文架构中的 belief residual 分支。其余分支仍按分阶段实验矩阵推进。
+
 ## 目标
 
 该方案必须达到以下目标：
 
-1. 神经网络必须改善现有 `rule-planner`，而不是创建一个与搜索无关的新端到端策略。
+1. 神经网络必须作为可关闭的评分组件改善现有 `rule-planner`。
 2. 最终策略必须在全新 seed 上直接对 `rule-fast` 达到至少 `+45 Elo-like`。
 3. 正式验收以点估计至少 `+55 Elo-like`，且 95% 置信区间下界高于 `+45` 为目标。
 4. 增加搜索预算不得产生可复现的显著退步。至少一个预算增量必须产生置信区间下界高于零的收益。
@@ -54,22 +84,20 @@ Rust 始终负责游戏规则、合法动作、随机种子、信息边界和最
 
 第一阶段不执行以下工作：
 
-- 不恢复旧 `live_wall` 单暗手目标生成。
 - 不从终局回报直接执行 policy gradient。
-- 不用 KL 投影、signed SGD 或跨数据批次的 Nesterov 动量约束策略更新。
 - 不让神经网络判断动作是否合法。
 - 不让 Python 成为权威模拟器。
 - 不用神经网络替换根动作的独立粒子验证。
 - 不要求第一版模型缩短思考时间。单步最多约 10 秒仍可接受。
 - 不同时启用多个未经独立验证的模型组件。
 
-## 旧训练失败机制
+## 信息集目标
 
-旧 Python 主线固定来源牌局中的四家暗手，只重排尚未摸出的牌墙。它实际在一个隐藏世界上训练；其他实验若对合法隐藏世界均匀采样，也没有利用公开历史改变世界权重。前者把单一暗手当成目标，后者把不符合历史的世界当成同等可能。两种目标都不是行动者在信息集内应当优化的后验期望。该方法可以降低同一暗手下的未来牌墙方差，但不能积分对手暗手的不确定性。一个 query 的动作优势仍然依赖来源牌局中偶然出现的对手暗手。
+训练目标必须对当前信息集内的隐藏世界后验求期望。固定一个隐藏世界会把来源牌局中的偶然暗手写入动作优势；对所有合法隐藏世界均匀加权则会忽略公开历史。两种目标都会产生不可泛化的条件偏差。
 
-公开弃牌、碰杠和胡牌历史会改变不同暗手的相对概率。旧训练没有按这些事件计算公开历史后验，也没有用独立粒子流验证动作改动。因此，增加每个 query 的牌墙样本数只能更精确地估计错误的条件目标。该操作不能消除隐藏暗手造成的偏差，也不能保证增加预算会提升强度。
+公开弃牌、碰杠、杠和胡牌历史会改变不同暗手的相对概率。模型必须按这些事件修正 proposal，并在独立粒子流上验证根动作改动。增加同一错误目标的采样预算只能降低估计方差，不能修复后验偏差。
 
-优化器和 KL 约束只能改变参数如何跟随目标。它们不能修复目标本身的信息集偏差。QPC sweep、SGD/AdamW sweep 和 KL scale sweep没有得到稳定收益，与这一判断一致。
+优化算法只决定模型如何拟合目标。优化算法不能替代正确的信息集、后验和独立验证结构。
 
 当前 `rule-planner` 已经验证了更可靠的结构：
 
@@ -104,11 +132,13 @@ belief scorer 评估一个候选隐藏世界与公开历史的一致程度。输
 - 候选世界中三个对手的暗手计数；
 - 候选世界对应的公开约束。
 
+首版 observation 的事件历史长度固定为 `192`。Rust 始终传递固定形状；短历史用 padding 填充，并单独传递 `event_len`。训练和 Candle 推理必须使用相同的容量、字段顺序和 padding 语义。
+
 belief scorer 不得读取未摸牌的顺序。公开历史对尚未发生的牌墙排列没有额外信息。让 scorer 读取牌墙顺序会引入不可泛化的噪声。
 
 belief scorer 输出一个未归一化的 log density ratio。Rust 将该输出与当前手写 history likelihood 组合，再在同一根状态的粒子之间执行 log-sum-exp 归一化。
 
-第一版 scorer 只学习当前手写模型的残差：
+首版 scorer 只学习当前手写模型的残差：
 
 ```text
 log_weight(world) = handwritten_log_weight(world) + neural_residual(world)
@@ -192,6 +222,32 @@ value head 使用完整 Rust 续局的终局名次和分数监督。第一版 va
 
 Oracle 实验可以读取评测器保存的隐藏信息和策略身份。Oracle 结果不能成为部署结果，也不能进入最终 Elo 报告。
 
+锦标赛通过 planner 参数 `root-belief` 提供 belief 消融。`posterior` 使用当前公开历史后验；`uniform` 对合法隐藏世界等权；`oracle-hidden` 固定真实暗手和剩余牌组成，但独立重排未来牌墙。`oracle-hidden` 测量完美当前暗手信息的价值，不是公开历史可学习信息的上界。
+
+参数 `continuation` 提供 continuation 消融。`current` 使用生产路径中的两个代理模型。`oracle-continuation` 根据本局 seat mask 注入已知冻结策略。Fast 和 EV 保留原配置。planner 使用关闭 paired root search 的 baseline 配置，避免递归搜索，并保持一次策略改进的固定 continuation。每个模拟座位只使用自己的 observation。该模式知道策略身份，但不会把一个座位的暗手交给另一个座位的策略。
+
+Current 使用 `posterior + current`。Oracle continuation 使用 `posterior + oracle-continuation`。Joint oracle 使用 `oracle-hidden + oracle-continuation`。这些模式共享相同的 selection、validation、终局 utility 和独立粒子流。
+
+### 首轮 Oracle 诊断（2026-07-31）
+
+belief 消融使用 `h0 d1 c1 b64 r0 i64`。每项比较运行 8 个平衡 block，共 48 局和每侧 96 个 seat-game。置信区间使用 10,000 次 paired block bootstrap。局级并行固定为 2；并行度 4 的吞吐更低。
+
+下表只比较手写 `posterior`、`uniform` 和读取真实暗手的 `oracle-hidden`。它不使用 learned artifact，因此不能作为 learned belief residual 的 Elo 结果。
+
+| 比较 | root seed | Elo-like delta | 95% CI | P(stronger) |
+| --- | ---: | ---: | ---: | ---: |
+| `oracle-hidden` 对 `posterior` | 20260731 | +61.54 | [+24.23, +110.07] | 1.0000 |
+| `oracle-hidden` 对 `posterior` | 20260801 | +53.96 | [+7.56, +112.60] | 0.9917 |
+| `posterior` 对 `uniform` | 20260731 | +6.56 | [+0.00, +15.13] | 0.9493 |
+
+第二组 Oracle 复现中，`oracle-hidden` 接受 65/656 次根搜索改动，`posterior` 接受 29/694 次。Oracle 同时增加 proposal 数和 validation 通过率。该结果说明搜索结构对更准确的隐藏牌后验有可利用空间；它不证明公开历史模型能够恢复该差距。
+
+`posterior` 相对 `uniform` 只有小幅收益。`posterior` 接受 36/622 次改动，`uniform` 接受 47/632 次。当前公开历史模型主要过滤高方差改动，但该结果仍需独立 seed 复现。
+
+`oracle-hidden` 知道真实暗手。该结果不证明公开历史能够恢复全部信息，也不证明神经 belief scorer 已经有效。下一步必须训练只读取公开历史的 density-ratio residual，并在独立粒子和独立 seed 上测量它能恢复多少 Oracle 差距。
+
+continuation oracle 已实现，但精确 planner baseline 续局不适合直接做整局 Elo。即使使用 `h0 d1 c1 b0 r0 i8`，单 block 探针在 95 秒后仍未完成首个昂贵外层搜索决策。`b64 i64` 会更慢几个数量级。后续 continuation 实验必须先提供批量 student 推理或等价缓存；不能继续缩小搜索预算并把失真的结果解释为 continuation 上界。
+
 每项消融使用相同的平衡 seed blocks 和座位排列。比较使用 paired block bootstrap。只有 95% 置信区间下界高于零，才把该组件视为有可学习空间。
 
 如果 Joint oracle 相对当前 planner 没有稳定收益，则同一搜索结构中的神经网络不太可能达到目标。此时应先修改 planner 的状态或动作抽象，不应扩大模型和数据量。
@@ -200,22 +256,17 @@ Oracle 实验可以读取评测器保存的隐藏信息和策略身份。Oracle 
 
 ### Rust 数据生成器
 
-新增独立 Rust 工具负责数据生成。该工具直接调用 core crate，不通过 Python 重放游戏。core crate 只提供结构化搜索诊断接口，不依赖 Arrow、PyTorch 或模型文件格式。
+`engine/tools/belief-dataset` 直接调用 core crate，不通过 Python 重放游戏。该工具只生成首版 belief residual 数据。它不生成 policy、value 或 teacher advantage 标签。
 
-数据工具使用 Apache Parquet 分片。每个数据目录包含一个 JSON manifest。manifest 至少记录：
+工具输出 `safetensors` 分片和 `manifest.json`。manifest 记录 belief schema version、engine rules version、候选数、`max_history=192`、根 seed、随机动作概率、数据来源策略族、请求的最小根状态数、实际根状态数、牌局数、数据审计结果和每个分片的 SHA-256。每个 block 包含 4 局。4 种策略在每个座位各出现一次。split 以完整 block 为单位分配；同一 block 不会跨 train、calibration 和 development。当前实现按 8:1:1 划分这三个 split，尚未生成 final split。
 
-- engine rules version 和 Git commit；
-- observation schema version；
-- teacher 和 rollout policy 的模型摘要；
-- 全部 planner 配置；
-- 对手池及其采样权重；
-- 根 seed domain、selection seed domain 和 validation seed domain；
-- 分片文件的 SHA-256；
-- train、development 和 final split 的 seed block 范围。
+生成器和训练器只接受不存在或为空的输出目录。它们拒绝复用包含其他文件的目录。训练器在构造数据集时校验每个分片的 SHA-256；每个 epoch 不重复计算摘要。
 
-不允许用日志文本反向解析训练标签。
+每个根状态包含 1 个权威隐藏世界和两条独立的 Rust proposal 流。每条流有 `K` 个候选，最终候选组大小为 `2K+1`。候选顺序随机打乱，`proposal_streams` 保存每个候选属于 selection、validation 或 truth 的标记。训练标签允许多个与权威隐藏世界相同的候选，`positive_mask` 必须标记全部且仅标记这些匹配项。`positive_collisions` 统计除权威样本外、与权威隐藏世界完全相同的额外候选数；它不等于所有 proposal collision 的数量。Rust 生成器和 Python 训练审计使用相同定义。数据工具同时保存每个候选的手写 log weight、公开输入、`block_id` 和 `root_id`。
 
-### Policy 记录
+不允许用日志文本反向解析训练标签。后续 policy 和 value 数据也必须使用结构化分片和显式 schema。
+
+### 计划中的 Policy 记录
 
 每条 policy 记录包含：
 
@@ -228,23 +279,32 @@ Oracle 实验可以读取评测器保存的隐藏信息和策略身份。Oracle 
 
 高预算 teacher 必须对每个合法根动作记录相对 baseline 的 posterior-weighted paired advantage。teacher 结果还必须包含最终选择、是否通过 validation、拒绝原因和每个 rollout policy 的比较结果。数据生成器不得只写入 teacher 选择的动作；否则 student 会把 teacher 的访问分布误认为状态分布。
 
-同一完整牌局产生的所有根状态必须进入同一个数据 split。同一个平衡 6 局 seed block 也必须进入同一个 split。该规则防止相同暗手、座位旋转或公共轨迹同时出现在训练集和评测集。
+同一牌局产生的所有已记录根状态必须进入同一个数据 split。同一个平衡 4 局策略分配 block 也必须进入同一个 split。该规则防止同一公共轨迹跨 split，并保持每个 split 的策略和座位分配平衡。4 局使用独立 game seed，不复用暗手或牌山。
 
-### Belief 记录
+### 已实现的 Belief 记录
 
-belief 数据使用单独的 Parquet schema 和目录。每条记录包含：
+belief 数据使用独立的 `safetensors` schema 和目录。每个分片包含以下张量：
 
-- policy 记录中的公开输入；
-- 真实对手暗手分配；
-- proposal 生成的负样本暗手分配；
-- 每个候选的手写 log weight；
-- proposal seed 和候选编号。
+- `tile_obs`、`melds`、`river` 和 `meta`；
+- 固定形状为 `[roots, 192, 8]` 的 `events`，以及 `event_lengths`；
+- 固定形状为 `[roots, 2K+1, 4, 27]` 的 `candidate_worlds`；
+- `handwritten_log_weights`、`positive_mask` 和 `proposal_streams`；
+- `block_ids` 和 `root_ids`。
 
-belief 文件不得被 policy 或 value dataloader 打开。训练代码必须根据 manifest 中的 dataset kind 拒绝错误 schema。
+候选世界的 4 个平面依次表示 3 家对手暗手计数和剩余牌组成。它不包含未来摸牌顺序。belief 文件不得被未来的 policy 或 value dataloader 打开。
 
 ### 数据来源
 
-根状态必须来自以下混合对手池：
+首版生成器轮换以下四种数据来源策略：
+
+- `rule-fast`；
+- 确定性 `rule-ev`；
+- 低预算 `rule-planner`；
+- 带 full-support 随机动作的 `rule-fast`。
+
+默认随机动作概率是 `0.15`。该对手池只用于验证首版链路。它不是最终训练分布。
+
+长期数据应来自以下混合对手池：
 
 - `rule-fast`；
 - 确定性 `rule-ev`；
@@ -254,9 +314,13 @@ belief 文件不得被 policy 或 value dataloader 打开。训练代码必须�
 
 四个座位和所有主要阶段必须平衡。训练集可以包含 `rule-fast`，但不能让它占据多数根状态。development panel 必须包含训练中未出现的 student 快照、planner 预算或随机化策略。
 
+### 复现实验
+
+数据生成、训练、模型校验和锦标赛命令统一维护在 [`BELIEF_RESIDUAL.md`](BELIEF_RESIDUAL.md)。本文件只定义架构、信息边界和验收标准，避免同一操作流程出现多个版本。
+
 ## DAgger 闭环
 
-训练采用 DAgger，而不是只蒸馏 teacher 自己访问的状态。
+后续 policy 阶段计划采用 DAgger，使 teacher 不只标注自身访问的状态。
 
 1. 第 0 轮从当前 Rust 策略池收集根状态。
 2. 高预算 teacher 为这些根状态生成 `pi_teacher`。
@@ -268,7 +332,7 @@ belief 文件不得被 policy 或 value dataloader 打开。训练代码必须�
 
 数据合并比例、teacher 预算和训练 epoch 数必须在本轮开始前写入 manifest。development 结果不能反向修改已完成轮次的目标或数据 split。
 
-初始 student 从新随机权重训练。旧 SL 模型只作为对照。任何旧权重 warm start 都必须作为独立消融，不能成为主线的隐式依赖。
+初始 student 从新随机权重训练。任何已有权重 warm start 都必须作为独立消融，不能成为主线的隐式依赖。
 
 ## 分阶段实验矩阵
 
@@ -277,11 +341,11 @@ belief 文件不得被 policy 或 value dataloader 打开。训练代码必须�
 | 阶段 | 单一变量与明确产物 | 接受条件 | 停止条件 |
 | --- | --- | --- | --- |
 | 0：冻结基线 | 三档预算的 `rule-planner` commit、配置、吞吐、动作摘要、平衡 seed blocks | 相同 commit、配置和 seed 完全复现动作摘要和 tournament 原始结果 | 无法精确复现时，停止后续实验并修复随机性或记录缺口 |
-| 1：Oracle 和数据接口 | 五组 oracle 结果；结构化 root evaluation；Parquet schema、manifest、checksum、exact replay test | 至少一个 oracle 相对 baseline 的 95% CI 下界高于零；Python observation 与 Rust replay 字节一致 | Joint oracle 无稳定收益时，停止模型训练，先修改 planner 状态或动作抽象 |
-| 2：DAgger policy | 高预算 teacher advantage 数据；至少两轮 observation-only DAgger；ONNX policy artifact | held-out opponent panel 上相对无搜索 baseline 不显著退步，并达到预注册的 teacher regret 门槛 | 两轮后无改善或出现信息边界违规时，停止并检查 teacher 数据和 observation schema |
+| 1：Oracle 和数据接口 | 五组 oracle 结果；结构化 root evaluation；`safetensors` schema、manifest、checksum、exact replay test | 至少一个 oracle 相对 baseline 的 95% CI 下界高于零；Python observation 与 Rust replay 字节一致 | Joint oracle 无稳定收益时，停止模型训练，先修改 planner 状态或动作抽象 |
+| 2：DAgger policy | 高预算 teacher advantage 数据；至少两轮 observation-only DAgger；可由 Rust 加载的 policy artifact | held-out opponent panel 上相对无搜索 baseline 不显著退步，并达到预注册的 teacher regret 门槛 | 两轮后无改善或出现信息边界违规时，停止并检查 teacher 数据和 observation schema |
 | 3：第三种 rollout policy | 冻结 student 作为新增 rollout policy；原手写 rollout 保留 | 相对原 planner 的 Elo 95% CI 下界高于零；override rate、validation reject rate 和 ESS 无异常 | CI 下界不高于零，或收益只出现于单一对手时，移除该 rollout policy |
 | 4：无搜索 baseline | student 单独替换无搜索 baseline 的 tournament 和 mixed panel 报告 | 不弱于原 baseline，且对 held-out mixed panel 无显著退步 | 模型仅对 `rule-fast` 有收益时，不进入后续组件阶段 |
-| 5：Belief residual | density-ratio artifact；posterior calibration、ESS 与 tournament 报告 | 独立粒子上提高真实隐藏分配排序，且 tournament 95% CI 下界高于零 | 低 ESS fallback 成为主要路径，或 calibration 恶化时，停止接入 |
+| 5：Belief residual | PyTorch 训练的 `safetensors` artifact；Candle golden；posterior calibration、ESS 与 tournament 报告 | 独立粒子上提高真实隐藏分配排序；独立 seed tournament 的 95% CI 下界高于零；fallback 率不异常 | 低 ESS fallback 成为主要路径，或 calibration 恶化时，停止接入 |
 | 6：Leaf value | rank/score artifact；相对 terminal rollout 的排序和核时报告 | 相同核时提高 Elo，或相同决策质量减少核时；validation 仍使用 terminal rollout | 仅离线误差降低时，不接入 planner |
 | 7：Root prior | policy prior 的动作排序和额外预算分配；最小配对预算保持不变 | 提高单位核时收益，并且中预算搜索稳定强于模型 baseline | 任一合法动作因 prior 未获最小样本，或预算扩展退步时，撤回 prior |
 
@@ -306,37 +370,38 @@ ESS = 1 / sum_i(w_i * w_i)
 - weight entropy；
 - selection 和 validation 的 paired mean、standard error 和 LCB。
 
-learned belief 可能使权重集中。Rust 先按稳定粒子编号增加粒子，直到 ESS 达到预注册门槛或预算耗尽。如果预算耗尽后 ESS 仍不足，planner 不接受 neural override，并回到当前手写 posterior 或 baseline。正式结果必须报告 fallback 比例，不能把 fallback 隐藏为模型成功。
+首版 learned belief 不动态增加粒子。Rust 对 selection 和 validation 各自计算带残差的归一化权重。没有任何有限手写权重的 learned 粒子流，其 ESS 定义为 `0`。只要任一粒子流的 ESS 小于 `8`，两条粒子流就原子地回退到 manual planner，避免 selection 和 validation 使用不同的目标。
 
-ESS 门槛、最大粒子数和 belief temperature 只能在 development split 上确定。final tournament 期间不得修改这些参数。
+learned ESS 只决定 residual 是否生效。原子回退后，manual planner 继续使用已有的 posterior 行为。如果 manual posterior 对一条合法粒子流仍然没有支持，manual planner 保留既有的均匀应急策略。该应急策略不改变 learned ESS，不计作 residual 成功，也不能把零支持报告为 learned 高 ESS。正式结果必须报告 residual decision 数和 ESS fallback 比例。
+
+后续版本可以研究按稳定粒子编号扩展预算，但必须先预注册 ESS 门槛、最大粒子数和 belief temperature。final tournament 期间不得修改这些参数。
 
 ## 模型结构和导出
 
-第一版模型使用无状态 encoder。输入宽度固定，只有 batch 维动态。event history 使用固定容量和显式 length，不使用 Python 对象或可变控制流。
+第一版模型使用无状态 encoder。输入宽度固定，只有 batch 维动态。事件历史固定为 `192`，并使用显式 `event_len`。模型不使用 Python 对象或可变控制流。
 
 policy 和 value 可以共享 observation encoder。belief 使用独立的 particle encoder，并可共享 public-history encoder。第一阶段保持两个独立 artifact，避免 belief 输入进入 policy graph。
 
-Python 导出 ONNX opset 18。每个 artifact 目录包含：
+### 首版 belief artifact
 
-- `model.onnx`；
+Python/PyTorch 导出 `safetensors` 权重。每个 artifact 目录包含：
+
+- `model.safetensors`；
+- `golden.safetensors`；
 - `manifest.json`；
-- 固定输入和输出的 golden vectors；
-- 文件 SHA-256。
+- 模型和 golden 文件的 SHA-256。
 
 manifest 必须记录：
 
-- model kind；
-- observation schema version；
-- engine rules version；
-- action space size；
-- 输入名称、dtype 和 shape；
-- 输出语义；
-- 训练数据摘要；
-- PyTorch 和 ONNX exporter 版本。
+- `artifact_version` 和 `model_kind=belief_residual`；
+- `belief_schema_version`、`engine_rules_version` 和 `max_history=192`；
+- 候选世界平面数、牌种数和完整网络配置；
+- `beta`、`model_sha256` 和 `golden_sha256`；
+- 训练数据路径、训练 seed、calibration 指标、development 指标和训练审计。
 
-Rust 不加载 pickle 或 Python checkpoint。Rust 运行时在加载模型时验证全部版本、shape 和摘要。版本不匹配必须返回明确错误。正式评测不能静默回退到手写策略。
+Rust 不加载 pickle 或 Python checkpoint。`CandleBeliefModel::load` 在构造运行时前验证 manifest 的版本、规则版本、网络 shape、有限 beta 和 RoPE 配置，再验证模型 SHA-256、golden SHA-256、golden tensor shape、有限值和 CPU 输出误差。`belief-model-check` 使用同一套检查。版本或校验不匹配必须返回明确错误；正式评测不能静默回退到手写策略。
 
-模型后端放在独立 crate。core crate 只定义批量 evaluator trait 和纯 Rust feature schema。这样 ONNX runtime 依赖不会进入权威游戏状态机。
+模型后端放在独立 crate。core crate 只定义批量 evaluator trait 和纯 Rust feature schema。这样 Candle 依赖不会进入权威游戏状态机。首版只提供 CPU 推理；未来 policy/value artifact 可以复用该边界，但不能假定已经支持。
 
 ## Rust 批量推理
 
@@ -385,13 +450,14 @@ Value 至少报告：
 
 ## 防止对 `rule-fast` 过拟合
 
-实验使用三层数据和评测边界：
+实验使用四层数据和评测边界：
 
 1. **Train**：允许包含 `rule-fast`，用于训练模型。
-2. **Development**：使用全新 seed、未见 student 快照和未见 planner 预算，用于组件选择。
-3. **Final**：预先冻结的全新平衡 seed blocks，只用于正式验收。
+2. **Calibration**：使用完整且不重叠的策略平衡 block，用于选择 `beta` 和其他预注册的部署参数。
+3. **Development**：使用全新 seed、未见 student 快照和未见 planner 预算。训练器只在 artifact 固定后汇报该 split；结果不得反馈到同一个 artifact 的权重或 `beta`。
+4. **Final**：预先冻结的全新平衡 seed blocks，只用于正式验收。
 
-每次 development arena 同时报告：
+每次 development arena 在 artifact 固定后同时报告：
 
 - 对 `rule-fast`；
 - 对确定性 `rule-ev`；
@@ -436,26 +502,24 @@ point estimate >= +55 Elo-like
 
 ## 实施顺序
 
-按以下顺序提交代码：
+长期实施顺序如下。Oracle、belief 数据生成、belief residual 训练和 Candle runtime 已有首版实现；policy、value、DAgger 和 root prior 仍未实现。
 
 1. 冻结当前 planner 基线和三档预算。
 2. 为 planner 增加结构化 root evaluation，不改变动作。
 3. 实现 oracle evaluator 和 paired tournament。
-4. 新增 Rust 数据生成工具、Parquet schema 和 replay tests。
-5. 实现 Python policy trainer、DAgger driver 和 ONNX export。
-6. 新增独立 Rust 模型运行时和 batch evaluator trait。
+4. 新增 Rust 数据生成工具、`safetensors` schema 和 replay tests。
+5. 实现 Python policy trainer、DAgger driver 和可由 Rust 加载的 artifact。
+6. 新增独立 Rust Candle 模型运行时和 batch evaluator trait。
 7. 将 policy 接为第三种 rollout policy。
 8. 独立测试模型替换 planner 无搜索 baseline 的效果。
-9. 实现 belief residual 数据和训练。
+9. 扩展 belief residual 数据、训练和独立 seed 验收。
 10. 实现 leaf value。
 11. 最后接入 root prior 和预算分配。
 
 每一步都必须保持无模型 planner 可构建、可测试、可测评。任何组件没有得到独立正收益时，后续阶段不得把该组件当作默认依赖。
 
-## 明确废弃的路径
+## 在线微调约束
 
-本方案不复用旧 `live_wall` 单暗手 PG/CE 路径。旧代码和文档可以保留用于复现实验，但它们不定义新模型的数据或优化目标。
-
-新方案中的交叉熵是对高预算信息集搜索 target 的监督蒸馏。它与“在一个固定对手暗手上重排牌墙，再把动作收益直接压入 Actor”的旧 CE 不同。新方案也不使用终局 REINFORCE、单步 signed SGD 或强制 KL 归一化来补偿目标噪声。
+交叉熵目标用于监督蒸馏高预算信息集搜索。目标必须包含隐藏世界后验、配对根动作收益和独立验证结果。
 
 若后续需要在线微调，在线样本仍必须通过 posterior particles、paired root actions 和独立 validation。任何绕过这些约束的实验都只能作为独立研究分支，不能进入 planner 主线。

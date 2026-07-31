@@ -18,7 +18,7 @@ const STARTING_SCORE: i64 = 10_000;
 pub(crate) const SCORE_UNIT: i64 = 100;
 /// Increment whenever engine rule semantics or deterministic initialization
 /// change in a way that can invalidate a stored action-sequence replay.
-pub const ENGINE_RULES_VERSION: u32 = 2;
+pub const ENGINE_RULES_VERSION: u32 = 3;
 pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
@@ -471,7 +471,7 @@ pub struct Game {
     // A discard remains in the river after a discard win, while the winner's
     // recorded hand also contains that same physical tile. One entry is kept
     // for every such hand reference so public tile counts can remove it.
-    discard_win_references: [u8; TILE_KIND_COUNT],
+    duplicate_win_references: [u8; TILE_KIND_COUNT],
     transition_draw: Option<DrawEvent>,
     transition_discard: Option<DiscardEvent>,
     events: [StoredEvent; EVENT_HISTORY_CAPACITY],
@@ -526,7 +526,7 @@ impl Game {
             discard_hand_revisions: [0; WALL_TILE_COUNT],
             discard_len: 0,
             hand_revisions: [0; PLAYER_COUNT],
-            discard_win_references: [0; TILE_KIND_COUNT],
+            duplicate_win_references: [0; TILE_KIND_COUNT],
             transition_draw: None,
             transition_discard: None,
             events: [StoredEvent::EMPTY; EVENT_HISTORY_CAPACITY],
@@ -770,7 +770,8 @@ impl Game {
             })
             .collect();
         let constrained_allocations =
-            sample_constrained_suit_allocations(&unknown, &constraints, &mut rng);
+            sample_constrained_suit_allocations(&unknown, &constraints, &mut rng)
+                .ok_or(GameError::InformationSetUnavailable)?;
         let mut suit_pools: [Vec<u8>; 3] = core::array::from_fn(|_| Vec::new());
         for tile in unknown {
             suit_pools[usize::from(tile / 9)].push(tile);
@@ -832,7 +833,11 @@ impl Game {
     pub fn resample_live_wall(&self, seed: u64) -> Self {
         let mut sampled = self.clone();
         let mut rng = Rng::new(seed);
-        rng.shuffle(&mut sampled.wall[sampled.wall_head as usize..sampled.wall_tail as usize]);
+        let live_wall = &mut sampled.wall[sampled.wall_head as usize..sampled.wall_tail as usize];
+        // A sample is a function of the remaining multiset and the seed. It
+        // must not retain information from the authoritative wall order.
+        live_wall.sort_unstable();
+        rng.shuffle(live_wall);
         sampled
     }
 
@@ -1358,8 +1363,34 @@ impl Game {
         }
 
         core::array::from_fn(|index| {
-            let known = counts[index].saturating_sub(u16::from(self.discard_win_references[index]));
-            debug_assert!(known <= u16::from(TILE_COPIES));
+            let known =
+                counts[index].saturating_sub(u16::from(self.duplicate_win_references[index]));
+            debug_assert!(
+                known <= u16::from(TILE_COPIES),
+                "visible tile count exceeds physical inventory: viewer={viewer:?}, tile={index}, raw={}, own_concealed={}, concealed_by_seat={:?}, locked_by_seat={:?}, meld_extra_by_seat={:?}, river={}, duplicate_win_references={}, known={known}, phase={:?}, discards={}",
+                counts[index],
+                self.players[viewer.index()].concealed[index],
+                Seat::ALL.map(|seat| self.players[seat.index()].concealed[index]),
+                Seat::ALL.map(|seat| self.players[seat.index()].locked[index]),
+                Seat::ALL.map(|seat| self.players[seat.index()]
+                    .melds
+                    .iter()
+                    .flatten()
+                    .filter(|meld| meld.tile.index() == index)
+                    .map(|meld| match meld.kind {
+                        MeldKind::Pong => 2_u16,
+                        MeldKind::ExposedKong | MeldKind::AddedKong => 3,
+                        MeldKind::ConcealedKong => 4,
+                    })
+                    .sum::<u16>()),
+                self.discards[..self.discard_len as usize]
+                    .iter()
+                    .filter(|&&tile| usize::from(tile) == index)
+                    .count(),
+                self.duplicate_win_references[index],
+                self.phase(),
+                self.discard_len,
+            );
             known.min(u16::from(u8::MAX)) as u8
         })
     }
@@ -2067,10 +2098,12 @@ impl Game {
         }
 
         let mut last_winner = source;
-        for winner in seats_in_mask_after(source, winners) {
-            if matches!(kind, ReactionKind::Discard { .. }) {
-                self.discard_win_references[tile.index()] =
-                    self.discard_win_references[tile.index()].saturating_add(1);
+        for (resolved_winners, winner) in seats_in_mask_after(source, winners).enumerate() {
+            let duplicates_existing_reference = matches!(kind, ReactionKind::Discard { .. })
+                || (kind == ReactionKind::AddedKong && resolved_winners > 0);
+            if duplicates_existing_reference {
+                self.duplicate_win_references[tile.index()] =
+                    self.duplicate_win_references[tile.index()].saturating_add(1);
             }
             self.players[winner.index()].concealed[tile.index()] =
                 self.players[winner.index()].concealed[tile.index()].saturating_add(1);
@@ -3574,7 +3607,7 @@ fn sample_constrained_suit_allocations(
     unknown: &[u8],
     constraints: &[HiddenHandConstraint],
     rng: &mut Rng,
-) -> Vec<[usize; 3]> {
+) -> Option<Vec<[usize; 3]>> {
     let mut remaining = [0_usize; 3];
     for &tile in unknown {
         remaining[usize::from(tile / 9)] += 1;
@@ -3596,28 +3629,39 @@ fn sample_constrained_suit_allocations(
             })
             .collect();
         let total: f64 = weights.iter().sum();
-        assert!(
-            total.is_finite() && total > 0.0,
-            "public hand constraints are feasible"
-        );
+        if !total.is_finite()
+            || total <= 0.0
+            || weights
+                .iter()
+                .any(|weight| !weight.is_finite() || *weight < 0.0)
+        {
+            return None;
+        }
 
-        let mut draw = rng.unit_f64() * total;
-        let selected = weights
-            .iter()
-            .position(|&weight| {
-                if draw < weight {
-                    true
-                } else {
-                    draw -= weight;
-                    false
-                }
-            })
-            .unwrap_or(weights.len() - 1);
+        let selected = choose_weighted_index(&weights, rng.unit_f64() * total);
         let allocation = options[selected];
         remaining = subtract_allocation(remaining, allocation);
         sampled.push(allocation);
     }
-    sampled
+    Some(sampled)
+}
+
+/// Selects one non-zero weighted option. The final positive option is a
+/// deliberate rounding guard: subtractive accumulation can leave a tiny
+/// residual after the mathematical total has been consumed.
+fn choose_weighted_index(weights: &[f64], mut draw: f64) -> usize {
+    let mut last_positive = None;
+    for (index, &weight) in weights.iter().enumerate() {
+        if weight <= 0.0 {
+            continue;
+        }
+        last_positive = Some(index);
+        if draw < weight {
+            return index;
+        }
+        draw -= weight;
+    }
+    last_positive.expect("weighted choices have positive mass")
 }
 
 fn constrained_completion_weight(
@@ -3784,6 +3828,18 @@ mod tests {
         add_tile(player, winning_tile, 1);
         player.missing = Some(Suit::Dots);
         winning_tile
+    }
+
+    fn make_zero_copy_wait(player: &mut Player) -> Tile {
+        add_sequence(player, Suit::Characters, 1);
+        add_sequence(player, Suit::Characters, 4);
+        add_sequence(player, Suit::Bamboo, 1);
+        let pair = tile(Suit::Bamboo, 5);
+        add_tile(player, pair, 2);
+        add_tile(player, tile(Suit::Characters, 7), 1);
+        add_tile(player, tile(Suit::Characters, 8), 1);
+        player.missing = Some(Suit::Dots);
+        tile(Suit::Characters, 9)
     }
 
     fn make_flower_pig(player: &mut Player) {
@@ -4189,7 +4245,7 @@ mod tests {
         game.step(Action::Hu).unwrap();
         game.step(Action::Hu).unwrap();
 
-        assert_eq!(game.discard_win_references[winning_tile.index()], 2);
+        assert_eq!(game.duplicate_win_references[winning_tile.index()], 2);
         assert_eq!(game.locked(first_winner)[winning_tile.index()], 2);
         assert_eq!(game.locked(second_winner)[winning_tile.index()], 2);
         assert_eq!(game.visible_tile_counts(viewer)[winning_tile.index()], 3);
@@ -4209,11 +4265,46 @@ mod tests {
             ReactionKind::AddedKong,
         );
 
-        assert_eq!(game.discard_win_references[winning_tile.index()], 0);
+        assert_eq!(game.duplicate_win_references[winning_tile.index()], 0);
         assert_eq!(
             game.visible_tile_counts(Seat::ALL[2])[winning_tile.index()],
             2
         );
+    }
+
+    #[test]
+    fn multiple_robbed_added_kong_wins_share_one_physical_tile() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let first_winner = Seat::ALL[1];
+        let second_winner = Seat::ALL[2];
+        let viewer = Seat::ALL[3];
+        let winning_tile = make_zero_copy_wait(&mut game.players[first_winner.index()]);
+        assert_eq!(
+            make_zero_copy_wait(&mut game.players[second_winner.index()]),
+            winning_tile,
+        );
+        add_tile(&mut game.players[source.index()], winning_tile, 1);
+        assert!(game.players[source.index()].add_meld(Meld {
+            tile: winning_tile,
+            kind: MeldKind::Pong,
+            source: viewer,
+        }));
+        game.discards[0] = winning_tile.as_u8();
+        game.discard_owners[0] = viewer.as_u8();
+        game.discard_len = 1;
+
+        game.resolve_discard_wins(
+            source,
+            winning_tile,
+            seat_bit(first_winner) | seat_bit(second_winner),
+            ReactionKind::AddedKong,
+        );
+
+        assert_eq!(game.duplicate_win_references[winning_tile.index()], 1);
+        assert_eq!(game.locked(first_winner)[winning_tile.index()], 1);
+        assert_eq!(game.locked(second_winner)[winning_tile.index()], 1);
+        assert_eq!(game.visible_tile_counts(viewer)[winning_tile.index()], 4);
     }
 
     #[test]
@@ -4799,6 +4890,13 @@ mod tests {
     }
 
     #[test]
+    fn constrained_weight_sampling_never_selects_zero_mass_fallback() {
+        assert_eq!(choose_weighted_index(&[1.0, 0.0], 1.0), 0);
+        assert_eq!(choose_weighted_index(&[0.0, 1.0, 0.0], 1.0), 1);
+        assert_eq!(choose_weighted_index(&[0.0, 2.0, 0.0, 3.0], 5.0), 3);
+    }
+
+    #[test]
     fn information_set_batch_sampling_is_deterministic_and_rejects_terminal_states() {
         let batch = Batch::new(3, 101);
         let indices = [2, 0, 2];
@@ -4833,7 +4931,12 @@ mod tests {
         let first = game.resample_live_wall(17);
         let repeated = game.resample_live_wall(17);
         let different = game.resample_live_wall(19);
+        let mut reordered = game.clone();
+        reordered.wall[reordered.wall_head as usize..reordered.wall_tail as usize]
+            .sort_unstable_by(|left, right| right.cmp(left));
+        let from_reordered = reordered.resample_live_wall(17);
         assert_eq!(first.wall, repeated.wall);
+        assert_eq!(first.wall, from_reordered.wall);
         assert_ne!(first.wall, different.wall);
         assert_eq!(first.wall_head, game.wall_head);
         assert_eq!(first.wall_tail, game.wall_tail);

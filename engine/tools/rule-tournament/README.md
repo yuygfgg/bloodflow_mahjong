@@ -56,11 +56,27 @@ A 侧参数使用 `--a-*`，B 侧使用 `--b-*`。两侧参数完全对称。
 | `draw-horizon` | 忽略 | 忽略 | 候选图摸牌视野 `0..32` |
 | `candidate-states` | 忽略 | 忽略 | 候选图状态上限 `1..200000` |
 | `belief-worlds` | 忽略 | 忽略 | 信念粒子数 `0..256` |
+| `root-belief` | 忽略 | 忽略 | `posterior`、`uniform` 或 `oracle-hidden` |
+| `continuation` | 忽略 | 忽略 | `current` 或 `oracle-continuation` |
 | `response-worlds` | 忽略 | 忽略 | 响应分析世界数 `0..256` |
 | `search-iterations` | 忽略 | 忽略 | 配对 rollout iteration 数 `0..4096` |
 | `defense` | 忽略 | `none` 或 `heuristic` | 忽略 |
 
 CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`search-iterations` 只影响 `rule-planner`；`rule-fast` 和 `rule-ev` 会忽略该参数。
+
+`root-belief` 只改变 planner 根搜索的粒子分布。`posterior` 是生产模式。`uniform` 对合法隐藏世界等权。`oracle-hidden` 固定权威状态中的真实暗手和剩余牌组成，并为每个粒子独立重排未来牌墙。该模式读取隐藏信息，只能用于诊断 belief 的信息价值，不能作为可部署策略或正式 Elo 成绩。
+
+`continuation` 只改变 planner 根搜索的终局续局策略。`current` 保留生产路径中的 `Simple` 和 `Direct` 两个代理模型。`oracle-continuation` 根据当前 2v2 seat mask，把本局已知的 `rule-fast`、`rule-ev` 或 planner baseline 分配到四个座位。每个座位只读取自己的合法 observation。planner baseline 保留手牌图、belief 和 response 配置，但关闭 paired root search，避免 rollout 内递归搜索。该模式会读取对手策略身份，只能用于诊断 continuation mismatch。
+
+`belief-model` 只能与 `posterior + current` 组合使用。模型 manifest 记录 beta 校准时每条 proposal 流的粒子数。对应侧的 `search-iterations` 必须与该数值完全相同；CLI 会拒绝未校准的粒子预算。
+
+以下组合分别对应三项主要消融：
+
+| 名称 | `root-belief` | `continuation` |
+| --- | --- | --- |
+| Current | `posterior` | `current` |
+| Oracle continuation | `posterior` | `oracle-continuation` |
+| Joint oracle | `oracle-hidden` | `oracle-continuation` |
 
 只有 `rule-planner` 的 `belief-worlds`、`response-worlds` 和 `search-iterations` 会影响内层搜索的自动并发判断。需要固定调度时，显式设置 `--parallel-games`。
 
@@ -79,7 +95,7 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
   --blocks 32 \
   --bootstrap-samples 10000 \
   --root-seed 20265001 \
-  --parallel-games 4 \
+  --parallel-games 2 \
   --policy-a rule-planner \
   --a-hand-changes 0 \
   --a-draw-horizon 1 \
@@ -87,12 +103,14 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
   --a-belief-worlds 64 \
   --a-response-worlds 0 \
   --a-search-iterations 64 \
+  --a-root-belief posterior \
+  --a-continuation current \
   --policy-b rule-ev \
   --b-lookahead-depth 1 \
   --b-defense heuristic
 ```
 
-该命令用于统计验证，不是快速测试。`--parallel-games` 同时增加局级并行和内层搜索竞争。过高的值可能降低吞吐。正式运行前应在目标机器上比较 `1`、`2` 和 `4`。
+该命令用于统计验证，不是快速测试。`--parallel-games` 同时增加局级并行和内层搜索竞争。过高的值可能降低吞吐。当前 32 线程机器上，`2` 快于 `1` 和 `4`；其他机器仍应先测量吞吐。
 
 ## 输出解释
 
@@ -104,7 +122,8 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
 - `cross-policy-win`：同局内 A 座位名次优于 B 座位的两两比例；
 - `mean-rank`、`mean-score`、`first` 和 `last`：每种策略的 seat-game 汇总；`mean-score` 是相对每局初始分数的平均变化，不是终局绝对分数；
 - `Decisions`：胡、碰、杠和过的选择计数；
-- `Planner search`、`Planner validation` 和 `Planner`：搜索决策、验证拒绝、改动和 rollout 计数；
+- `Planner search <policy>`：按 A/B 策略侧分别统计搜索决策、proposal、验证拒绝、改动和 rollout；
+- `Planner`：两侧实际对局决策的确定性规划和危险度统计；oracle continuation 内部模拟不会写入该统计；
 - `Throughput`：牌局、动作和统计耗时。
 
 `Elo-like delta` 不是跨规则、跨阵容或跨版本通用的外部等级分。它只描述本次二对二实验。只有在新 seed 上复现且置信区间稳定时，才能把正点估计解释为可靠提升。

@@ -26,6 +26,10 @@ path = "benchmarks/max_wait_benchmark.rs"
 name = "ffi-throughput-benchmark"
 path = "benchmarks/ffi_throughput.rs"
 
+[features]
+belief-training = []
+planner-analysis = []
+
 [dependencies]
 rand = "0.9"
 rand_chacha = "0.9"

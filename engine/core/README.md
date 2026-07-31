@@ -98,6 +98,12 @@ planner 先评估手牌候选图和公开状态价值。`belief_worlds` 为危�
 
 planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者或 `rule-tournament` 管理。
 
+feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAnalysisOptions`、冻结 continuation profile 和两组 `Game::rule_planner_analysis_*` 接口。`with_config` 接口保留当前生产 continuation。`with_options` 接口可以独立选择根 belief 和 continuation model。结构化结果包含 baseline、proposal、validation 结果和真实执行的 rollout 计数。
+
+`RulePlannerContinuationProfile` 为四个座位分别指定 `Fast`、`Ev` 或 `PlannerBaseline`。profile 是封闭策略集合，不接受任意回调。`PlannerBaseline` 会关闭 paired root search，但保留其余 planner 配置。该限制使一次根策略改进具有固定 continuation，并防止 rollout 内递归搜索。每个 continuation 策略只读取当前行动者的普通 observation 输入。
+
+`OracleHidden` 会读取权威隐藏状态。`KnownPolicies` continuation 会读取评测器提供的策略身份。两者都只能用于诊断，不能用于部署或正式策略成绩。
+
 ## Batch
 
 `Batch` 的高吞吐接口由调用者分配输出缓冲区。常用能力包括：
@@ -114,6 +120,8 @@ planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者�
 
 ```bash
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
+cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
+  --all-targets --features planner-analysis
 ```
 
 crate 使用 `#![forbid(unsafe_code)]`。

@@ -2,10 +2,12 @@ use std::collections::BTreeMap;
 
 use rayon::prelude::*;
 
-use crate::Action;
 use crate::game::{Game, Phase, SCORE_UNIT, TerminationReason};
 use crate::rules::hand::Holding;
 use crate::types::{PLAYER_COUNT, Seat, TILE_KIND_COUNT, Tile};
+use crate::{Action, BeliefResidualError, BeliefResidualEvaluator};
+#[cfg(any(feature = "belief-training", test))]
+use crate::{BeliefPublicFeatures, BeliefRootCandidate};
 use crate::{WinFlags, analyze_shanten, evaluate_max_wait, evaluate_win};
 
 use super::history::PublicHistory;
@@ -26,6 +28,36 @@ pub(super) struct RootBeliefSampler<'a> {
 pub(super) struct RootBeliefParticle {
     pub(super) game: Game,
     pub(super) log_likelihood: f64,
+    handwritten_log_likelihood: f64,
+}
+
+impl RootBeliefParticle {
+    pub(super) fn use_handwritten_weight(&mut self) {
+        self.log_likelihood = self.handwritten_log_likelihood;
+    }
+
+    #[cfg(test)]
+    pub(super) fn new_for_test(
+        game: Game,
+        log_likelihood: f64,
+        handwritten_log_likelihood: f64,
+    ) -> Self {
+        Self {
+            game,
+            log_likelihood,
+            handwritten_log_likelihood,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(super) enum RootBeliefMode {
+    #[default]
+    Posterior,
+    #[cfg(any(feature = "planner-analysis", test))]
+    Uniform,
+    #[cfg(any(feature = "planner-analysis", test))]
+    OracleHidden,
 }
 
 impl<'a> RootBeliefSampler<'a> {
@@ -58,16 +90,136 @@ impl<'a> RootBeliefSampler<'a> {
             .then_some(state)
     }
 
-    /// Samples one stable particle and scores it under the public action
-    /// history. Search code normalizes these log-likelihoods only after it has
-    /// discarded incomplete paired evaluations.
-    pub(super) fn sample_weighted(&self, id: u64) -> Option<RootBeliefParticle> {
-        let game = self.sample(id)?;
-        let log_likelihood = world_log_likelihood_ratio(&game, self.actor, &self.history);
+    /// Samples one stable root-search particle under the selected diagnostic
+    /// belief. Search normalizes log-likelihoods after incomplete paired
+    /// evaluations have been discarded.
+    pub(super) fn sample_weighted(
+        &self,
+        id: u64,
+        mode: RootBeliefMode,
+    ) -> Option<RootBeliefParticle> {
+        let (game, log_likelihood) = match mode {
+            RootBeliefMode::Posterior => {
+                let game = self.sample(id)?;
+                let log_likelihood = world_log_likelihood_ratio(&game, self.actor, &self.history);
+                (game, log_likelihood)
+            }
+            #[cfg(any(feature = "planner-analysis", test))]
+            RootBeliefMode::Uniform => (self.sample(id)?, 0.0),
+            #[cfg(any(feature = "planner-analysis", test))]
+            RootBeliefMode::OracleHidden => {
+                let seed = mix_seed(self.base_seed.wrapping_add(id));
+                (self.root.resample_live_wall(seed), 0.0)
+            }
+        };
         Some(RootBeliefParticle {
             game,
             log_likelihood,
+            handwritten_log_likelihood: log_likelihood,
         })
+    }
+
+    /// Builds one stable prefix of weighted root particles.
+    pub(super) fn sample_batch(
+        &self,
+        count: usize,
+        mode: RootBeliefMode,
+    ) -> Vec<RootBeliefParticle> {
+        // A public state can reject a determinization when its missing-suit
+        // constraints have no feasible allocation. Keep the normal path at
+        // the requested budget, and only spend extra sampling work when a
+        // rejected draw actually leaves the batch short.
+        let mut particles: Vec<_> = (0..count)
+            .into_par_iter()
+            .filter_map(|id| self.sample_weighted(id as u64, mode))
+            .collect();
+        let missing = count.saturating_sub(particles.len());
+        if missing != 0 {
+            let extra_attempts = missing.saturating_mul(4);
+            let extra: Vec<_> = (count as u64..count as u64 + extra_attempts as u64)
+                .into_par_iter()
+                .filter_map(|id| self.sample_weighted(id, mode))
+                .collect();
+            particles.extend(extra);
+        }
+        particles.truncate(count);
+        particles
+    }
+
+    /// Applies one learned residual evaluation to one or more particle
+    /// streams. Candidate and particle order remain unchanged.
+    pub(super) fn apply_residuals(
+        &self,
+        evaluator: &dyn BeliefResidualEvaluator,
+        batches: &mut [&mut [RootBeliefParticle]],
+    ) -> Result<(), BeliefResidualError> {
+        let public = self.root.belief_public_features(self.actor);
+        let candidates: Vec<_> = batches
+            .iter()
+            .flat_map(|batch| batch.iter())
+            .map(|particle| particle.game.belief_candidate_features(self.actor))
+            .collect();
+        let mut residuals = vec![0.0_f32; candidates.len()];
+        evaluator.evaluate_residuals(&public, &candidates, &mut residuals)?;
+        for (index, (particle, residual)) in batches
+            .iter_mut()
+            .flat_map(|batch| batch.iter_mut())
+            .zip(residuals)
+            .enumerate()
+        {
+            if !residual.is_finite() {
+                return Err(BeliefResidualError::NonFinite { index });
+            }
+            particle.log_likelihood += f64::from(residual);
+        }
+        Ok(())
+    }
+}
+
+impl Game {
+    /// Returns public belief features for the current turn root.
+    #[cfg(any(feature = "belief-training", test))]
+    pub fn belief_root_public_features(&self) -> Option<BeliefPublicFeatures> {
+        let decision = self.decision()?;
+        (decision.phase == Phase::Turn).then(|| self.belief_public_features(decision.actor))
+    }
+
+    /// Returns the authoritative hidden allocation and its hand-written
+    /// posterior offset. This method is intended for analysis and training
+    /// labels, not for deployed policy input.
+    #[cfg(any(feature = "belief-training", test))]
+    pub fn belief_root_candidate(&self) -> Option<BeliefRootCandidate> {
+        let decision = self.decision()?;
+        if decision.phase != Phase::Turn {
+            return None;
+        }
+        let history = PublicHistory::from_game(self);
+        Some(BeliefRootCandidate {
+            features: self.belief_candidate_features(decision.actor),
+            handwritten_log_weight: world_log_likelihood_ratio(self, decision.actor, &history),
+        })
+    }
+
+    /// Samples a stable prefix from the current turn information-set proposal.
+    /// Existing proposal IDs do not change when `count` grows.
+    #[cfg(any(feature = "belief-training", test))]
+    pub fn belief_root_proposals(
+        &self,
+        base_seed: u64,
+        count: usize,
+    ) -> Option<Vec<BeliefRootCandidate>> {
+        let decision = self.decision()?;
+        let sampler = RootBeliefSampler::new(self, decision.actor, base_seed)?;
+        let particles = sampler.sample_batch(count, RootBeliefMode::Posterior);
+        Some(
+            particles
+                .into_iter()
+                .map(|particle| BeliefRootCandidate {
+                    features: particle.game.belief_candidate_features(decision.actor),
+                    handwritten_log_weight: particle.log_likelihood,
+                })
+                .collect(),
+        )
     }
 }
 
@@ -1016,6 +1168,42 @@ fn all_tiles() -> impl Iterator<Item = Tile> {
 mod tests {
     use super::*;
 
+    struct WallResidual;
+
+    impl BeliefResidualEvaluator for WallResidual {
+        fn evaluate_residuals(
+            &self,
+            _public: &BeliefPublicFeatures,
+            candidates: &[crate::BeliefCandidateFeatures],
+            output: &mut [f32],
+        ) -> Result<(), BeliefResidualError> {
+            if candidates.len() != output.len() {
+                return Err(BeliefResidualError::BatchLength {
+                    candidates: candidates.len(),
+                    outputs: output.len(),
+                });
+            }
+            for (candidate, residual) in candidates.iter().zip(output) {
+                *residual = f32::from(candidate.live_wall[0]) * 0.25;
+            }
+            Ok(())
+        }
+    }
+
+    struct NonFiniteResidual;
+
+    impl BeliefResidualEvaluator for NonFiniteResidual {
+        fn evaluate_residuals(
+            &self,
+            _public: &BeliefPublicFeatures,
+            _candidates: &[crate::BeliefCandidateFeatures],
+            output: &mut [f32],
+        ) -> Result<(), BeliefResidualError> {
+            output.fill(f32::NAN);
+            Ok(())
+        }
+    }
+
     fn observed_turn(seed: u64) -> Game {
         let mut game = Game::new(seed);
         for _ in 0..MAX_PROJECTION_ACTIONS {
@@ -1062,6 +1250,118 @@ mod tests {
             );
         }
         assert_eq!(short, long[..4]);
+    }
+
+    #[test]
+    fn public_root_proposals_share_the_production_sampler_prefix() {
+        let game = observed_turn(1_021);
+        let short = game
+            .belief_root_proposals(0x4ae8_20cd, 4)
+            .expect("turn root supports belief proposals");
+        let long = game
+            .belief_root_proposals(0x4ae8_20cd, 8)
+            .expect("turn root supports belief proposals");
+        let truth = game
+            .belief_root_candidate()
+            .expect("turn root exposes one training label");
+
+        assert_eq!(short, long[..4]);
+        assert_eq!(
+            truth.features,
+            game.belief_candidate_features(game.decision().expect("turn root has an actor").actor,),
+        );
+        assert_eq!(
+            game.belief_root_public_features(),
+            game.decision()
+                .map(|decision| game.belief_public_features(decision.actor)),
+        );
+    }
+
+    #[test]
+    fn residual_batch_updates_multiple_particle_streams() {
+        let game = observed_turn(1_022);
+        let actor = game.decision().expect("turn root has an actor").actor;
+        let sampler = RootBeliefSampler::new(&game, actor, 0x052f_901b)
+            .expect("turn root supports belief particles");
+        let baseline = sampler.sample_batch(8, RootBeliefMode::Posterior);
+        let mut learned = sampler.sample_batch(8, RootBeliefMode::Posterior);
+        let mut validation = sampler.sample_batch(4, RootBeliefMode::Posterior);
+        let validation_baseline = sampler.sample_batch(4, RootBeliefMode::Posterior);
+        let mut batches = [learned.as_mut_slice(), validation.as_mut_slice()];
+        sampler
+            .apply_residuals(&WallResidual, &mut batches)
+            .expect("finite residuals are accepted");
+
+        assert_eq!(baseline.len(), learned.len());
+        for (base, adjusted) in baseline.iter().zip(&learned) {
+            assert_eq!(base.game, adjusted.game);
+            let residual =
+                f64::from(base.game.belief_candidate_features(actor).live_wall[0]) * 0.25;
+            assert_eq!(adjusted.log_likelihood, base.log_likelihood + residual);
+        }
+        for (base, adjusted) in validation_baseline.iter().zip(&validation) {
+            let residual =
+                f64::from(base.game.belief_candidate_features(actor).live_wall[0]) * 0.25;
+            assert_eq!(adjusted.log_likelihood, base.log_likelihood + residual);
+        }
+
+        let mut invalid = sampler.sample_batch(8, RootBeliefMode::Posterior);
+        let mut invalid_batches = [invalid.as_mut_slice()];
+        assert!(matches!(
+            sampler.apply_residuals(&NonFiniteResidual, &mut invalid_batches),
+            Err(BeliefResidualError::NonFinite { index: 0 }),
+        ));
+    }
+
+    #[test]
+    fn oracle_particles_preserve_hidden_allocation_and_resample_future() {
+        let game = observed_turn(1_023);
+        let actor = game.decision().expect("turn has an actor").actor;
+        let sampler = RootBeliefSampler::new(&game, actor, 0x7f83_a019)
+            .expect("the observed turn has an information set");
+        let first = sampler
+            .sample_weighted(3, RootBeliefMode::OracleHidden)
+            .expect("oracle particle has support");
+        let repeated = sampler
+            .sample_weighted(3, RootBeliefMode::OracleHidden)
+            .expect("repeated oracle particle has support");
+        let second = sampler
+            .sample_weighted(4, RootBeliefMode::OracleHidden)
+            .expect("second oracle particle has support");
+
+        assert_eq!(first.log_likelihood, 0.0);
+        assert_eq!(first.game, repeated.game);
+        assert_ne!(first.game, second.game);
+        for seat in Seat::ALL {
+            assert_eq!(first.game.concealed(seat), game.concealed(seat));
+            assert_eq!(first.game.locked(seat), game.locked(seat));
+        }
+        let mut expected = [0; crate::game::ORACLE_TILE_COUNT_WIDTH];
+        let mut actual = [0; crate::game::ORACLE_TILE_COUNT_WIDTH];
+        game.oracle_tile_counts_into(&mut expected)
+            .expect("root oracle buffer is valid");
+        first
+            .game
+            .oracle_tile_counts_into(&mut actual)
+            .expect("sample oracle buffer is valid");
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn uniform_particles_ignore_public_history_likelihood() {
+        let game = observed_turn(1_027);
+        let actor = game.decision().expect("turn has an actor").actor;
+        let sampler = RootBeliefSampler::new(&game, actor, 0x392c_61a8)
+            .expect("the observed turn has an information set");
+        let particle = sampler
+            .sample_weighted(0, RootBeliefMode::Uniform)
+            .expect("uniform particle has support");
+
+        assert_eq!(particle.log_likelihood, 0.0);
+        assert_eq!(
+            super::super::public_state_hash(&particle.game, actor),
+            super::super::public_state_hash(&game, actor)
+        );
     }
 
     #[test]

@@ -1,15 +1,19 @@
 use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-use crate::ActionId;
 use crate::game::{
     Game, LegalActions, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, Phase,
     RIVER_OBSERVATION_WIDTH, TILE_OBSERVATION_WIDTH,
 };
+#[cfg(feature = "planner-analysis")]
+use crate::rules::ev::RuleEvConfig;
 use crate::rules::{
     hand::{Holding, mask_tiles},
     opening,
 };
+#[cfg(feature = "planner-analysis")]
+use crate::types::PLAYER_COUNT;
 use crate::types::{Seat, Tile};
+use crate::{ActionId, BeliefResidualError, BeliefResidualEvaluator};
 
 mod belief;
 mod graph;
@@ -32,6 +36,7 @@ const MAX_CANDIDATE_STATES: u32 = 200_000;
 const MAX_BELIEF_WORLDS: u16 = 256;
 const MAX_RESPONSE_WORLDS: u16 = 256;
 const MAX_SEARCH_ITERATIONS: u16 = 4_096;
+pub const RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS: u16 = 9;
 const MAX_ROLLOUT_ACTIONS: usize = 1_024;
 const SEARCH_SEED_DOMAIN: u64 = 0x6b82_12f4_c938_d0a7;
 const BELIEF_SEED_DOMAIN: u64 = 0xd14f_3a6c_92e7_580b;
@@ -59,6 +64,214 @@ pub struct RulePlannerSearchStats {
     pub hazard_candidates: u64,
     pub hazard_loss_millipoints: u64,
     pub hazard_won_loss_millipoints: u64,
+}
+
+/// Root-particle distribution used by planner analysis builds.
+///
+/// `OracleHidden` reads the authoritative hidden allocation and is never a
+/// deployable policy. It independently resamples the future wall order.
+#[cfg(feature = "planner-analysis")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RulePlannerRootBelief {
+    #[default]
+    Posterior,
+    Uniform,
+    OracleHidden,
+}
+
+/// One observation-only policy used by a known continuation profile.
+///
+/// `PlannerBaseline` deliberately disables paired root search. It retains the
+/// remaining planner configuration and represents the fixed policy improved
+/// by one root-search decision.
+#[cfg(feature = "planner-analysis")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RulePlannerContinuationPolicy {
+    Fast,
+    Ev(RuleEvConfig),
+    PlannerBaseline(RulePlannerConfig),
+}
+
+/// Frozen continuation policy assigned to each seat in an analysis rollout.
+///
+/// Each policy receives only the current actor's ordinary policy inputs. The
+/// profile reveals strategy identity to the diagnostic search, but it does not
+/// expose another seat's concealed hand to the acting policy.
+#[cfg(feature = "planner-analysis")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RulePlannerContinuationProfile {
+    policies: [RulePlannerContinuationPolicy; PLAYER_COUNT],
+}
+
+#[cfg(feature = "planner-analysis")]
+impl RulePlannerContinuationProfile {
+    pub const fn new(policies: [RulePlannerContinuationPolicy; PLAYER_COUNT]) -> Self {
+        Self { policies }
+    }
+
+    pub const fn for_seat(self, seat: Seat) -> RulePlannerContinuationPolicy {
+        self.policies[seat.index()]
+    }
+}
+
+/// Continuation model used by planner analysis.
+///
+/// `Current` preserves the production proxy ensemble. `KnownPolicies` is an
+/// oracle diagnostic because deployed play cannot assume the opponents'
+/// strategy identities.
+#[cfg(feature = "planner-analysis")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RulePlannerContinuation {
+    #[default]
+    Current,
+    KnownPolicies(RulePlannerContinuationProfile),
+}
+
+/// Orthogonal root-belief and continuation settings for planner analysis.
+#[cfg(feature = "planner-analysis")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RulePlannerAnalysisOptions {
+    root_belief: RulePlannerRootBelief,
+    continuation: RulePlannerContinuation,
+}
+
+#[cfg(feature = "planner-analysis")]
+impl RulePlannerAnalysisOptions {
+    pub const fn new(root_belief: RulePlannerRootBelief) -> Self {
+        Self {
+            root_belief,
+            continuation: RulePlannerContinuation::Current,
+        }
+    }
+
+    pub const fn with_continuation(mut self, continuation: RulePlannerContinuation) -> Self {
+        self.continuation = continuation;
+        self
+    }
+
+    pub const fn root_belief(self) -> RulePlannerRootBelief {
+        self.root_belief
+    }
+
+    pub const fn continuation(self) -> RulePlannerContinuation {
+        self.continuation
+    }
+}
+
+/// One planner decision and its optional root-search diagnostic.
+///
+/// This type is exported only by the `planner-analysis` feature.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RulePlannerAnalysis {
+    action: ActionId,
+    search: Option<RulePlannerSearchAnalysis>,
+}
+
+impl RulePlannerAnalysis {
+    const fn without_search(action: ActionId) -> Self {
+        Self {
+            action,
+            search: None,
+        }
+    }
+
+    const fn from_search(search: RulePlannerSearchAnalysis) -> Self {
+        Self {
+            action: search.action(),
+            search: Some(search),
+        }
+    }
+
+    pub const fn action(self) -> ActionId {
+        self.action
+    }
+
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn search(self) -> Option<RulePlannerSearchAnalysis> {
+        self.search
+    }
+}
+
+/// Diagnostic for one root-search decision.
+///
+/// `outcome` determines the final action. An accepted proposal becomes the
+/// action; every other outcome retains `baseline`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct RulePlannerSearchAnalysis {
+    baseline: ActionId,
+    outcome: RulePlannerSearchOutcome,
+    rollouts: u64,
+    belief_residual_fallback: Option<bool>,
+}
+
+impl RulePlannerSearchAnalysis {
+    const fn new(baseline: ActionId, outcome: RulePlannerSearchOutcome, rollouts: u64) -> Self {
+        Self {
+            baseline,
+            outcome,
+            rollouts,
+            belief_residual_fallback: None,
+        }
+    }
+
+    const fn with_belief_residual(mut self, fallback: bool) -> Self {
+        self.belief_residual_fallback = Some(fallback);
+        self
+    }
+
+    const fn action(self) -> ActionId {
+        match self.outcome {
+            RulePlannerSearchOutcome::Accepted(proposal) => proposal,
+            RulePlannerSearchOutcome::NoProposal | RulePlannerSearchOutcome::Rejected(_) => {
+                self.baseline
+            }
+        }
+    }
+
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn baseline(self) -> ActionId {
+        self.baseline
+    }
+
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn outcome(self) -> RulePlannerSearchOutcome {
+        self.outcome
+    }
+
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn rollouts(self) -> u64 {
+        self.rollouts
+    }
+
+    /// Returns `None` when no learned residual was evaluated. `Some(true)`
+    /// identifies an atomic selection-and-validation fallback.
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn belief_residual_fallback(self) -> Option<bool> {
+        self.belief_residual_fallback
+    }
+}
+
+/// Result of the proposal and validation gates for one root search.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RulePlannerSearchOutcome {
+    NoProposal,
+    Rejected(ActionId),
+    Accepted(ActionId),
+}
+
+impl RulePlannerSearchOutcome {
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn proposal(self) -> Option<ActionId> {
+        match self {
+            Self::NoProposal => None,
+            Self::Rejected(proposal) | Self::Accepted(proposal) => Some(proposal),
+        }
+    }
+
+    #[cfg(any(feature = "planner-analysis", test))]
+    pub const fn accepted(self) -> bool {
+        matches!(self, Self::Accepted(_))
+    }
 }
 
 pub fn rule_planner_search_stats() -> RulePlannerSearchStats {
@@ -224,6 +437,17 @@ impl Default for RulePlannerConfig {
     }
 }
 
+fn validate_belief_residual_config(config: RulePlannerConfig) -> Result<(), BeliefResidualError> {
+    let actual = config.search_iterations();
+    if actual < RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS {
+        return Err(BeliefResidualError::SearchIterations {
+            actual,
+            minimum: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS,
+        });
+    }
+    Ok(())
+}
+
 impl Game {
     pub fn rule_planner_action(&self) -> Option<ActionId> {
         self.rule_planner_action_with_config(RulePlannerConfig::STANDARD)
@@ -240,6 +464,123 @@ impl Game {
             config.without_search(),
         ))
     }
+
+    /// Runs paired root search with a learned residual added to the hand-written
+    /// posterior log weight. Non-search decisions do not call the evaluator.
+    pub fn rule_planner_action_with_config_and_belief_residual(
+        &self,
+        config: RulePlannerConfig,
+        evaluator: &dyn BeliefResidualEvaluator,
+    ) -> Result<Option<ActionId>, BeliefResidualError> {
+        self.rule_planner_analysis_with_config_and_belief_residual_inner(config, evaluator)
+            .map(|analysis| analysis.map(RulePlannerAnalysis::action))
+    }
+
+    /// Runs paired root search with a learned belief residual and returns its
+    /// structured search diagnostic.
+    #[cfg(feature = "planner-analysis")]
+    pub fn rule_planner_analysis_with_config_and_belief_residual(
+        &self,
+        config: RulePlannerConfig,
+        evaluator: &dyn BeliefResidualEvaluator,
+    ) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
+        self.rule_planner_analysis_with_config_and_belief_residual_inner(config, evaluator)
+    }
+
+    fn rule_planner_analysis_with_config_and_belief_residual_inner(
+        &self,
+        config: RulePlannerConfig,
+        evaluator: &dyn BeliefResidualEvaluator,
+    ) -> Result<Option<RulePlannerAnalysis>, BeliefResidualError> {
+        validate_belief_residual_config(config)?;
+        let Some(legal) = self.legal_actions() else {
+            return Ok(None);
+        };
+        if legal.decision.phase == Phase::Turn && !legal.can_hu {
+            return search::paired_policy_improvement_analysis_with_residual(
+                self, &legal, config, evaluator,
+            );
+        }
+        Ok(Some(RulePlannerAnalysis::without_search(
+            planner_action_without_search(self, &legal, config.without_search()),
+        )))
+    }
+
+    /// Runs a planner root-belief ablation.
+    ///
+    /// This method is diagnostic. `OracleHidden` reads authoritative hidden
+    /// state and must not be used by a deployed policy.
+    #[cfg(feature = "planner-analysis")]
+    pub fn rule_planner_analysis_action_with_config(
+        &self,
+        config: RulePlannerConfig,
+        root_belief: RulePlannerRootBelief,
+    ) -> Option<ActionId> {
+        self.rule_planner_analysis_with_config(config, root_belief)
+            .map(RulePlannerAnalysis::action)
+    }
+
+    /// Runs a planner analysis with explicit root-belief and continuation
+    /// settings and returns only the selected action.
+    #[cfg(feature = "planner-analysis")]
+    pub fn rule_planner_analysis_action_with_options(
+        &self,
+        config: RulePlannerConfig,
+        options: RulePlannerAnalysisOptions,
+    ) -> Option<ActionId> {
+        self.rule_planner_analysis_with_options(config, options)
+            .map(RulePlannerAnalysis::action)
+    }
+
+    /// Runs a planner root-belief ablation and returns its search diagnostic.
+    ///
+    /// This method is diagnostic. `OracleHidden` reads authoritative hidden
+    /// state and must not be used by a deployed policy.
+    #[cfg(feature = "planner-analysis")]
+    pub fn rule_planner_analysis_with_config(
+        &self,
+        config: RulePlannerConfig,
+        root_belief: RulePlannerRootBelief,
+    ) -> Option<RulePlannerAnalysis> {
+        self.rule_planner_analysis_with_options(
+            config,
+            RulePlannerAnalysisOptions::new(root_belief),
+        )
+    }
+
+    /// Runs a planner analysis with explicit root-belief and continuation
+    /// settings and returns its search diagnostic.
+    #[cfg(feature = "planner-analysis")]
+    pub fn rule_planner_analysis_with_options(
+        &self,
+        config: RulePlannerConfig,
+        options: RulePlannerAnalysisOptions,
+    ) -> Option<RulePlannerAnalysis> {
+        let legal = self.legal_actions()?;
+        if config.search_iterations != 0 && legal.decision.phase == Phase::Turn && !legal.can_hu {
+            return search::paired_policy_improvement_analysis(
+                self,
+                &legal,
+                config,
+                options.root_belief.into(),
+                options.continuation.into(),
+            );
+        }
+        Some(RulePlannerAnalysis::without_search(
+            planner_action_without_search(self, &legal, config.without_search()),
+        ))
+    }
+}
+
+#[cfg(feature = "planner-analysis")]
+impl From<RulePlannerRootBelief> for belief::RootBeliefMode {
+    fn from(value: RulePlannerRootBelief) -> Self {
+        match value {
+            RulePlannerRootBelief::Posterior => Self::Posterior,
+            RulePlannerRootBelief::Uniform => Self::Uniform,
+            RulePlannerRootBelief::OracleHidden => Self::OracleHidden,
+        }
+    }
 }
 
 fn planner_action_without_search(
@@ -247,8 +588,27 @@ fn planner_action_without_search(
     legal: &LegalActions,
     config: RulePlannerConfig,
 ) -> ActionId {
+    planner_action_without_search_with_observation(game, legal, config, true)
+}
+
+/// Evaluates a frozen continuation without recording simulated policy work.
+#[cfg(feature = "planner-analysis")]
+fn planner_action_without_search_unobserved(
+    game: &Game,
+    legal: &LegalActions,
+    config: RulePlannerConfig,
+) -> ActionId {
+    planner_action_without_search_with_observation(game, legal, config, false)
+}
+
+fn planner_action_without_search_with_observation(
+    game: &Game,
+    legal: &LegalActions,
+    config: RulePlannerConfig,
+    observe: bool,
+) -> ActionId {
     match legal.decision.phase {
-        Phase::Turn => choose_turn(game, legal, config),
+        Phase::Turn => choose_turn(game, legal, config, observe),
         Phase::HuResponse | Phase::MeldResponse => response::choose(game, legal, config),
         Phase::Exchange => opening::choose_exchange(
             game.concealed(legal.decision.actor),
@@ -260,18 +620,27 @@ fn planner_action_without_search(
     }
 }
 
-fn choose_turn(game: &Game, legal: &LegalActions, config: RulePlannerConfig) -> ActionId {
+fn choose_turn(
+    game: &Game,
+    legal: &LegalActions,
+    config: RulePlannerConfig,
+    observe: bool,
+) -> ActionId {
     let actor = legal.decision.actor;
-    PLANNED_TURNS.fetch_add(1, AtomicOrdering::Relaxed);
+    if observe {
+        PLANNED_TURNS.fetch_add(1, AtomicOrdering::Relaxed);
+    }
     if legal.can_hu {
         return ActionId::HU;
     }
     let baseline = game.simple_rule_action();
 
     let best = plan_turn(game, legal, config, |hazards| {
-        record_turn_hazards(game, actor, legal, hazards);
+        if observe {
+            record_turn_hazards(game, actor, legal, hazards);
+        }
     });
-    if baseline.is_some_and(|action| action != best.action) {
+    if observe && baseline.is_some_and(|action| action != best.action) {
         TURN_OVERRIDES.fetch_add(1, AtomicOrdering::Relaxed);
     }
     best.action
@@ -508,6 +877,19 @@ fn mix_search_seed(mut value: u64) -> u64 {
 mod tests {
     use super::*;
 
+    struct UnexpectedResidual;
+
+    impl BeliefResidualEvaluator for UnexpectedResidual {
+        fn evaluate_residuals(
+            &self,
+            _public: &crate::BeliefPublicFeatures,
+            _candidates: &[crate::BeliefCandidateFeatures],
+            _output: &mut [f32],
+        ) -> Result<(), BeliefResidualError> {
+            panic!("an invalid residual search budget must fail before evaluation")
+        }
+    }
+
     #[test]
     fn config_rejects_out_of_range_budgets() {
         assert!(
@@ -539,6 +921,23 @@ mod tests {
             RulePlannerConfig::STANDARD
                 .with_search_iterations(MAX_SEARCH_ITERATIONS + 1)
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn learned_residual_rejects_an_insufficient_search_budget() {
+        let actual = RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS - 1;
+        let config = RulePlannerConfig::ROLLOUT
+            .with_search_iterations(actual)
+            .expect("budget below the learned minimum is a valid base configuration");
+
+        assert_eq!(
+            Game::new(17)
+                .rule_planner_action_with_config_and_belief_residual(config, &UnexpectedResidual),
+            Err(BeliefResidualError::SearchIterations {
+                actual,
+                minimum: RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS,
+            }),
         );
     }
 

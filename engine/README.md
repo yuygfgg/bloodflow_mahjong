@@ -7,7 +7,9 @@
 | 目录 | Package | 产物 |
 | --- | --- | --- |
 | [`core/`](core/) | `bloodflow-mahjong` | Rust 库和四个诊断 benchmark |
+| [`model-runtime/`](model-runtime/) | `bloodflow-mahjong-model-runtime` | Candle belief runtime 和 `belief-model-check` CLI |
 | [`pybind/`](pybind/) | `bloodflow-mahjong-pybind` | Python 扩展 `bloodflow_mahjong` |
+| [`tools/belief-dataset/`](tools/belief-dataset/) | `bloodflow-mahjong-belief-dataset` | `belief-dataset` CLI |
 | [`tools/rule-tournament/`](tools/rule-tournament/) | `bloodflow-mahjong-rule-tournament` | `rule-tournament` CLI |
 
 workspace 使用 Rust 2024 edition，最低 Rust 版本为 1.85。release profile 使用单 codegen unit、fat LTO 和 `panic=abort`。
@@ -47,6 +49,10 @@ cargo build --release --workspace --all-targets
 - `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。
 
 详细 Rust API 和配置示例见 [`core/README.md`](core/README.md)。状态机和信息边界见 [`../IMPLEMENTATION.md`](../IMPLEMENTATION.md)。
+
+## Belief residual
+
+可选的 belief residual 只修改 `rule-planner` 根节点的隐藏世界后验。`tools/belief-dataset` 生成带版本的 `safetensors` 数据；仓库根目录的 `learning/belief` 使用 PyTorch 训练；`model-runtime` 使用 Candle 在 CPU 上加载模型。完整操作流程见 [`../BELIEF_RESIDUAL.md`](../BELIEF_RESIDUAL.md)。
 
 ## 策略测评
 

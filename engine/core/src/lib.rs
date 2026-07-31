@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod action;
+mod belief;
 mod game;
 mod hand;
 mod rng;
@@ -18,6 +19,13 @@ pub use action::{
     ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
     ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, Action, ActionId, ActionMask,
     LEGAL_ACTION_MASK_WORDS,
+};
+#[cfg(any(feature = "belief-training", test))]
+pub use belief::BeliefRootCandidate;
+pub use belief::{
+    BELIEF_EVENT_FEATURE_WIDTH, BELIEF_EVENT_HISTORY_LENGTH, BELIEF_FEATURE_SCHEMA_VERSION,
+    BELIEF_OPPONENT_COUNT, BELIEF_PROPOSAL_STREAM_COUNT, BELIEF_TARGET_VERSION,
+    BeliefCandidateFeatures, BeliefPublicFeatures, BeliefResidualError, BeliefResidualEvaluator,
 };
 pub use game::{
     Batch, Decision, DiscardEvent, DrawEvent, DrawNotice, ENGINE_RULES_VERSION,
@@ -36,7 +44,13 @@ pub use hand::{
 pub use rules::ev::{RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense};
 pub use rules::fast::SIMPLE_RULE_ACTION_TERMINAL;
 pub use rules::planner::{
-    RulePlannerConfig, RulePlannerSearchStats, reset_rule_planner_search_stats,
-    rule_planner_search_stats,
+    RULE_PLANNER_MIN_BELIEF_RESIDUAL_SEARCH_ITERATIONS, RulePlannerConfig, RulePlannerSearchStats,
+    reset_rule_planner_search_stats, rule_planner_search_stats,
+};
+#[cfg(feature = "planner-analysis")]
+pub use rules::planner::{
+    RulePlannerAnalysis, RulePlannerAnalysisOptions, RulePlannerContinuation,
+    RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
+    RulePlannerSearchAnalysis, RulePlannerSearchOutcome,
 };
 pub use types::{ExchangeDirection, Meld, MeldKind, Seat, Suit, Tile, WinSource};
