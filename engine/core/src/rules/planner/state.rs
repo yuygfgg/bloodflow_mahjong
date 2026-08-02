@@ -1,9 +1,8 @@
 use crate::game::Game;
+use crate::hand::apply_bloodflow_win;
 use crate::rules::hand::Holding;
 use crate::types::{PLAYER_COUNT, Seat, Tile};
-use crate::{
-    ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten, evaluate_shanten, evaluate_win,
-};
+use crate::{ShantenAnalysis, WinEvaluation, WinFlags};
 
 /// Origin of the next draw represented by a planner public state.
 ///
@@ -66,33 +65,24 @@ impl PlanningPublicState {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(super) struct PlanningHand {
     pub(super) holding: Holding,
-    pub(super) has_won: bool,
     pub(super) max_win_multiplier: u32,
 }
 
 impl PlanningHand {
-    pub(super) const fn new(holding: Holding, has_won: bool, max_win_multiplier: u32) -> Self {
+    pub(super) fn new(mut holding: Holding, has_won: bool, max_win_multiplier: u32) -> Self {
+        holding.has_won = has_won;
         Self {
             holding,
-            has_won,
             max_win_multiplier,
         }
     }
 
     pub(super) fn analysis(self) -> ShantenAnalysis {
-        analyze_shanten(
-            &self.holding.concealed,
-            self.holding.melds(),
-            self.holding.missing,
-        )
+        self.holding.analysis()
     }
 
     pub(super) fn shanten(self) -> i8 {
-        evaluate_shanten(
-            &self.holding.concealed,
-            self.holding.melds(),
-            self.holding.missing,
-        )
+        self.holding.analysis().shanten
     }
 
     pub(super) fn with_draw(self, tile: Tile) -> Option<Self> {
@@ -110,31 +100,21 @@ impl PlanningHand {
     }
 
     pub(super) fn win_on_draw(self, tile: Tile, flags: WinFlags) -> Option<WinEvaluation> {
-        if self.holding.missing_count() != 0 {
-            return None;
-        }
-        evaluate_win(
-            &self.holding.concealed,
-            self.holding.melds(),
-            Some(tile),
-            flags,
-        )
+        self.holding.evaluate_win(Some(tile), flags)
     }
 
-    /// Applies the same lock expansion as `Game::apply_win`.
+    /// Applies the same stable-base transition as `Game::apply_win`.
     pub(super) fn after_win(mut self, required: Option<Tile>, evaluation: WinEvaluation) -> Self {
-        for (index, &selected) in evaluation.used.iter().enumerate() {
-            if selected == 0 {
-                continue;
-            }
-            let target = if required.is_some_and(|tile| tile.index() == index) {
-                selected.max(self.holding.locked[index].saturating_add(1))
-            } else {
-                selected.max(self.holding.locked[index])
-            };
-            self.holding.locked[index] = target.min(self.holding.concealed[index]);
-        }
-        self.has_won = true;
+        let applied = apply_bloodflow_win(
+            &self.holding.concealed,
+            &mut self.holding.locked,
+            &mut self.holding.win_base,
+            self.holding.has_won,
+            &evaluation.used,
+            required,
+        );
+        debug_assert!(applied, "a planned legal win must match its physical hand");
+        self.holding.has_won = true;
         self.max_win_multiplier = self.max_win_multiplier.max(evaluation.shape_multiplier);
         self
     }
@@ -159,9 +139,11 @@ mod tests {
         let holding = Holding {
             concealed: counts,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: Some(Suit::Dots),
+            has_won: false,
         };
         let state = PlanningHand::new(holding, false, 0);
         let winning_tile = tile(Suit::Characters, 9);
@@ -181,7 +163,7 @@ mod tests {
         let after = state.after_win(Some(winning_tile), win);
 
         assert_eq!(event_win.multiplier, win.multiplier * 4);
-        assert!(after.has_won);
+        assert!(after.holding.has_won);
         assert!(after.holding.locked[winning_tile.index()] > 0);
         assert!(after.max_win_multiplier > 0);
     }

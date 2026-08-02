@@ -1,9 +1,9 @@
 use core::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use crate::WinFlags;
 use crate::rules::hand::{Holding, all_tiles, mask_tiles};
 use crate::types::{TILE_COPIES, TILE_KIND_COUNT, Tile};
-use crate::{WinFlags, analyze_shanten, evaluate_win};
 
 use super::history::{DiscardOrigin, RiverEntry};
 
@@ -25,33 +25,31 @@ impl HandPotential {
         visible: &[u8; TILE_KIND_COUNT],
         has_won: bool,
     ) -> Self {
-        let analysis = analyze_shanten(&holding.concealed, holding.melds(), holding.missing);
+        let analysis = holding.analysis();
         let mut potential = Self {
             shanten: analysis.shanten,
             live_improvements: remaining_copies(analysis.improving_tiles, visible),
-            structure: structure_score(&holding.concealed),
+            structure: structure_score(&holding.evaluation_counts().unwrap_or(holding.concealed)),
             ..Self::default()
         };
 
         if analysis.shanten <= 0 || has_won {
-            let mut augmented = holding.concealed;
             for tile in all_tiles() {
                 if holding.missing == Some(tile.suit()) {
                     continue;
                 }
                 let copies = TILE_COPIES.saturating_sub(visible[tile.index()].min(TILE_COPIES));
-                if copies == 0 || augmented[tile.index()] >= TILE_COPIES {
+                if copies == 0 {
                     continue;
                 }
-                augmented[tile.index()] += 1;
-                if let Some(win) =
-                    evaluate_win(&augmented, holding.melds(), Some(tile), WinFlags::NONE)
-                {
+                let Some(with_tile) = holding.after_draw(tile) else {
+                    continue;
+                };
+                if let Some(win) = with_tile.evaluate_win(Some(tile), WinFlags::NONE) {
                     potential.live_waits += u16::from(copies);
                     potential.weighted_wait_value += u64::from(copies) * u64::from(win.multiplier);
                     potential.max_multiplier = potential.max_multiplier.max(win.multiplier);
                 }
-                augmented[tile.index()] -= 1;
             }
         }
         potential
@@ -297,9 +295,11 @@ mod tests {
         let holding = Holding {
             concealed,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: None,
+            has_won: false,
         };
         let visible = concealed;
         let probability = discard_likelihood(holding, tile(5), &visible, false)
@@ -317,9 +317,11 @@ mod tests {
         let holding = Holding {
             concealed,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: None,
+            has_won: false,
         };
         let entries = [
             RiverEntry {

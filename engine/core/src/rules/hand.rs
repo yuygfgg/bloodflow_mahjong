@@ -1,5 +1,11 @@
 use crate::game::Game;
+use crate::hand::{
+    ShantenAnalysis, analyze_shanten, bloodflow_evaluation_counts, evaluate_bloodflow_max_wait,
+    evaluate_bloodflow_win, evaluate_max_wait, evaluate_win, remove_tiles_for_meld,
+    stabilize_win_base,
+};
 use crate::types::{Meld, MeldKind, Seat, Suit, TILE_KIND_COUNT, Tile};
+use crate::{MaxWaitEvaluation, WinEvaluation, WinFlags};
 
 pub(crate) const DUMMY_MELD: Meld = Meld {
     tile: Tile::from_index_unchecked(0),
@@ -16,9 +22,11 @@ pub(crate) const DUMMY_MELD: Meld = Meld {
 pub(crate) struct Holding {
     pub(crate) concealed: [u8; TILE_KIND_COUNT],
     pub(crate) locked: [u8; TILE_KIND_COUNT],
+    pub(crate) win_base: [u8; TILE_KIND_COUNT],
     pub(crate) melds: [Meld; 4],
     pub(crate) meld_len: usize,
     pub(crate) missing: Option<Suit>,
+    pub(crate) has_won: bool,
 }
 
 impl Holding {
@@ -31,14 +39,58 @@ impl Holding {
         Self {
             concealed: *game.concealed(actor),
             locked: *game.locked(actor),
+            win_base: *game.win_base(actor),
             melds,
             meld_len,
             missing: game.missing_suit(actor),
+            has_won: game.has_won(actor),
         }
     }
 
     pub(crate) fn melds(&self) -> &[Meld] {
         &self.melds[..self.meld_len]
+    }
+
+    pub(crate) fn evaluate_win(
+        &self,
+        required: Option<Tile>,
+        flags: WinFlags,
+    ) -> Option<WinEvaluation> {
+        if self.missing_count() != 0 {
+            return None;
+        }
+        if self.has_won {
+            let counts = self.evaluation_counts()?;
+            evaluate_bloodflow_win(&counts, &self.win_base, self.melds(), required, flags)
+        } else {
+            evaluate_win(&self.concealed, self.melds(), required, flags)
+        }
+    }
+
+    pub(crate) fn max_wait(&self) -> Option<MaxWaitEvaluation> {
+        if self.has_won {
+            evaluate_bloodflow_max_wait(
+                &self.evaluation_counts()?,
+                &self.win_base,
+                self.melds(),
+                self.missing,
+            )
+        } else {
+            evaluate_max_wait(&self.concealed, self.melds(), self.missing)
+        }
+    }
+
+    pub(crate) fn analysis(&self) -> ShantenAnalysis {
+        let counts = self.evaluation_counts().unwrap_or(self.concealed);
+        analyze_shanten(&counts, self.melds(), self.missing)
+    }
+
+    pub(crate) fn evaluation_counts(&self) -> Option<[u8; TILE_KIND_COUNT]> {
+        if self.has_won {
+            bloodflow_evaluation_counts(&self.concealed, &self.locked, &self.win_base)
+        } else {
+            Some(self.concealed)
+        }
     }
 
     pub(crate) fn unlocked_count(&self, tile: Tile) -> u8 {
@@ -82,10 +134,7 @@ impl Holding {
     }
 
     pub(crate) fn after_draw(mut self, tile: Tile) -> Option<Self> {
-        if self.concealed[tile.index()] >= 4 {
-            return None;
-        }
-        self.concealed[tile.index()] += 1;
+        self.concealed[tile.index()] = self.concealed[tile.index()].checked_add(1)?;
         Some(self)
     }
 
@@ -94,19 +143,29 @@ impl Holding {
             return None;
         }
         self.concealed[tile.index()] -= 1;
+        if self.has_won {
+            let target_len = 13_usize.saturating_sub(3 * self.meld_len);
+            if !stabilize_win_base(
+                &self.concealed,
+                &mut self.locked,
+                &mut self.win_base,
+                target_len,
+            ) {
+                return None;
+            }
+        }
         Some(self)
     }
 
     fn remove_for_meld(&mut self, tile: Tile, amount: u8, allow_locked: bool) -> bool {
-        let index = tile.index();
-        if self.concealed[index] < amount || (!allow_locked && self.unlocked_count(tile) < amount) {
-            return false;
-        }
-        if allow_locked {
-            self.locked[index] -= self.locked[index].min(amount);
-        }
-        self.concealed[index] -= amount;
-        true
+        remove_tiles_for_meld(
+            &mut self.concealed,
+            &mut self.locked,
+            &mut self.win_base,
+            tile,
+            amount,
+            allow_locked,
+        )
     }
 
     fn push_meld(&mut self, meld: Meld) -> bool {
@@ -119,7 +178,8 @@ impl Holding {
     }
 
     pub(crate) fn after_pong(mut self, tile: Tile, source: Seat) -> Option<Self> {
-        if self.missing == Some(tile.suit())
+        if self.has_won
+            || self.missing == Some(tile.suit())
             || self.unlocked_len() < 3
             || !self.remove_for_meld(tile, 2, false)
             || !self.push_meld(Meld {
@@ -134,7 +194,8 @@ impl Holding {
     }
 
     pub(crate) fn after_exposed_kong(mut self, tile: Tile, source: Seat) -> Option<Self> {
-        if self.missing == Some(tile.suit())
+        if self.has_won
+            || self.missing == Some(tile.suit())
             || !self.remove_for_meld(tile, 3, false)
             || !self.push_meld(Meld {
                 tile,
@@ -173,12 +234,20 @@ impl Holding {
     }
 
     pub(crate) fn after_robbed_added_kong(mut self, tile: Tile) -> Option<Self> {
-        let index = tile.index();
-        if self.concealed[index] == 0 {
+        if !self.remove_for_meld(tile, 1, true) {
             return None;
         }
-        self.concealed[index] -= 1;
-        self.locked[index] = self.locked[index].min(self.concealed[index]);
+        if self.has_won {
+            let target_len = 13_usize.saturating_sub(3 * self.meld_len);
+            if !stabilize_win_base(
+                &self.concealed,
+                &mut self.locked,
+                &mut self.win_base,
+                target_len,
+            ) {
+                return None;
+            }
+        }
         Some(self)
     }
 }
@@ -248,9 +317,11 @@ mod tests {
         let mut holding = Holding {
             concealed: [0; TILE_KIND_COUNT],
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: None,
+            has_won: false,
         };
         holding.concealed[one.index()] = 2;
         holding.locked[one.index()] = 2;
@@ -267,9 +338,11 @@ mod tests {
         let mut holding = Holding {
             concealed: [0; TILE_KIND_COUNT],
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: Some(Suit::Characters),
+            has_won: false,
         };
         holding.concealed[tile.index()] = 4;
 
@@ -296,9 +369,11 @@ mod tests {
         let mut holding = Holding {
             concealed: [0; TILE_KIND_COUNT],
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 1,
             missing: None,
+            has_won: false,
         };
         holding.melds[0] = Meld {
             tile: characters,
@@ -309,5 +384,79 @@ mod tests {
         holding.concealed[dots.index()] = 1;
 
         assert_eq!(holding.suit_count(), 3);
+    }
+
+    fn post_win_added_kong_holding() -> (Holding, Tile, Tile, Tile) {
+        let kong_tile = Tile::from_index_unchecked(0);
+        let active_tile = Tile::from_index_unchecked(20);
+        let replacement_tile = Tile::from_index_unchecked(21);
+        let mut win_base = [0; TILE_KIND_COUNT];
+        for count in win_base.iter_mut().take(10) {
+            *count = 1;
+        }
+        let mut holding = Holding {
+            concealed: win_base,
+            locked: win_base,
+            win_base,
+            melds: [DUMMY_MELD; 4],
+            meld_len: 1,
+            missing: Some(Suit::Dots),
+            has_won: true,
+        };
+        holding.concealed[active_tile.index()] += 1;
+        holding.melds[0] = Meld {
+            tile: kong_tile,
+            kind: MeldKind::Pong,
+            source: Seat::EAST.next(),
+        };
+        (holding, kong_tile, active_tile, replacement_tile)
+    }
+
+    #[test]
+    fn added_kong_consumes_historical_references_before_the_stable_base() {
+        let (mut holding, kong_tile, _, _) = post_win_added_kong_holding();
+        holding.concealed[kong_tile.index()] += 1;
+        holding.locked[kong_tile.index()] += 1;
+        let original_base = holding.win_base;
+
+        let after = holding
+            .after_added_kong(kong_tile)
+            .expect("the historical fourth tile extends the Pong");
+
+        assert_eq!(after.win_base, original_base);
+        assert_eq!(
+            after.locked[kong_tile.index()],
+            original_base[kong_tile.index()]
+        );
+    }
+
+    #[test]
+    fn post_kong_discard_restores_a_consumed_stable_base_tile() {
+        let (holding, kong_tile, active_tile, replacement_tile) = post_win_added_kong_holding();
+
+        let after = holding
+            .after_added_kong(kong_tile)
+            .and_then(|holding| holding.after_draw(replacement_tile))
+            .and_then(|holding| holding.after_discard(active_tile))
+            .expect("the replacement draw restores the shortened base");
+
+        assert_eq!(after.win_base.iter().sum::<u8>(), 10);
+        assert_eq!(after.win_base[kong_tile.index()], 0);
+        assert_eq!(after.win_base[replacement_tile.index()], 1);
+        assert_eq!(after.locked, after.concealed);
+    }
+
+    #[test]
+    fn robbed_added_kong_restores_the_base_from_the_current_active_tile() {
+        let (holding, kong_tile, active_tile, _) = post_win_added_kong_holding();
+
+        let after = holding
+            .after_robbed_added_kong(kong_tile)
+            .expect("the current active tile restores the robbed base tile");
+
+        assert_eq!(after.win_base.iter().sum::<u8>(), 10);
+        assert_eq!(after.win_base[kong_tile.index()], 0);
+        assert_eq!(after.win_base[active_tile.index()], 1);
+        assert_eq!(after.locked, after.concealed);
     }
 }

@@ -2,10 +2,12 @@ use core::cmp::Ordering;
 
 use crate::game::{Batch, Game, GameError, LegalActions, Phase};
 use crate::types::{PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
-use crate::{ACTION_SPACE_SIZE, ActionId, WinFlags, analyze_shanten, evaluate_win};
+use crate::{ACTION_SPACE_SIZE, ActionId, WinFlags};
 
 use super::batch_policy_actions_into;
-use super::hand::{DUMMY_MELD, Holding, all_tiles, hand_structure_score, mask_tiles};
+#[cfg(test)]
+use super::hand::DUMMY_MELD;
+use super::hand::{Holding, all_tiles, hand_structure_score, mask_tiles};
 use super::opening;
 
 /// Sentinel written for terminal batch slots by [`Batch::rule_ev_actions_into`].
@@ -195,7 +197,7 @@ fn hand_quality(
             holding,
             exposure,
             quality.shanten,
-            analyze_shanten(&holding.concealed, holding.melds(), holding.missing).improving_tiles,
+            holding.analysis().improving_tiles,
             search_depth,
         );
     }
@@ -203,7 +205,7 @@ fn hand_quality(
 }
 
 fn static_hand_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> HandQuality {
-    let analysis = analyze_shanten(&holding.concealed, holding.melds(), holding.missing);
+    let analysis = holding.analysis();
     let waits = if analysis.shanten <= 0 {
         wait_quality(holding, exposure)
     } else {
@@ -214,7 +216,7 @@ fn static_hand_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> H
         live_improvements: remaining_copies(analysis.improving_tiles, exposure),
         one_draw_value: 0,
         waits,
-        structure: hand_structure_score(&holding.concealed),
+        structure: hand_structure_score(&holding.evaluation_counts().unwrap_or(holding.concealed)),
     }
 }
 
@@ -237,16 +239,7 @@ fn one_draw_value(
         let mut next_exposure = *exposure;
         next_exposure[tile.index()] = next_exposure[tile.index()].saturating_add(1).min(4);
 
-        let direct_win = if augmented.missing_count() == 0 {
-            evaluate_win(
-                &augmented.concealed,
-                augmented.melds(),
-                Some(tile),
-                WinFlags::NONE,
-            )
-        } else {
-            None
-        };
+        let direct_win = augmented.evaluate_win(Some(tile), WinFlags::NONE);
         let continuation = if let Some(win) = direct_win {
             2_000 + u64::from(win.multiplier.min(WAIT_MULTIPLIER_CAP)) * 200
         } else {
@@ -259,8 +252,7 @@ fn one_draw_value(
                 if quality.shanten < current_shanten {
                     let mut value = static_attack_value(quality);
                     if search_depth > 1 && (0..=2).contains(&quality.shanten) {
-                        let analysis =
-                            analyze_shanten(&after.concealed, after.melds(), after.missing);
+                        let analysis = after.analysis();
                         value = value.saturating_add(
                             one_draw_value(
                                 &after,
@@ -299,7 +291,6 @@ fn wait_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> WaitQual
         return WaitQuality::default();
     }
     let mut result = WaitQuality::default();
-    let mut augmented = holding.concealed;
     for tile in all_tiles() {
         if holding.missing == Some(tile.suit()) {
             continue;
@@ -308,17 +299,16 @@ fn wait_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> WaitQual
         if copies == 0 {
             continue;
         }
-        augmented[tile.index()] = augmented[tile.index()].saturating_add(1);
-        if let Some(evaluation) =
-            evaluate_win(&augmented, holding.melds(), Some(tile), WinFlags::NONE)
-        {
+        let Some(augmented) = holding.after_draw(tile) else {
+            continue;
+        };
+        if let Some(evaluation) = augmented.evaluate_win(Some(tile), WinFlags::NONE) {
             let multiplier = evaluation.multiplier.min(WAIT_MULTIPLIER_CAP);
             result.weighted_value += u64::from(copies) * u64::from(multiplier);
             result.live_copies += u16::from(copies);
             result.max_multiplier = result.max_multiplier.max(multiplier);
             result.distinct_tiles += 1;
         }
-        augmented[tile.index()] = holding.concealed[tile.index()];
     }
     result
 }
@@ -579,14 +569,11 @@ fn certain_wait_multiplier(game: &Game, opponent: Seat, tile: Tile) -> Option<u3
     if !game.has_won(opponent) || game.missing_suit(opponent) == Some(tile.suit()) {
         return None;
     }
-    let mut counts = *game.locked(opponent);
-    counts[tile.index()] = counts[tile.index()].saturating_add(1);
-    let mut melds = [DUMMY_MELD; 4];
-    let meld_len = game.meld_count(opponent);
-    for (index, meld) in melds.iter_mut().enumerate().take(meld_len) {
-        *meld = game.meld(opponent, index).expect("meld slots are dense");
-    }
-    evaluate_win(&counts, &melds[..meld_len], Some(tile), WinFlags::NONE)
+    let mut holding = Holding::from_game(game, opponent);
+    holding.concealed = holding.locked;
+    holding
+        .after_draw(tile)?
+        .evaluate_win(Some(tile), WinFlags::NONE)
         .map(|evaluation| evaluation.multiplier)
 }
 
@@ -607,7 +594,10 @@ fn choose_turn(game: &Game, actor: Seat, legal: &LegalActions, config: RuleEvCon
     let exposure = public_exposure(game, actor);
     let baseline = best_discard(game, actor, holding, legal.discard_mask, &exposure, config)
         .expect("a turn has a legal discard");
-    let seven_pairs = seven_pairs_shanten(&holding.concealed, holding.missing);
+    let seven_pairs = seven_pairs_shanten(
+        &holding.evaluation_counts().unwrap_or(holding.concealed),
+        holding.missing,
+    );
     let mut best_kong = None;
 
     if seven_pairs > 1 {
@@ -697,7 +687,10 @@ fn choose_meld_response(
     let holding = Holding::from_game(game, actor);
     let exposure = public_exposure(game, actor);
     let pass = hand_quality(&holding, &exposure, config.search_depth);
-    let seven_pairs = seven_pairs_shanten(&holding.concealed, holding.missing);
+    let seven_pairs = seven_pairs_shanten(
+        &holding.evaluation_counts().unwrap_or(holding.concealed),
+        holding.missing,
+    );
 
     if legal.can_exposed_kong
         && seven_pairs > 1
@@ -798,9 +791,11 @@ mod tests {
         Holding {
             concealed: counts,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: None,
+            has_won: false,
         }
     }
 

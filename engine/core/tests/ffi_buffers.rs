@@ -80,9 +80,15 @@ fn assert_observation_matches_public_state(
     for relative in 0..4 {
         let seat = viewer.offset(relative as u8);
         let locked_start = (2 + relative) * TILE_KIND_COUNT;
+        let expected_wins = game.public_win_tiles(seat);
+        let expected_tiles = if seat == viewer {
+            game.locked(seat)
+        } else {
+            &expected_wins
+        };
         assert_eq!(
             &tile_obs[locked_start..locked_start + TILE_KIND_COUNT],
-            game.locked(seat)
+            expected_tiles
         );
         for tile_index in 0..TILE_KIND_COUNT {
             let expected = discards

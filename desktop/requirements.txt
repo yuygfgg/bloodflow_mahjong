@@ -1,0 +1,3 @@
+PySide6>=6.6
+numpy>=1.26
+# bloodflow-mahjong: 由本仓库 engine/pybind 通过 maturin develop --release 安装

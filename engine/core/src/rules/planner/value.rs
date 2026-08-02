@@ -1,4 +1,3 @@
-use crate::evaluate_max_wait;
 use crate::game::{Game, SCORE_UNIT};
 use crate::types::{PLAYER_COUNT, Seat};
 
@@ -251,13 +250,11 @@ fn hand_wall_outcome(hand: PlanningHand) -> WallOutcome {
     if hand.holding.suit_count() == 3 {
         return WallOutcome::Flower;
     }
-    let wait_multiplier = evaluate_max_wait(
-        &hand.holding.concealed,
-        hand.holding.melds(),
-        hand.holding.missing,
-    )
-    .map_or(0, |wait| wait.evaluation.multiplier);
-    if wait_multiplier != 0 || hand.has_won {
+    let wait_multiplier = hand
+        .holding
+        .max_wait()
+        .map_or(0, |wait| wait.evaluation.multiplier);
+    if wait_multiplier != 0 || hand.holding.has_won {
         let multiplier = f64::from(wait_multiplier.max(hand.max_win_multiplier).max(1));
         if wait_multiplier != 0 {
             WallOutcome::Ready(multiplier)

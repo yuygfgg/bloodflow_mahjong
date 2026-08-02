@@ -5,7 +5,7 @@ use rayon::prelude::*;
 use crate::game::{Game, Phase, SCORE_UNIT, TerminationReason};
 use crate::rules::hand::Holding;
 use crate::types::{PLAYER_COUNT, Seat, TILE_KIND_COUNT, Tile};
-use crate::{Action, WinFlags, analyze_shanten, evaluate_max_wait, evaluate_win};
+use crate::{Action, WinFlags};
 
 use super::history::PublicHistory;
 use super::quality::{HandPotential, history_likelihood_ratio};
@@ -493,7 +493,8 @@ fn sampled_wall_outcome(world: &Game, seat: Seat) -> SampledWallOutcome {
         return SampledWallOutcome::Flower;
     }
 
-    let wait_multiplier = evaluate_max_wait(&holding.concealed, holding.melds(), holding.missing)
+    let wait_multiplier = holding
+        .max_wait()
         .map_or(0, |wait| wait.evaluation.multiplier);
     if wait_multiplier != 0 {
         SampledWallOutcome::Ready(wait_multiplier.max(world.max_win_multiplier(seat)).max(1))
@@ -802,9 +803,7 @@ fn projected_turn_event(
         Action::Hu => {
             let drawn = world.current_draw()?;
             let holding = Holding::from_game(world, source);
-            let evaluation = evaluate_win(
-                &holding.concealed,
-                holding.melds(),
+            let evaluation = holding.evaluate_win(
                 Some(drawn.tile),
                 WinFlags {
                     after_kong_draw: drawn.replacement,
@@ -845,14 +844,7 @@ fn fallback_opponent_turn_event(
     actor_future_wins: &WorldWinTable,
 ) -> Option<OpponentTurnEvent> {
     let holding = Holding::from_game(world, source).after_draw(drawn_tile)?;
-    if holding.missing_count() == 0
-        && let Some(evaluation) = evaluate_win(
-            &holding.concealed,
-            holding.melds(),
-            Some(drawn_tile),
-            WinFlags::NONE,
-        )
-    {
+    if let Some(evaluation) = holding.evaluate_win(Some(drawn_tile), WinFlags::NONE) {
         return Some(OpponentTurnEvent::SelfDraw(SampledWin {
             payout_multiplier: evaluation.multiplier,
             shape_multiplier: evaluation.shape_multiplier,
@@ -980,9 +972,7 @@ fn world_win_table(
             let Some(with_tile) = holding.after_draw(tile) else {
                 continue;
             };
-            let Some(evaluation) =
-                evaluate_win(&with_tile.concealed, with_tile.melds(), Some(tile), flags)
-            else {
+            let Some(evaluation) = with_tile.evaluate_win(Some(tile), flags) else {
                 continue;
             };
             table[tile.index()][opponent.index()] = Some(SampledWin {
@@ -1012,9 +1002,7 @@ fn world_wins_for_tile(
         let Some(with_tile) = holding.after_draw(tile) else {
             continue;
         };
-        let Some(evaluation) =
-            evaluate_win(&with_tile.concealed, with_tile.melds(), Some(tile), flags)
-        else {
+        let Some(evaluation) = with_tile.evaluate_win(Some(tile), flags) else {
             continue;
         };
         wins[opponent.index()] = Some(SampledWin {
@@ -1029,7 +1017,7 @@ fn win_candidate_mask(world: &Game, opponent: Seat, holding: &Holding) -> u32 {
     if world.has_won(opponent) {
         return (1_u32 << TILE_KIND_COUNT) - 1;
     }
-    let analysis = analyze_shanten(&holding.concealed, holding.melds(), holding.missing);
+    let analysis = holding.analysis();
     if analysis.shanten == 0 {
         analysis.improving_tiles
     } else {
@@ -1200,12 +1188,7 @@ mod tests {
                 let Some(with_tile) = holding.after_draw(tile) else {
                     continue;
                 };
-                let Some(evaluation) = evaluate_win(
-                    &with_tile.concealed,
-                    with_tile.melds(),
-                    Some(tile),
-                    WinFlags::NONE,
-                ) else {
+                let Some(evaluation) = with_tile.evaluate_win(Some(tile), WinFlags::NONE) else {
                     continue;
                 };
                 table[tile.index()][opponent.index()] = Some(SampledWin {

@@ -1,9 +1,9 @@
 use crate::game::{Batch, Game, GameError, LegalActions, Phase};
-use crate::types::{Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
-use crate::{ACTION_SPACE_SIZE, ActionId, analyze_shanten};
+use crate::types::{PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
+use crate::{ACTION_SPACE_SIZE, ActionId};
 
 use super::batch_policy_actions_into;
-use super::hand::{hand_structure_score, suit_structure_score};
+use super::hand::{Holding, hand_structure_score, suit_structure_score};
 
 /// Sentinel written for terminal batch slots by
 /// [`Batch::simple_rule_actions_into`].
@@ -14,7 +14,7 @@ impl Game {
     ///
     /// This policy is intended for cold-start opponents and regression tests,
     /// not as a strong Mahjong agent. It uses the current actor's concealed
-    /// hand and exchange selection plus public locked tiles, melds, and
+    /// hand and exchange selection plus public winning tiles, melds, and
     /// discards. It never reads opponents' concealed hands or the wall.
     pub fn simple_rule_action(&self) -> Option<ActionId> {
         let legal = self.legal_actions()?;
@@ -149,19 +149,21 @@ fn choose_turn(game: &Game, actor: Seat, legal: &LegalActions) -> ActionId {
         return ActionId::added_kong(tile);
     }
 
-    let counts = *game.concealed(actor);
+    let holding = Holding::from_game(game, actor);
     let exposure = public_exposure(game, actor);
-    let (melds, meld_count) = actor_melds(game, actor);
-    let missing = game.missing_suit(actor);
     let mut best: Option<(i8, u16, i32, u8, u8, u8)> = None;
     for tile in mask_tiles(legal.discard_mask) {
-        let mut remaining = counts;
-        remaining[tile.index()] -= 1;
-        let analysis = analyze_shanten(&remaining, &melds[..meld_count], missing);
+        let remaining = holding
+            .after_discard(tile)
+            .expect("the legal discard mask contains an active tile");
+        let counts = remaining
+            .evaluation_counts()
+            .expect("a legal holding has a consistent stable base");
+        let analysis = remaining.analysis();
         let candidate = (
             -analysis.shanten,
             remaining_improving_copies(analysis.improving_tiles, &exposure),
-            hand_structure_score(&remaining),
+            hand_structure_score(&counts),
             exposure[tile.index()],
             edge_distance(tile),
             u8::MAX - tile.as_u8(),
@@ -177,20 +179,6 @@ fn choose_turn(game: &Game, actor: Seat, legal: &LegalActions) -> ActionId {
     ActionId::discard(Tile::new(tile_index).expect("chosen tile index is valid"))
 }
 
-fn actor_melds(game: &Game, actor: Seat) -> ([Meld; 4], usize) {
-    let placeholder = Meld {
-        tile: Tile::new(0).expect("tile zero is valid"),
-        kind: MeldKind::Pong,
-        source: actor,
-    };
-    let mut melds = [placeholder; 4];
-    let count = game.meld_count(actor);
-    for (index, slot) in melds.iter_mut().enumerate().take(count) {
-        *slot = game.meld(actor, index).expect("meld slots are dense");
-    }
-    (melds, count)
-}
-
 fn remaining_improving_copies(mask: u32, exposure: &[u8; TILE_KIND_COUNT]) -> u16 {
     mask_tiles(mask)
         .map(|tile| u16::from(4_u8.saturating_sub(exposure[tile.index()].min(4))))
@@ -198,33 +186,7 @@ fn remaining_improving_copies(mask: u32, exposure: &[u8; TILE_KIND_COUNT]) -> u1
 }
 
 fn public_exposure(game: &Game, actor: Seat) -> [u8; TILE_KIND_COUNT] {
-    let mut exposure = *game.concealed(actor);
-    for seat in Seat::ALL {
-        if seat != actor {
-            add_counts(&mut exposure, game.locked(seat));
-        }
-        for index in 0..game.meld_count(seat) {
-            let meld = game.meld(seat, index).expect("meld slots are dense");
-            let amount = match meld.kind {
-                // Claimed discards remain in the chronological river, so only
-                // count the tiles contributed from the caller's hand here.
-                MeldKind::Pong => 2,
-                MeldKind::ExposedKong | MeldKind::AddedKong => 3,
-                MeldKind::ConcealedKong => 4,
-            };
-            exposure[meld.tile.index()] = exposure[meld.tile.index()].saturating_add(amount);
-        }
-    }
-    for (_, tile) in game.discards() {
-        exposure[tile.index()] = exposure[tile.index()].saturating_add(1);
-    }
-    exposure
-}
-
-fn add_counts(target: &mut [u8; TILE_KIND_COUNT], source: &[u8; TILE_KIND_COUNT]) {
-    for (target, source) in target.iter_mut().zip(source.iter().copied()) {
-        *target = target.saturating_add(source);
-    }
+    game.visible_tile_counts(actor)
 }
 
 fn suit_count(counts: &[u8; TILE_KIND_COUNT], suit: Suit) -> u8 {

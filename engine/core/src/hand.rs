@@ -222,6 +222,44 @@ pub struct MaxWaitEvaluation {
     pub evaluation: WinEvaluation,
 }
 
+#[derive(Clone, Copy)]
+struct TileRequirements {
+    minimum: [u8; TILE_KIND_COUNT],
+}
+
+impl TileRequirements {
+    fn for_tile(tile: Tile) -> Self {
+        let mut minimum = [0; TILE_KIND_COUNT];
+        minimum[tile.index()] = 1;
+        Self { minimum }
+    }
+
+    fn for_continuation(win_base: &[u8; TILE_KIND_COUNT], required: Option<Tile>) -> Option<Self> {
+        let mut minimum = *win_base;
+        if let Some(tile) = required {
+            minimum[tile.index()] = minimum[tile.index()].checked_add(1)?;
+        }
+        Some(Self { minimum })
+    }
+
+    fn accepts(self, used: &[u8; TILE_KIND_COUNT]) -> bool {
+        used.iter()
+            .zip(self.minimum)
+            .all(|(&used, minimum)| used >= minimum)
+    }
+
+    fn single_required_tile(self) -> Option<Tile> {
+        let mut required = self
+            .minimum
+            .iter()
+            .enumerate()
+            .filter(|(_, minimum)| **minimum != 0);
+        let (index, minimum) = required.next()?;
+        (*minimum == 1 && required.next().is_none())
+            .then(|| Tile::from_index_unchecked(index as u8))
+    }
+}
+
 /// A conventional structural shanten result for one concealed holding.
 ///
 /// `-1` means the holding already contains a winning structure and `0` means
@@ -461,21 +499,68 @@ pub fn evaluate_win(
     required: Option<Tile>,
     flags: WinFlags,
 ) -> Option<WinEvaluation> {
+    evaluate_win_with_requirement(
+        counts,
+        melds,
+        required.map(TileRequirements::for_tile),
+        flags,
+    )
+}
+
+/// Evaluates a later Blood Flow win while preserving the established base.
+///
+/// Historical winning-tile references are intentionally absent from `counts`.
+/// Every base tile and the tile received by the current event must participate
+/// in the selected winning structure.
+pub(crate) fn evaluate_bloodflow_win(
+    counts: &[u8; TILE_KIND_COUNT],
+    win_base: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    required: Option<Tile>,
+    flags: WinFlags,
+) -> Option<WinEvaluation> {
+    if win_base
+        .iter()
+        .zip(counts)
+        .any(|(&base_count, &count)| base_count > count)
+    {
+        return None;
+    }
+    let requirement = TileRequirements::for_continuation(win_base, required)?;
+    evaluate_win_with_requirement(counts, melds, Some(requirement), flags)
+}
+
+pub(crate) fn is_bloodflow_winning(
+    counts: &[u8; TILE_KIND_COUNT],
+    win_base: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    required: Option<Tile>,
+) -> bool {
+    evaluate_bloodflow_win(counts, win_base, melds, required, WinFlags::NONE).is_some()
+}
+
+fn evaluate_win_with_requirement(
+    counts: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    requirement: Option<TileRequirements>,
+    flags: WinFlags,
+) -> Option<WinEvaluation> {
     if melds.len() > 4 {
         return None;
     }
 
     let counts = capped_counts(counts);
     let mut best = None;
+    let required = requirement.and_then(TileRequirements::single_required_tile);
 
     if can_standard(&counts, 4 - melds.len(), required) {
-        let mut search = StandardSearch::new(counts, melds, required);
+        let mut search = StandardSearch::new(counts, melds, requirement);
         search.run();
         best = search.best;
     }
 
     if melds.is_empty() && can_seven_pairs(&counts, required) {
-        search_seven_pairs(&counts, required, &mut best);
+        search_seven_pairs(&counts, requirement, &mut best);
     }
 
     let mut result = best?;
@@ -571,6 +656,189 @@ pub fn evaluate_max_wait(
     }
 }
 
+/// Finds the best legal next win for an expanded Blood Flow holding.
+pub(crate) fn evaluate_bloodflow_max_wait(
+    counts: &[u8; TILE_KIND_COUNT],
+    win_base: &[u8; TILE_KIND_COUNT],
+    melds: &[Meld],
+    missing_suit: Option<Suit>,
+) -> Option<MaxWaitEvaluation> {
+    if melds.len() > 4
+        || win_base
+            .iter()
+            .zip(counts)
+            .any(|(&base_count, &count)| base_count > count)
+    {
+        return None;
+    }
+    if let Some(suit) = missing_suit {
+        let start = suit as usize * RANK_COUNT;
+        if counts[start..start + RANK_COUNT]
+            .iter()
+            .any(|&count| count != 0)
+            || melds.iter().any(|meld| meld.tile.suit() == suit)
+        {
+            return None;
+        }
+    }
+
+    let mut augmented = *counts;
+    let mut best: Option<MaxWaitEvaluation> = None;
+    for index in 0..TILE_KIND_COUNT {
+        let tile = Tile::from_index_unchecked(index as u8);
+        if missing_suit == Some(tile.suit()) || counts[index] >= 4 {
+            continue;
+        }
+        augmented[index] += 1;
+        if let Some(evaluation) =
+            evaluate_bloodflow_win(&augmented, win_base, melds, Some(tile), WinFlags::NONE)
+            && best
+                .as_ref()
+                .is_none_or(|current| evaluation.multiplier > current.evaluation.multiplier)
+        {
+            best = Some(MaxWaitEvaluation {
+                winning_tile: tile,
+                evaluation,
+            });
+        }
+        augmented[index] = counts[index];
+    }
+    best
+}
+
+/// Builds the only tile multiset which may participate in a later win.
+///
+/// `locked` can contain many historical winning-tile references. Those
+/// references remain visible and non-discardable, but they cannot alter the
+/// established winning base.
+pub(crate) fn bloodflow_evaluation_counts(
+    concealed: &[u8; TILE_KIND_COUNT],
+    locked: &[u8; TILE_KIND_COUNT],
+    win_base: &[u8; TILE_KIND_COUNT],
+) -> Option<[u8; TILE_KIND_COUNT]> {
+    let mut counts = [0; TILE_KIND_COUNT];
+    for index in 0..TILE_KIND_COUNT {
+        if win_base[index] > locked[index] || locked[index] > concealed[index] {
+            return None;
+        }
+        counts[index] = win_base[index].checked_add(concealed[index] - locked[index])?;
+    }
+    Some(counts)
+}
+
+/// Locks the tiles selected by a win and establishes its stable continuation
+/// base. Returns false if the selected structure is inconsistent with the
+/// physical hand state.
+pub(crate) fn apply_bloodflow_win(
+    concealed: &[u8; TILE_KIND_COUNT],
+    locked: &mut [u8; TILE_KIND_COUNT],
+    win_base: &mut [u8; TILE_KIND_COUNT],
+    has_won: bool,
+    used: &[u8; TILE_KIND_COUNT],
+    required: Option<Tile>,
+) -> bool {
+    let mut next_locked = *locked;
+    let mut next_base = *used;
+
+    for index in 0..TILE_KIND_COUNT {
+        let contribution = if has_won {
+            let Some(contribution) = used[index].checked_sub(win_base[index]) else {
+                return false;
+            };
+            contribution
+        } else {
+            used[index]
+        };
+        if contribution > concealed[index].saturating_sub(locked[index]) {
+            return false;
+        }
+        let Some(updated) = next_locked[index].checked_add(contribution) else {
+            return false;
+        };
+        if updated > concealed[index] {
+            return false;
+        }
+        next_locked[index] = updated;
+    }
+
+    let continuation_tile = required
+        .map(Tile::index)
+        .or_else(|| next_base.iter().position(|&count| count != 0));
+    let Some(continuation_tile) = continuation_tile else {
+        return false;
+    };
+    let Some(remaining) = next_base[continuation_tile].checked_sub(1) else {
+        return false;
+    };
+    next_base[continuation_tile] = remaining;
+
+    *locked = next_locked;
+    *win_base = next_base;
+    true
+}
+
+/// Removes hand tiles for a meld. Active tiles are consumed first, followed by
+/// historical win references, and finally by the stable base when required.
+pub(crate) fn remove_tiles_for_meld(
+    concealed: &mut [u8; TILE_KIND_COUNT],
+    locked: &mut [u8; TILE_KIND_COUNT],
+    win_base: &mut [u8; TILE_KIND_COUNT],
+    tile: Tile,
+    amount: u8,
+    allow_locked: bool,
+) -> bool {
+    let index = tile.index();
+    let unlocked = concealed[index].saturating_sub(locked[index]);
+    if (!allow_locked && unlocked < amount) || concealed[index] < amount {
+        return false;
+    }
+
+    let from_unlocked = unlocked.min(amount);
+    let mut remaining = amount - from_unlocked;
+    let historical = locked[index].saturating_sub(win_base[index]);
+    let from_historical = historical.min(remaining);
+    remaining -= from_historical;
+    if remaining > win_base[index] {
+        return false;
+    }
+
+    concealed[index] -= amount;
+    locked[index] -= from_historical + remaining;
+    win_base[index] -= remaining;
+    true
+}
+
+/// Replaces stable-base tiles consumed by a Kong with the active tiles left
+/// after the player's discard or after a robbed added Kong.
+pub(crate) fn stabilize_win_base(
+    concealed: &[u8; TILE_KIND_COUNT],
+    locked: &mut [u8; TILE_KIND_COUNT],
+    win_base: &mut [u8; TILE_KIND_COUNT],
+    target_len: usize,
+) -> bool {
+    let current_len: usize = win_base.iter().map(|&count| usize::from(count)).sum();
+    if current_len >= target_len {
+        return current_len == target_len;
+    }
+
+    let mut next_locked = *locked;
+    let mut next_base = *win_base;
+    let mut needed = target_len - current_len;
+    for index in 0..TILE_KIND_COUNT {
+        let available = concealed[index].saturating_sub(next_locked[index]) as usize;
+        let taken = available.min(needed);
+        next_locked[index] += taken as u8;
+        next_base[index] += taken as u8;
+        needed -= taken;
+        if needed == 0 {
+            *locked = next_locked;
+            *win_base = next_base;
+            return true;
+        }
+    }
+    false
+}
+
 fn standard_multiplier_upper_bound(melds: &[Meld]) -> u32 {
     if melds.len() == 4 {
         if melds.iter().all(|meld| meld.kind.is_kong()) {
@@ -598,7 +866,11 @@ fn evaluate_max_seven_pairs(
         let capped = capped_counts(&augmented);
         if can_seven_pairs(&capped, Some(tile)) {
             let mut evaluation = None;
-            search_seven_pairs(&capped, Some(tile), &mut evaluation);
+            search_seven_pairs(
+                &capped,
+                Some(TileRequirements::for_tile(tile)),
+                &mut evaluation,
+            );
             if let Some(evaluation) = evaluation
                 && best.as_ref().is_none_or(|current: &MaxWaitEvaluation| {
                     evaluation.multiplier > current.evaluation.multiplier
@@ -798,7 +1070,7 @@ struct StandardSearch<'a> {
     used: [u8; TILE_KIND_COUNT],
     codes: [usize; SUIT_COUNT],
     exposed: &'a [Meld],
-    required: Option<usize>,
+    requirement: Option<TileRequirements>,
     needed_melds: usize,
     exposed_groups_have_terminal: bool,
     table: &'static [u16],
@@ -806,13 +1078,17 @@ struct StandardSearch<'a> {
 }
 
 impl<'a> StandardSearch<'a> {
-    fn new(counts: [u8; TILE_KIND_COUNT], exposed: &'a [Meld], required: Option<Tile>) -> Self {
+    fn new(
+        counts: [u8; TILE_KIND_COUNT],
+        exposed: &'a [Meld],
+        requirement: Option<TileRequirements>,
+    ) -> Self {
         Self {
             codes: suit_codes(&counts),
             available: counts,
             used: [0; TILE_KIND_COUNT],
             exposed,
-            required: required.map(Tile::index),
+            requirement,
             needed_melds: 4 - exposed.len(),
             exposed_groups_have_terminal: exposed.iter().all(|meld| meld.tile.is_terminal()),
             table: suit_shapes(),
@@ -833,16 +1109,9 @@ impl<'a> StandardSearch<'a> {
             self.codes[suit] -= 2 * POW5[rank];
 
             if can_combine_shapes(self.table, self.codes, self.needed_melds, false) {
-                let required_used = self.required == Some(pair);
                 let groups_have_terminal =
                     is_terminal_index(pair) && self.exposed_groups_have_terminal;
-                self.search_melds(
-                    0,
-                    self.needed_melds,
-                    false,
-                    groups_have_terminal,
-                    required_used,
-                );
+                self.search_melds(0, self.needed_melds, false, groups_have_terminal);
             }
 
             self.codes[suit] += 2 * POW5[rank];
@@ -857,10 +1126,12 @@ impl<'a> StandardSearch<'a> {
         remaining: usize,
         has_sequence: bool,
         groups_have_terminal: bool,
-        required_used: bool,
     ) {
         if remaining == 0 {
-            if self.required.is_some() && !required_used {
+            if self
+                .requirement
+                .is_some_and(|required| !required.accepts(&self.used))
+            {
                 return;
             }
             let candidate =
@@ -887,7 +1158,6 @@ impl<'a> StandardSearch<'a> {
                         remaining - 1,
                         has_sequence,
                         groups_have_terminal && is_terminal_index(tile),
-                        required_used || self.required == Some(tile),
                     );
                 }
 
@@ -916,15 +1186,11 @@ impl<'a> StandardSearch<'a> {
             self.codes[suit] -= delta;
 
             if can_combine_shapes(self.table, self.codes, remaining - 1, false) {
-                let contains_required = self
-                    .required
-                    .is_some_and(|tile| (offset + start..offset + start + 3).contains(&tile));
                 self.search_melds(
                     group,
                     remaining - 1,
                     true,
                     groups_have_terminal && matches!(start, 0 | 6),
-                    required_used || contains_required,
                 );
             }
 
@@ -1026,10 +1292,9 @@ struct PairFeatures {
     all_two_five_eight: bool,
     all_simples: bool,
     all_terminals: bool,
-    required_used: bool,
 }
 
-const PAIR_STATE_COUNT: usize = 4_096;
+const PAIR_STATE_COUNT: usize = 2_048;
 
 impl PairFeatures {
     const fn encode(self) -> usize {
@@ -1039,7 +1304,6 @@ impl PairFeatures {
             | (self.all_two_five_eight as usize) << 8
             | (self.all_simples as usize) << 9
             | (self.all_terminals as usize) << 10
-            | (self.required_used as usize) << 11
     }
 
     const fn decode(value: usize) -> Self {
@@ -1050,14 +1314,13 @@ impl PairFeatures {
             all_two_five_eight: value & (1 << 8) != 0,
             all_simples: value & (1 << 9) != 0,
             all_terminals: value & (1 << 10) != 0,
-            required_used: value & (1 << 11) != 0,
         }
     }
 }
 
 fn search_seven_pairs(
     counts: &[u8; TILE_KIND_COUNT],
-    required: Option<Tile>,
+    requirement: Option<TileRequirements>,
     best: &mut Option<WinEvaluation>,
 ) {
     let mut current = [PairState::EMPTY; PAIR_STATE_COUNT];
@@ -1069,14 +1332,12 @@ fn search_seven_pairs(
         all_two_five_eight: true,
         all_simples: true,
         all_terminals: true,
-        required_used: false,
     };
     current[initial.encode()] = PairState {
         reachable: true,
         used: [0; TILE_KIND_COUNT],
     };
 
-    let required = required.map(Tile::index);
     for (tile, &count) in counts.iter().enumerate() {
         next.fill(PairState::EMPTY);
         for (state_index, &state) in current.iter().enumerate() {
@@ -1095,7 +1356,6 @@ fn search_seven_pairs(
                     updated.all_two_five_eight &= matches!(rank, 1 | 4 | 7);
                     updated.all_simples &= !matches!(rank, 0 | 8);
                     updated.all_terminals &= matches!(rank, 0 | 8);
-                    updated.required_used |= required == Some(tile);
                 }
 
                 let destination = updated.encode();
@@ -1114,7 +1374,8 @@ fn search_seven_pairs(
             continue;
         }
         let features = PairFeatures::decode(state_index);
-        if features.pairs != 7 || (required.is_some() && !features.required_used) {
+        if features.pairs != 7 || requirement.is_some_and(|required| !required.accepts(&state.used))
+        {
             continue;
         }
         consider_candidate(best, score_seven_pairs(&state.used));
@@ -1383,6 +1644,57 @@ mod tests {
             evaluate_win(&counts, &[], Some(tile(Suit::Dots, 8)), WinFlags::NONE).unwrap();
         assert_eq!(evaluation.used.iter().sum::<u8>(), 14);
         assert_eq!(evaluation.used[tile(Suit::Bamboo, 9).index()], 0);
+    }
+
+    #[test]
+    fn bloodflow_win_cannot_reuse_a_historical_winning_tile() {
+        let mut completed = [0; TILE_KIND_COUNT];
+        for (suit, first_rank) in [
+            (Suit::Characters, 1),
+            (Suit::Characters, 4),
+            (Suit::Bamboo, 1),
+            (Suit::Bamboo, 4),
+        ] {
+            for rank in first_rank..first_rank + 3 {
+                add(&mut completed, suit, rank, 1);
+            }
+        }
+        add(&mut completed, Suit::Bamboo, 9, 2);
+        let mut win_base = completed;
+        win_base[tile(Suit::Bamboo, 9).index()] -= 1;
+        let incoming = tile(Suit::Characters, 1);
+        let mut counts = win_base;
+        counts[incoming.index()] += 1;
+
+        assert!(
+            evaluate_bloodflow_win(&counts, &win_base, &[], Some(incoming), WinFlags::NONE)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn bloodflow_win_accepts_a_tile_that_completes_the_stable_base() {
+        let mut counts = [0; TILE_KIND_COUNT];
+        for rank in 1..=3 {
+            add(&mut counts, Suit::Characters, rank, 1);
+        }
+        for rank in 4..=6 {
+            add(&mut counts, Suit::Bamboo, rank, 1);
+        }
+        add(&mut counts, Suit::Bamboo, 7, 3);
+        add(&mut counts, Suit::Bamboo, 8, 3);
+        add(&mut counts, Suit::Bamboo, 9, 2);
+        let incoming = tile(Suit::Bamboo, 9);
+        let mut win_base = counts;
+        win_base[incoming.index()] -= 1;
+
+        let evaluation =
+            evaluate_bloodflow_win(&counts, &win_base, &[], Some(incoming), WinFlags::NONE)
+                .expect("the new 9s completes the stable base");
+        assert_eq!(
+            evaluation.used[incoming.index()],
+            win_base[incoming.index()] + 1
+        );
     }
 
     #[test]

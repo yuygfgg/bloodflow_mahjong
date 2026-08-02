@@ -5,7 +5,6 @@ use std::sync::Arc;
 use rayon::prelude::*;
 
 use crate::WinFlags;
-use crate::analyze_shanten;
 use crate::game::{Game, SCORE_UNIT};
 use crate::rules::hand::{all_tiles, hand_structure_score, mask_tiles};
 use crate::types::{PLAYER_COUNT, Seat, TILE_COPIES, TILE_KIND_COUNT, Tile};
@@ -295,7 +294,7 @@ impl<'a> HandGraphPlanner<'a> {
             .iter()
             .map(|(_, hand)| hand.analysis().shanten)
             .min()?;
-        if !state.hand.has_won {
+        if !state.hand.holding.has_won {
             // Before the first win, shanten is a dominance constraint. The
             // sampled immediate hazard ranks equally advanced routes; only
             // terminal search may validate sacrificing hand progress.
@@ -439,10 +438,19 @@ impl<'a> HandGraphPlanner<'a> {
             .map(|tile| u16::from(hand.holding.unlocked_count(tile)))
             .sum();
         HandProgress {
-            shanten: Reverse(if hand.has_won { 0 } else { analysis.shanten }),
+            shanten: Reverse(if hand.holding.has_won {
+                0
+            } else {
+                analysis.shanten
+            }),
             live_improvements,
             distinct_improvements: analysis.improving_tiles.count_ones() as u8,
-            structure: hand_structure_score(&hand.holding.concealed),
+            structure: hand_structure_score(
+                &hand
+                    .holding
+                    .evaluation_counts()
+                    .unwrap_or(hand.holding.concealed),
+            ),
             unlocked_tiles,
             state: hand,
         }
@@ -948,13 +956,7 @@ impl<'a, 'model> BranchEvaluator<'a, 'model> {
         let score_unit = SCORE_UNIT as f64;
         let win_scale = nominal_gain.max(score_unit);
 
-        let analysis = (!hand.has_won).then(|| {
-            analyze_shanten(
-                &hand.holding.concealed,
-                hand.holding.melds(),
-                hand.holding.missing,
-            )
-        });
+        let analysis = (!hand.holding.has_won).then(|| hand.holding.analysis());
         let wait_mask = analysis.map_or_else(
             || {
                 all_tiles().fold(0_u32, |mask, tile| {
@@ -1124,7 +1126,7 @@ impl<'a, 'model> BranchEvaluator<'a, 'model> {
             .iter()
             .map(|(_, hand)| hand.analysis().shanten)
             .min()?;
-        if !state.hand.has_won {
+        if !state.hand.holding.has_won {
             candidates.retain(|(_, hand)| hand.analysis().shanten == root_shanten);
         }
         candidates
@@ -1571,7 +1573,7 @@ impl<'a, 'model> BranchEvaluator<'a, 'model> {
         if let Some(after_pong) = state.hand.holding.after_pong(tile, source) {
             let pong_hand = PlanningHand::new(
                 after_pong,
-                state.hand.has_won,
+                state.hand.holding.has_won,
                 state.hand.max_win_multiplier,
             );
             if let Some(value) = self.best_called_discard(
@@ -1585,7 +1587,7 @@ impl<'a, 'model> BranchEvaluator<'a, 'model> {
         if let Some(after_kong) = state.hand.holding.after_exposed_kong(tile, source) {
             let kong_hand = PlanningHand::new(
                 after_kong,
-                state.hand.has_won,
+                state.hand.holding.has_won,
                 state.hand.max_win_multiplier,
             );
             let (next_public, immediate) = self
@@ -1701,18 +1703,22 @@ mod tests {
         ] {
             concealed[tile(suit, rank).index()] += 1;
         }
+        let winning_tile = tile(Suit::Bamboo, 9);
+        let mut win_base = concealed;
+        win_base[winning_tile.index()] -= 1;
         let hand = PlanningHand::new(
             Holding {
                 concealed,
                 locked: concealed,
+                win_base,
                 melds: [DUMMY_MELD; 4],
                 meld_len: 0,
                 missing: Some(Suit::Dots),
+                has_won: true,
             },
             true,
             1,
         );
-        let winning_tile = tile(Suit::Bamboo, 9);
         assert!(
             hand.with_draw(winning_tile)
                 .and_then(|drawn| drawn.win_on_draw(winning_tile, WinFlags::NONE))
@@ -1763,7 +1769,10 @@ mod tests {
             drawn: DrawnInventory::default(),
         };
 
-        assert_eq!(hand.analysis().improving_tiles, 0);
+        assert_ne!(
+            hand.analysis().improving_tiles & (1 << winning_tile.index()),
+            0
+        );
         assert!(planner.available_copies_in_state(state, winning_tile) > 0);
         assert!(evaluator.frontier_value(state) > 0.0);
     }
@@ -1806,9 +1815,11 @@ mod tests {
         let holding = Holding {
             concealed: counts,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: Some(Suit::Dots),
+            has_won: false,
         };
         let hand = PlanningHand::new(holding, false, 0);
         let values = PublicValueModel::new(&game, Seat::EAST, None);
@@ -1862,9 +1873,11 @@ mod tests {
             Holding {
                 concealed: counts,
                 locked: [0; TILE_KIND_COUNT],
+                win_base: [0; TILE_KIND_COUNT],
                 melds: [DUMMY_MELD; 4],
                 meld_len: 0,
                 missing: Some(Suit::Dots),
+                has_won: false,
             },
             false,
             0,
@@ -2093,9 +2106,11 @@ mod tests {
         let holding = Holding {
             concealed: counts,
             locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
             melds: [DUMMY_MELD; 4],
             meld_len: 0,
             missing: Some(Suit::Dots),
+            has_won: false,
         };
         let hand = PlanningHand::new(holding, false, 0);
         let winning_tile = tile(Suit::Characters, 9);
