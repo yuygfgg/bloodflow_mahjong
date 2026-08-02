@@ -73,32 +73,19 @@ let action = game.rule_ev_action_with_config(config);
 
 `search_depth` 控制确定性手牌前瞻：枚举公开有效牌和后续弃牌，不采样隐藏牌，也不读取权威牌墙。`RuleEvConfig::STANDARD` 使用 depth 1 和启发式防守。
 
-`Batch::rule_ev_actions_into` 提供批量接口。隐藏世界搜索只由 `rule-planner` 实现。
+`Batch::rule_ev_actions_into` 和 `Batch::rule_ev_actions_with_config_into` 提供批量接口。隐藏世界搜索只由 `rule-planner` 实现。
 
 ### `rule-planner`
 
 ```rust
 use bloodflow_mahjong::RulePlannerConfig;
 
-let config = RulePlannerConfig::STANDARD
-    .with_hand_changes(0)
-    .expect("hand changes are in 0..=2")
-    .with_draw_horizon(1)
-    .expect("draw horizon is in 0..=32")
-    .with_candidate_states(1)
-    .expect("candidate states are in 1..=200000")
-    .with_belief_worlds(64)
-    .expect("belief worlds are in 0..=256")
-    .with_response_worlds(0)
-    .expect("response worlds are in 0..=256")
-    .with_search_iterations(64)
-    .expect("iterations are in 0..=4096");
+let config = RulePlannerConfig::DEFAULT;
 let action = game.rule_planner_action_with_config(config);
 ```
 
 planner 先评估手牌候选图和公开状态价值，再决定动作。`belief_worlds` 控制危险度和 rollout 使用的信息集粒子数。`search_iterations` 非零时，策略对候选动作做配对 rollout——固定其余三座位的行动不变，只改进当前动作——并用独立粒子流验证改动。
 
-planner 当前没有 `Batch` 或 Python 动作接口。局级并行由调用者或 `rule-tournament` 管理。
 
 #### 分析接口
 

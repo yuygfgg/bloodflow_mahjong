@@ -69,15 +69,15 @@ fn main() -> Result<(), GameError> {
 
 | CLI 标识符 | 设计 | 公开接口 |
 | --- | --- | --- |
-| `rule-fast` | 低成本、确定性的基准策略 | Rust `Game` 和 `Batch`；Python `Game` 和 `Batch` |
-| `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust `Game` 和 `Batch` |
-| `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust `Game` |
+| `rule-fast` | 低成本、确定性的基准策略 | Rust/Python `Game` 和 `Batch` |
+| `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust/Python `Game` 和 `Batch` |
+| `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust/Python `Game` 和 `Batch` |
 
 三种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
 ## Python 绑定
 
-需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样和 `rule-fast` 策略，不公开 `rule-ev` 或 `rule-planner`。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
+需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样，以及 `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
 
 ## 构建与验证
 

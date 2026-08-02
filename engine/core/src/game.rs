@@ -4728,12 +4728,16 @@ mod tests {
         let left_observation = observation_for(&left, actor);
         let right_observation = observation_for(&right, actor);
         assert_eq!(left_observation, right_observation);
-        let config = crate::RulePlannerConfig::FAST
+        let config = crate::RulePlannerConfig::DEFAULT
             .with_draw_horizon(0)
             .unwrap()
             .with_candidate_states(1)
             .unwrap()
+            .with_belief_worlds(0)
+            .unwrap()
             .with_response_worlds(2)
+            .unwrap()
+            .with_search_iterations(0)
             .unwrap();
         assert_eq!(
             left.rule_planner_action_with_config(config),

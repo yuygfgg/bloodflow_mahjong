@@ -22,6 +22,8 @@ SHANTEN_COMPLETE: Final[int]
 SHANTEN_MAX: Final[int]
 SHANTEN_TERMINAL: Final[int]
 SIMPLE_RULE_ACTION_TERMINAL: Final[int]
+RULE_EV_ACTION_TERMINAL: Final[int]
+RULE_PLANNER_ACTION_TERMINAL: Final[int]
 
 class EventKind(IntEnum):
     ACTION: Final[int]
@@ -67,6 +69,40 @@ PHASE_FINISHED: Final[int]
 TERMINATION_WALL_EXHAUSTED: Final[int]
 TERMINATION_THREE_PLAYERS_BANKRUPT: Final[int]
 
+class RuleEvConfig:
+    def __init__(self, search_depth: int = 1, defense: bool = True) -> None: ...
+    @staticmethod
+    def fast() -> RuleEvConfig: ...
+    @staticmethod
+    def standard() -> RuleEvConfig: ...
+    @property
+    def search_depth(self) -> int: ...
+    @property
+    def defense(self) -> bool: ...
+
+class RulePlannerConfig:
+    def __init__(
+        self,
+        hand_changes: int = 0,
+        draw_horizon: int = 1,
+        candidate_states: int = 1,
+        belief_worlds: int = 64,
+        response_worlds: int = 0,
+        search_iterations: int = 64,
+    ) -> None: ...
+    @property
+    def hand_changes(self) -> int: ...
+    @property
+    def draw_horizon(self) -> int: ...
+    @property
+    def candidate_states(self) -> int: ...
+    @property
+    def belief_worlds(self) -> int: ...
+    @property
+    def response_worlds(self) -> int: ...
+    @property
+    def search_iterations(self) -> int: ...
+
 class Game:
     def __init__(self, seed: int = 0) -> None: ...
     @staticmethod
@@ -80,6 +116,10 @@ class Game:
     @property
     def legal_action_mask(self) -> tuple[int, int]: ...
     def simple_rule_action(self) -> int | None: ...
+    def rule_ev_action(self, config: RuleEvConfig | None = None) -> int | None: ...
+    def rule_planner_action(
+        self, config: RulePlannerConfig | None = None
+    ) -> int | None: ...
     def step_id(self, action: int) -> tuple[int, ...]: ...
     def step_into(self, action: int, output: npt.NDArray[np.int64]) -> None: ...
     @property
@@ -173,6 +213,28 @@ class Batch:
         self,
         enabled: npt.NDArray[np.uint8],
         output: npt.NDArray[np.uint8],
+    ) -> None: ...
+    def rule_ev_actions_into(
+        self,
+        output: npt.NDArray[np.uint8],
+        config: RuleEvConfig | None = None,
+    ) -> None: ...
+    def rule_ev_actions_masked_into(
+        self,
+        enabled: npt.NDArray[np.uint8],
+        output: npt.NDArray[np.uint8],
+        config: RuleEvConfig | None = None,
+    ) -> None: ...
+    def rule_planner_actions_into(
+        self,
+        output: npt.NDArray[np.uint8],
+        config: RulePlannerConfig | None = None,
+    ) -> None: ...
+    def rule_planner_actions_masked_into(
+        self,
+        enabled: npt.NDArray[np.uint8],
+        output: npt.NDArray[np.uint8],
+        config: RulePlannerConfig | None = None,
     ) -> None: ...
     def hand_analysis_into(
         self,

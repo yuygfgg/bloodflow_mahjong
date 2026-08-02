@@ -1,11 +1,10 @@
 use core::cmp::Ordering;
 
-use rayon::prelude::*;
-
-use crate::game::{Batch, Game, GameError, LegalActions, PARALLEL_BATCH_THRESHOLD, Phase};
+use crate::game::{Batch, Game, GameError, LegalActions, Phase};
 use crate::types::{PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
 use crate::{ACTION_SPACE_SIZE, ActionId, WinFlags, analyze_shanten, evaluate_win};
 
+use super::batch_policy_actions_into;
 use super::hand::{DUMMY_MELD, Holding, all_tiles, hand_structure_score, mask_tiles};
 use super::opening;
 
@@ -111,25 +110,18 @@ impl Game {
 impl Batch {
     /// Writes one rule-EV action per environment.
     pub fn rule_ev_actions_into(&self, output: &mut [u8]) -> Result<(), GameError> {
-        if output.len() != self.len() {
-            return Err(GameError::BatchLength);
-        }
-        let write = |game: &Game, action: &mut u8| {
-            *action = game
-                .rule_ev_action()
-                .map_or(RULE_EV_ACTION_TERMINAL, |id| id.index() as u8);
-        };
-        if self.len() >= PARALLEL_BATCH_THRESHOLD {
-            self.games()
-                .par_iter()
-                .zip(output.par_iter_mut())
-                .for_each(|(game, action)| write(game, action));
-        } else {
-            for (game, action) in self.games().iter().zip(output.iter_mut()) {
-                write(game, action);
-            }
-        }
-        Ok(())
+        self.rule_ev_actions_with_config_into(RuleEvConfig::STANDARD, output)
+    }
+
+    /// Writes one configured rule-EV action per environment.
+    pub fn rule_ev_actions_with_config_into(
+        &self,
+        config: RuleEvConfig,
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        batch_policy_actions_into(self, None, output, RULE_EV_ACTION_TERMINAL, |game| {
+            game.rule_ev_action_with_config(config)
+        })
     }
 
     /// Writes rule-EV actions only where `enabled` is one.
@@ -138,36 +130,23 @@ impl Batch {
         enabled: &[u8],
         output: &mut [u8],
     ) -> Result<(), GameError> {
-        if enabled.len() != self.len() || output.len() != self.len() {
-            return Err(GameError::BatchLength);
-        }
-        if enabled.iter().any(|&value| value > 1) {
-            return Err(GameError::InvalidAction);
-        }
-        let write = |game: &Game, enabled: u8, action: &mut u8| {
-            if enabled != 0 {
-                *action = game
-                    .rule_ev_action()
-                    .map_or(RULE_EV_ACTION_TERMINAL, |id| id.index() as u8);
-            }
-        };
-        if self.len() >= PARALLEL_BATCH_THRESHOLD {
-            self.games()
-                .par_iter()
-                .zip(enabled.par_iter().copied())
-                .zip(output.par_iter_mut())
-                .for_each(|((game, enabled), action)| write(game, enabled, action));
-        } else {
-            for ((game, enabled), action) in self
-                .games()
-                .iter()
-                .zip(enabled.iter().copied())
-                .zip(output.iter_mut())
-            {
-                write(game, enabled, action);
-            }
-        }
-        Ok(())
+        self.rule_ev_actions_masked_with_config_into(enabled, RuleEvConfig::STANDARD, output)
+    }
+
+    /// Writes configured rule-EV actions only where `enabled` is one.
+    pub fn rule_ev_actions_masked_with_config_into(
+        &self,
+        enabled: &[u8],
+        config: RuleEvConfig,
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        batch_policy_actions_into(
+            self,
+            Some(enabled),
+            output,
+            RULE_EV_ACTION_TERMINAL,
+            |game| game.rule_ev_action_with_config(config),
+        )
     }
 }
 

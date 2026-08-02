@@ -82,4 +82,4 @@ benchmark 只用于定位性能变化。策略强弱必须通过平衡锦标赛�
 
 ## Python 绑定
 
-安装、数组格式和示例见 [`pybind/README.md`](pybind/README.md)。绑定需要 Python 3.10 或更高版本，只公开 `rule-fast` 策略，不公开 `rule-ev` 或 `rule-planner`。
+安装、数组格式和示例见 [`pybind/README.md`](pybind/README.md)。绑定需要 Python 3.10 或更高版本，并公开 `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。

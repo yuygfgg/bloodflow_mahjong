@@ -2,7 +2,7 @@ use core::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::ActionId;
 use crate::game::{
-    Game, LegalActions, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, Phase,
+    Batch, Game, GameError, LegalActions, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, Phase,
     RIVER_OBSERVATION_WIDTH, TILE_OBSERVATION_WIDTH,
 };
 #[cfg(feature = "planner-analysis")]
@@ -14,6 +14,8 @@ use crate::rules::{
 #[cfg(feature = "planner-analysis")]
 use crate::types::PLAYER_COUNT;
 use crate::types::{Seat, Tile};
+
+use super::batch_policy_actions_into;
 
 mod belief;
 mod graph;
@@ -50,6 +52,10 @@ static TURN_OVERRIDES: AtomicU64 = AtomicU64::new(0);
 static HAZARD_CANDIDATES: AtomicU64 = AtomicU64::new(0);
 static HAZARD_LOSS_MILLIPOINTS: AtomicU64 = AtomicU64::new(0);
 static HAZARD_WON_LOSS_MILLIPOINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Sentinel written for terminal batch slots by
+/// [`Batch::rule_planner_actions_into`].
+pub const RULE_PLANNER_ACTION_TERMINAL: u8 = u8::MAX;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct RulePlannerSearchStats {
@@ -299,29 +305,14 @@ pub struct RulePlannerConfig {
 }
 
 impl RulePlannerConfig {
-    pub const FAST: Self = Self {
+    /// Production and tournament default: `rule_planner_h0_d1_c1_b64_r0_i64`.
+    pub const DEFAULT: Self = Self {
         hand_changes: 0,
-        draw_horizon: 4,
-        candidate_states: 256,
-        belief_worlds: 0,
+        draw_horizon: 1,
+        candidate_states: 1,
+        belief_worlds: 64,
         response_worlds: 0,
-        search_iterations: 0,
-    };
-    pub const STANDARD: Self = Self {
-        hand_changes: 1,
-        draw_horizon: 27,
-        candidate_states: 4_096,
-        belief_worlds: 0,
-        response_worlds: 0,
-        search_iterations: 0,
-    };
-    pub const DEEP: Self = Self {
-        hand_changes: 2,
-        draw_horizon: 32,
-        candidate_states: 20_000,
-        belief_worlds: 0,
-        response_worlds: 0,
-        search_iterations: 256,
+        search_iterations: 64,
     };
     const ROLLOUT: Self = Self {
         hand_changes: 0,
@@ -418,13 +409,13 @@ impl RulePlannerConfig {
 
 impl Default for RulePlannerConfig {
     fn default() -> Self {
-        Self::STANDARD
+        Self::DEFAULT
     }
 }
 
 impl Game {
     pub fn rule_planner_action(&self) -> Option<ActionId> {
-        self.rule_planner_action_with_config(RulePlannerConfig::STANDARD)
+        self.rule_planner_action_with_config(RulePlannerConfig::DEFAULT)
     }
 
     pub fn rule_planner_action_with_config(&self, config: RulePlannerConfig) -> Option<ActionId> {
@@ -502,6 +493,53 @@ impl Game {
         Some(RulePlannerAnalysis::without_search(
             planner_action_without_search(self, &legal, config.without_search()),
         ))
+    }
+}
+
+impl Batch {
+    /// Writes one default rule-planner action per environment.
+    pub fn rule_planner_actions_into(&self, output: &mut [u8]) -> Result<(), GameError> {
+        self.rule_planner_actions_with_config_into(RulePlannerConfig::DEFAULT, output)
+    }
+
+    /// Writes one configured rule-planner action per environment.
+    pub fn rule_planner_actions_with_config_into(
+        &self,
+        config: RulePlannerConfig,
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        batch_policy_actions_into(self, None, output, RULE_PLANNER_ACTION_TERMINAL, |game| {
+            game.rule_planner_action_with_config(config)
+        })
+    }
+
+    /// Writes default rule-planner actions only where `enabled` is one.
+    pub fn rule_planner_actions_masked_into(
+        &self,
+        enabled: &[u8],
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        self.rule_planner_actions_masked_with_config_into(
+            enabled,
+            RulePlannerConfig::DEFAULT,
+            output,
+        )
+    }
+
+    /// Writes configured rule-planner actions only where `enabled` is one.
+    pub fn rule_planner_actions_masked_with_config_into(
+        &self,
+        enabled: &[u8],
+        config: RulePlannerConfig,
+        output: &mut [u8],
+    ) -> Result<(), GameError> {
+        batch_policy_actions_into(
+            self,
+            Some(enabled),
+            output,
+            RULE_PLANNER_ACTION_TERMINAL,
+            |game| game.rule_planner_action_with_config(config),
+        )
     }
 }
 
@@ -812,33 +850,45 @@ mod tests {
 
     #[test]
     fn config_rejects_out_of_range_budgets() {
+        assert_eq!(RulePlannerConfig::default(), RulePlannerConfig::DEFAULT);
+        assert_eq!(
+            (
+                RulePlannerConfig::DEFAULT.hand_changes(),
+                RulePlannerConfig::DEFAULT.draw_horizon(),
+                RulePlannerConfig::DEFAULT.candidate_states(),
+                RulePlannerConfig::DEFAULT.belief_worlds(),
+                RulePlannerConfig::DEFAULT.response_worlds(),
+                RulePlannerConfig::DEFAULT.search_iterations(),
+            ),
+            (0, 1, 1, 64, 0, 64),
+        );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_hand_changes(MAX_HAND_CHANGES + 1)
                 .is_none()
         );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_draw_horizon(MAX_DRAW_HORIZON + 1)
                 .is_none()
         );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_candidate_states(MAX_CANDIDATE_STATES + 1)
                 .is_none()
         );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_belief_worlds(MAX_BELIEF_WORLDS + 1)
                 .is_none()
         );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_response_worlds(MAX_RESPONSE_WORLDS + 1)
                 .is_none()
         );
         assert!(
-            RulePlannerConfig::STANDARD
+            RulePlannerConfig::DEFAULT
                 .with_search_iterations(MAX_SEARCH_ITERATIONS + 1)
                 .is_none()
         );

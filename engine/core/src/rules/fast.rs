@@ -1,8 +1,8 @@
-use crate::game::{Batch, Game, GameError, LegalActions, PARALLEL_BATCH_THRESHOLD, Phase};
+use crate::game::{Batch, Game, GameError, LegalActions, Phase};
 use crate::types::{Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile};
 use crate::{ACTION_SPACE_SIZE, ActionId, analyze_shanten};
-use rayon::prelude::*;
 
+use super::batch_policy_actions_into;
 use super::hand::{hand_structure_score, suit_structure_score};
 
 /// Sentinel written for terminal batch slots by
@@ -49,25 +49,13 @@ impl Batch {
     /// Active slots receive an action in `0..ACTION_SPACE_SIZE`. Terminal
     /// slots receive [`SIMPLE_RULE_ACTION_TERMINAL`].
     pub fn simple_rule_actions_into(&self, output: &mut [u8]) -> Result<(), GameError> {
-        if output.len() != self.len() {
-            return Err(GameError::BatchLength);
-        }
-        let write = |game: &Game, action: &mut u8| {
-            *action = game
-                .simple_rule_action()
-                .map_or(SIMPLE_RULE_ACTION_TERMINAL, |id| id.index() as u8);
-        };
-        if self.len() >= PARALLEL_BATCH_THRESHOLD {
-            self.games()
-                .par_iter()
-                .zip(output.par_iter_mut())
-                .for_each(|(game, action)| write(game, action));
-        } else {
-            for (game, action) in self.games().iter().zip(output.iter_mut()) {
-                write(game, action);
-            }
-        }
-        Ok(())
+        batch_policy_actions_into(
+            self,
+            None,
+            output,
+            SIMPLE_RULE_ACTION_TERMINAL,
+            Game::simple_rule_action,
+        )
     }
 
     /// Writes simple-rule actions only where the byte mask is one.
@@ -79,37 +67,13 @@ impl Batch {
         enabled: &[u8],
         output: &mut [u8],
     ) -> Result<(), GameError> {
-        if enabled.len() != self.len() || output.len() != self.len() {
-            return Err(GameError::BatchLength);
-        }
-        if enabled.iter().any(|&value| value > 1) {
-            return Err(GameError::InvalidAction);
-        }
-        let write = |game: &Game, enabled: u8, action: &mut u8| {
-            if enabled == 0 {
-                return;
-            }
-            *action = game
-                .simple_rule_action()
-                .map_or(SIMPLE_RULE_ACTION_TERMINAL, |id| id.index() as u8);
-        };
-        if self.len() >= PARALLEL_BATCH_THRESHOLD {
-            self.games()
-                .par_iter()
-                .zip(enabled.par_iter().copied())
-                .zip(output.par_iter_mut())
-                .for_each(|((game, enabled), action)| write(game, enabled, action));
-        } else {
-            for ((game, enabled), action) in self
-                .games()
-                .iter()
-                .zip(enabled.iter().copied())
-                .zip(output.iter_mut())
-            {
-                write(game, enabled, action);
-            }
-        }
-        Ok(())
+        batch_policy_actions_into(
+            self,
+            Some(enabled),
+            output,
+            SIMPLE_RULE_ACTION_TERMINAL,
+            Game::simple_rule_action,
+        )
     }
 }
 

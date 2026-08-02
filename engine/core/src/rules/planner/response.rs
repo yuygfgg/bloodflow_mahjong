@@ -228,7 +228,7 @@ mod tests {
     }
 
     fn test_config() -> RulePlannerConfig {
-        RulePlannerConfig::FAST
+        RulePlannerConfig::ROLLOUT
             .with_draw_horizon(0)
             .expect("zero draw horizon is supported")
             .with_candidate_states(1)

@@ -55,24 +55,44 @@ struct Config {
     policy_a: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
     a_lookahead_depth: u8,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.hand_changes(),
+        value_parser = clap::value_parser!(u8).range(0..=2)
+    )]
     a_hand_changes: u8,
-    #[arg(long, default_value_t = 27, value_parser = clap::value_parser!(u8).range(0..=32))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.draw_horizon(),
+        value_parser = clap::value_parser!(u8).range(0..=32)
+    )]
     a_draw_horizon: u8,
-    #[arg(long, default_value_t = 4_096, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.candidate_states(),
+        value_parser = clap::value_parser!(u32).range(1..=200_000)
+    )]
     a_candidate_states: u32,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.belief_worlds(),
+        value_parser = clap::value_parser!(u16).range(0..=256)
+    )]
     a_belief_worlds: u16,
     #[arg(long, value_enum, default_value = "posterior")]
     a_root_belief: PlannerRootBelief,
     #[arg(long, value_enum, default_value = "current")]
     a_continuation: PlannerContinuation,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.response_worlds(),
+        value_parser = clap::value_parser!(u16).range(0..=256)
+    )]
     a_response_worlds: u16,
     #[arg(
         long,
         visible_alias = "a-search-budget",
-        default_value_t = 0,
+        default_value_t = RulePlannerConfig::DEFAULT.search_iterations(),
         value_parser = clap::value_parser!(u16).range(0..=4_096)
     )]
     a_search_iterations: u16,
@@ -82,24 +102,44 @@ struct Config {
     policy_b: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
     b_lookahead_depth: u8,
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=2))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.hand_changes(),
+        value_parser = clap::value_parser!(u8).range(0..=2)
+    )]
     b_hand_changes: u8,
-    #[arg(long, default_value_t = 27, value_parser = clap::value_parser!(u8).range(0..=32))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.draw_horizon(),
+        value_parser = clap::value_parser!(u8).range(0..=32)
+    )]
     b_draw_horizon: u8,
-    #[arg(long, default_value_t = 4_096, value_parser = clap::value_parser!(u32).range(1..=200_000))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.candidate_states(),
+        value_parser = clap::value_parser!(u32).range(1..=200_000)
+    )]
     b_candidate_states: u32,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.belief_worlds(),
+        value_parser = clap::value_parser!(u16).range(0..=256)
+    )]
     b_belief_worlds: u16,
     #[arg(long, value_enum, default_value = "posterior")]
     b_root_belief: PlannerRootBelief,
     #[arg(long, value_enum, default_value = "current")]
     b_continuation: PlannerContinuation,
-    #[arg(long, default_value_t = 0, value_parser = clap::value_parser!(u16).range(0..=256))]
+    #[arg(
+        long,
+        default_value_t = RulePlannerConfig::DEFAULT.response_worlds(),
+        value_parser = clap::value_parser!(u16).range(0..=256)
+    )]
     b_response_worlds: u16,
     #[arg(
         long,
         visible_alias = "b-search-budget",
-        default_value_t = 0,
+        default_value_t = RulePlannerConfig::DEFAULT.search_iterations(),
         value_parser = clap::value_parser!(u16).range(0..=4_096)
     )]
     b_search_iterations: u16,
@@ -274,25 +314,25 @@ impl Default for Config {
             parallel_games: None,
             policy_a: PolicyKind::Ev,
             a_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            a_hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
-            a_draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
-            a_candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
-            a_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            a_hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
+            a_draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
+            a_candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
+            a_belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
             a_root_belief: PlannerRootBelief::Posterior,
             a_continuation: PlannerContinuation::Current,
-            a_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
-            a_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
+            a_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
+            a_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             a_defense: Defense::Heuristic,
             policy_b: PolicyKind::Fast,
             b_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            b_hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
-            b_draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
-            b_candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
-            b_belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            b_hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
+            b_draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
+            b_candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
+            b_belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
             b_root_belief: PlannerRootBelief::Posterior,
             b_continuation: PlannerContinuation::Current,
-            b_response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
-            b_search_iterations: RulePlannerConfig::STANDARD.search_iterations(),
+            b_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
+            b_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             b_defense: Defense::Heuristic,
         }
     }
@@ -910,7 +950,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
             ))
         }
         PolicyKind::Planner => {
-            let policy = RulePlannerConfig::STANDARD
+            let policy = RulePlannerConfig::DEFAULT
                 .with_hand_changes(settings.hand_changes)
                 .ok_or_else(|| {
                     invalid_policy_value(
@@ -1426,14 +1466,14 @@ mod tests {
                 a_defense: Defense::Heuristic,
                 policy_b: PolicyKind::Ev,
                 b_lookahead_depth: 0,
-                b_hand_changes: 1,
-                b_draw_horizon: 27,
-                b_candidate_states: 4_096,
-                b_belief_worlds: 0,
+                b_hand_changes: 0,
+                b_draw_horizon: 1,
+                b_candidate_states: 1,
+                b_belief_worlds: 64,
                 b_root_belief: PlannerRootBelief::Posterior,
                 b_continuation: PlannerContinuation::Current,
                 b_response_worlds: 0,
-                b_search_iterations: 0,
+                b_search_iterations: 64,
                 b_defense: Defense::None,
             }
         );
@@ -1459,13 +1499,13 @@ mod tests {
             argument_prefix: "a",
             kind: PolicyKind::Ev,
             lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            hand_changes: RulePlannerConfig::STANDARD.hand_changes(),
-            draw_horizon: RulePlannerConfig::STANDARD.draw_horizon(),
-            candidate_states: RulePlannerConfig::STANDARD.candidate_states(),
-            belief_worlds: RulePlannerConfig::STANDARD.belief_worlds(),
+            hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
+            draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
+            candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
+            belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
             root_belief: PlannerRootBelief::OracleHidden,
             continuation: PlannerContinuation::OracleContinuation,
-            response_worlds: RulePlannerConfig::STANDARD.response_worlds(),
+            response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
             search_iterations: 256,
             defense: Defense::Heuristic,
         };
@@ -1483,6 +1523,28 @@ mod tests {
             (Policy::Ev(left), Policy::Ev(right)) => assert_eq!(left, right),
             _ => panic!("both policies must be rule-ev"),
         }
+    }
+
+    #[test]
+    fn planner_defaults_use_the_canonical_tournament_budget() {
+        let config = Config::default();
+        let (_, name) = build_policy(PolicySettings {
+            argument_prefix: "a",
+            kind: PolicyKind::Planner,
+            lookahead_depth: config.a_lookahead_depth,
+            hand_changes: config.a_hand_changes,
+            draw_horizon: config.a_draw_horizon,
+            candidate_states: config.a_candidate_states,
+            belief_worlds: config.a_belief_worlds,
+            root_belief: config.a_root_belief,
+            continuation: config.a_continuation,
+            response_worlds: config.a_response_worlds,
+            search_iterations: config.a_search_iterations,
+            defense: config.a_defense,
+        })
+        .expect("the default planner budget is valid");
+
+        assert_eq!(name, "rule_planner_h0_d1_c1_b64_r0_i64");
     }
 
     #[test]
@@ -1508,7 +1570,7 @@ mod tests {
     fn continuation_profile_follows_every_balanced_seat_mask() {
         let policy_a = Policy::Ev(RuleEvConfig::FAST);
         let policy_b = Policy::Planner {
-            config: RulePlannerConfig::FAST,
+            config: RulePlannerConfig::DEFAULT,
             root_belief: PlannerRootBelief::OracleHidden,
             continuation: PlannerContinuation::OracleContinuation,
         };
@@ -1519,7 +1581,7 @@ mod tests {
                 let expected = if mask & (1 << seat.index()) != 0 {
                     RulePlannerContinuationPolicy::Ev(RuleEvConfig::FAST)
                 } else {
-                    RulePlannerContinuationPolicy::PlannerBaseline(RulePlannerConfig::FAST)
+                    RulePlannerContinuationPolicy::PlannerBaseline(RulePlannerConfig::DEFAULT)
                 };
                 assert_eq!(profile.for_seat(seat), expected);
             }
