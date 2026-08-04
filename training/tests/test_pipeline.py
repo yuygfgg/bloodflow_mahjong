@@ -73,30 +73,64 @@ def test_rule_opponents_are_assigned_per_seat_and_self_play_is_explicit() -> Non
     }
     assert pool.refresh_snapshot(tiny_model(), torch.device("cpu")) is None
 
-    config = tiny_ppo(self_play_enabled=True)
+    config = tiny_ppo(self_play_enabled=True, self_play_fraction=0.25)
     pool = OpponentPool(config, seed=19)
     pool.set_frozen(tiny_model())
-    for _ in range(config.rule_gate_consecutive_evals):
-        pool.update_rule_evaluation(
-            {"first_rate": 0.24, "mean_score_delta": -500.0}
-        )
-    assert pool.stage() == "mixed"
+    for _ in range(config.self_play_gate_consecutive_evals - 1):
+        pool.update_rule_evaluation({"first_rate": 0.24, "mean_score_delta": 0.0})
+    assert pool.stage() == "bootstrap"
+    pool.update_rule_evaluation({"first_rate": 0.25, "mean_score_delta": 0.0})
+    assert pool.stage() == "self_play"
     np.testing.assert_allclose(
-        pool.probabilities(), [13.0 / 60.0, 13.0 / 30.0, 0.35]
+        pool.probabilities(), [0.25, 0.50, 0.25]
     )
-    for _ in range(config.rule_gate_consecutive_evals):
-        pool.update_rule_evaluation({"first_rate": 0.25, "mean_score_delta": 0.0})
-    assert pool.stage() == "league"
-    np.testing.assert_allclose(
-        pool.probabilities(), [7.0 / 60.0, 7.0 / 30.0, 0.65]
-    )
-    league = pool.assign_seats(learner_seats)
-    assert OpponentPool.FROZEN_TRANSFORMER in league
-    assert set(np.unique(league[league >= 0])) <= {
+    self_play = pool.assign_seats(learner_seats)
+    assert OpponentPool.FROZEN_TRANSFORMER in self_play
+    assert set(np.unique(self_play[self_play >= 0])) <= {
         OpponentPool.RULE_FAST,
         OpponentPool.RULE_EV,
         OpponentPool.FROZEN_TRANSFORMER,
     }
+
+
+def test_snapshot_refresh_and_selection_have_separate_cadence() -> None:
+    config = tiny_ppo(
+        self_play_enabled=True,
+        self_play_gate_consecutive_evals=1,
+        historical_snapshot_probability=1.0,
+        opponent_refresh_updates=10,
+    )
+    pool = OpponentPool(config, seed=19)
+    pool.update_rule_evaluation({"first_rate": 0.25, "mean_score_delta": 0.0})
+
+    pool.refresh_snapshot(tiny_model(), torch.device("cpu"), update=100)
+    pool.refresh_snapshot(tiny_model(), torch.device("cpu"), update=110)
+
+    assert not pool.snapshot_due(119)
+    assert pool.snapshot_due(120)
+    assert pool.select_snapshot() == 0
+
+
+def test_snapshot_pool_keeps_the_fork_anchor() -> None:
+    config = tiny_ppo(
+        self_play_enabled=True,
+        self_play_gate_consecutive_evals=1,
+        frozen_snapshot_limit=2,
+    )
+    pool = OpponentPool(config, seed=23)
+    pool.update_rule_evaluation({"first_rate": 0.25, "mean_score_delta": 0.0})
+    model = tiny_model()
+    anchor = next(model.parameters()).detach().clone()
+    pool.refresh_snapshot(model, torch.device("cpu"), update=1)
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+    pool.refresh_snapshot(model, torch.device("cpu"), update=2)
+    with torch.no_grad():
+        next(model.parameters()).add_(1.0)
+    pool.refresh_snapshot(model, torch.device("cpu"), update=3)
+
+    assert len(pool.snapshots) == 2
+    torch.testing.assert_close(next(pool.snapshots[0].parameters()), anchor)
 
 
 def test_rule_opponents_only_calculate_their_assigned_rows() -> None:
@@ -379,12 +413,12 @@ def test_checkpoint_restores_model_optimizer_and_opponent_snapshots(tmp_path) ->
     model = tiny_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
     collector = RolloutCollector(config, torch.device("cpu"), seed=37)
-    for _ in range(config.rule_gate_consecutive_evals):
+    for _ in range(config.self_play_gate_consecutive_evals):
         collector.pool.update_rule_evaluation(
-            {"first_rate": 0.24, "mean_score_delta": -500.0}
+            {"first_rate": 0.24, "mean_score_delta": 0.0}
         )
-    collector.pool.refresh_snapshot(model, torch.device("cpu"))
-    collector.pool.refresh_snapshot(model, torch.device("cpu"))
+    collector.pool.refresh_snapshot(model, torch.device("cpu"), update=5)
+    collector.pool.refresh_snapshot(model, torch.device("cpu"), update=6)
     collector.next_seed = 9_999
     path = tmp_path / "checkpoint.pt"
     save_checkpoint(path, model, optimizer, 7, 1234, 321.5, config, collector)
@@ -411,6 +445,7 @@ def test_checkpoint_restores_model_optimizer_and_opponent_snapshots(tmp_path) ->
     assert restored_collector.next_seed == 9_999
     assert len(restored_collector.pool.snapshots) == 2
     assert restored_collector.pool.frozen_ready
+    assert restored_collector.pool.last_snapshot_update == 6
     assert all(
         not parameter.requires_grad
         for snapshot in restored_collector.pool.snapshots
@@ -418,6 +453,40 @@ def test_checkpoint_restores_model_optimizer_and_opponent_snapshots(tmp_path) ->
     )
     for expected, actual in zip(model.parameters(), restored_model.parameters()):
         torch.testing.assert_close(actual, expected)
+
+
+def test_checkpoint_can_restore_into_a_forked_opponent_curriculum(tmp_path) -> None:
+    source = tiny_ppo(self_play_enabled=False, opponent_refresh_updates=10)
+    target = replace(
+        source,
+        self_play_enabled=True,
+        self_play_fraction=0.25,
+        opponent_refresh_updates=200,
+    )
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=source.learning_rate)
+    collector = RolloutCollector(source, torch.device("cpu"), seed=43)
+    path = tmp_path / "source.pt"
+    save_checkpoint(path, model, optimizer, 9, 4321, 654.0, source, collector)
+
+    restored_model = tiny_model()
+    restored_optimizer = torch.optim.AdamW(
+        restored_model.parameters(), lr=target.learning_rate
+    )
+    restored_collector = RolloutCollector(target, torch.device("cpu"), seed=47)
+    state = load_checkpoint(
+        path,
+        restored_model,
+        restored_optimizer,
+        torch.device("cpu"),
+        target,
+        restored_collector,
+        expected_checkpoint_config=source,
+    )
+
+    assert state == (9, 4321, 654.0)
+    assert restored_collector.config == target
+    assert restored_collector.pool.config == target
 
 
 def test_legacy_checkpoint_keeps_score_only_reward_semantics(tmp_path) -> None:
@@ -438,6 +507,38 @@ def test_legacy_checkpoint_keeps_score_only_reward_semantics(tmp_path) -> None:
     assert restored.score_reward_weight == 1.0
     assert restored.rank_reward_weight == 0.0
     assert restored.kl_control == "monitor"
+
+
+def test_checkpoint_migrates_the_staged_self_play_curriculum(tmp_path) -> None:
+    config = tiny_ppo()
+    model = tiny_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.learning_rate)
+    collector = RolloutCollector(config, torch.device("cpu"), seed=113)
+    path = tmp_path / "staged-self-play.pt"
+    save_checkpoint(path, model, optimizer, 1, 16, 1.0, config, collector)
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    for name in (
+        "self_play_fraction",
+        "self_play_gate_score_delta",
+        "self_play_gate_consecutive_evals",
+        "historical_snapshot_probability",
+    ):
+        checkpoint["ppo_config"].pop(name)
+    checkpoint["ppo_config"].update(
+        {
+            "rule_mix_score_delta": -500.0,
+            "rule_league_score_delta": 0.0,
+            "rule_gate_consecutive_evals": 3,
+        }
+    )
+    torch.save(checkpoint, path)
+
+    _, restored = checkpoint_configs(path)
+
+    assert restored.self_play_fraction == 0.25
+    assert restored.self_play_gate_score_delta == 0.0
+    assert restored.self_play_gate_consecutive_evals == 3
+    assert restored.historical_snapshot_probability == 0.5
 
 
 def test_cosine_learning_rate_hits_both_endpoints() -> None:

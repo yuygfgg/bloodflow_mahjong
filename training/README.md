@@ -117,8 +117,34 @@ resume record as the start of a new metric generation.
 
 The first baseline keeps self-play disabled. Each non-learner seat independently
 uses Rule-Fast with probability `1/3` or Rule-EV standard with probability
-`2/3`. The optional `--self-play` flag enables the retained frozen-policy
-curriculum only for a later, separate experiment.
+`2/3`.
+
+Use `--fork` to start self-play from a complete PPO checkpoint without changing
+the source run. A fork restores the model, value head, optimizer, RNG state,
+collector state, and accumulated 24-hour schedule. It permits changes only to
+the opponent curriculum. The following command continues the 16-hour policy to
+the cumulative 24-hour target:
+
+```bash
+python -m training.train \
+  --device cuda \
+  --hours 24 \
+  --fork runs/ppo-rule-ev-2h-seed7/snapshot_16h.pt \
+  --output-dir runs/ppo-self-play-25-from16h-seed7 \
+  --self-play \
+  --self-play-fraction 0.25 \
+  --historical-snapshot-probability 0.5 \
+  --opponent-refresh-updates 200 \
+  --checkpoint-every 50
+```
+
+After the Rule-EV gate passes, each non-learner seat uses a frozen policy with
+probability `25%`, Rule-EV with probability `50%`, or Rule-Fast with probability
+`25%`. The pool creates a snapshot every 200 PPO updates and retains four,
+including the fork anchor.
+Each rollout uses the newest snapshot or a retained historical snapshot with
+equal probability. Periodic evaluation continues to use three Rule-EV players
+as a fixed external anchor.
 
 Start the corrected hybrid pilot from the completed Rule-EV supervised Actor.
 Do not resume the failed score-only PPO run:
@@ -172,6 +198,28 @@ seed appears once in all four seats, and the other three players use Rule-EV
 standard. Finished rows are not refilled, so short games cannot be counted more
 often. Periodic evaluations reuse one fixed panel for trend measurement; the
 final evaluation uses a fresh panel.
+
+To test whether PPO snapshots improve against each other, run the deterministic
+cross-play arena. Each matrix cell evaluates the row snapshot against three
+copies of the column snapshot, with every focal seat represented equally:
+
+```bash
+python -m training.arena \
+  --device cuda \
+  --games 1024 \
+  --output runs/ppo-rule-ev-2h-seed7/crossplay.json \
+  2h=runs/ppo-rule-ev-2h-seed7/snapshot_2h.pt \
+  6h=runs/ppo-rule-ev-2h-seed7/snapshot_6h.pt \
+  12h=runs/ppo-rule-ev-2h-seed7/snapshot_12h.pt \
+  16h=runs/ppo-rule-ev-2h-seed7/snapshot_16h.pt
+```
+
+The arena splits tied placements across their occupied ranks. It computes
+standard errors from independent seeds after averaging each four-seat panel.
+The diagonal is rank 2.5 and score zero. A later snapshot should have lower
+rank and positive score against an earlier snapshot if it learned a generally
+stronger policy. Compare the matrix with the separate Rule-EV evaluations
+before drawing conclusions from one matchup.
 
 `latest.pt` stores the complete PPO model and optimizer, RNG states, opponent
 state, collector seed, accumulated PPO time, engine rules version, input

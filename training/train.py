@@ -55,7 +55,27 @@ def build_parser() -> argparse.ArgumentParser:
         "--self-play",
         action="store_true",
         default=None,
-        help="enable gated frozen-policy opponents; disabled for the first baseline",
+        help="enable gated fixed-ratio frozen-policy opponents",
+    )
+    parser.add_argument(
+        "--self-play-fraction",
+        type=float,
+        help="fraction of non-learner seats controlled by frozen policies",
+    )
+    parser.add_argument(
+        "--historical-snapshot-probability",
+        type=float,
+        help="chance to use retained history instead of the newest snapshot",
+    )
+    parser.add_argument(
+        "--opponent-refresh-updates",
+        type=int,
+        help="PPO updates between frozen snapshot creations",
+    )
+    parser.add_argument(
+        "--frozen-snapshot-limit",
+        type=int,
+        help="maximum retained frozen policies",
     )
     parser.add_argument(
         "--score-reward-weight",
@@ -79,6 +99,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     checkpoint = parser.add_mutually_exclusive_group()
     checkpoint.add_argument("--resume", type=Path)
+    checkpoint.add_argument(
+        "--fork",
+        type=Path,
+        help="branch complete PPO state into a new opponent curriculum",
+    )
     checkpoint.add_argument(
         "--init-actor",
         type=Path,
@@ -155,6 +180,16 @@ def _compact_record(record: dict[str, Any]) -> str:
             f"  elapsed {format_duration(float(record['previous_run_elapsed_seconds']))}"
             f"/{float(record['target_hours']):g}h"
         )
+    if phase == "fork":
+        evaluation = record["evaluation"]
+        assert isinstance(evaluation, dict)
+        return (
+            f"FORK  u{int(record['update']):>5}"
+            f"  {int(record['transitions']):,} states"
+            f"  elapsed {format_duration(float(record['previous_run_elapsed_seconds']))}"
+            f"/{float(record['target_hours']):g}h"
+            f"  EV {_compact_evaluation(evaluation)}"
+        )
     if phase == "ppo":
         kl_summary = (
             "  KL off"
@@ -201,42 +236,86 @@ def _append_record(path: Path, record: dict[str, Any]) -> None:
     print(_compact_record(record), flush=True)
 
 
+def _requested_overrides(
+    args: argparse.Namespace,
+) -> dict[str, tuple[str, Any]]:
+    return {
+        "--self-play": ("self_play_enabled", args.self_play),
+        "--self-play-fraction": (
+            "self_play_fraction",
+            args.self_play_fraction,
+        ),
+        "--historical-snapshot-probability": (
+            "historical_snapshot_probability",
+            args.historical_snapshot_probability,
+        ),
+        "--opponent-refresh-updates": (
+            "opponent_refresh_updates",
+            args.opponent_refresh_updates,
+        ),
+        "--frozen-snapshot-limit": (
+            "frozen_snapshot_limit",
+            args.frozen_snapshot_limit,
+        ),
+        "--microbatch": ("microbatch", args.microbatch),
+        "--score-reward-weight": (
+            "score_reward_weight",
+            args.score_reward_weight,
+        ),
+        "--rank-reward-weight": (
+            "rank_reward_weight",
+            args.rank_reward_weight,
+        ),
+        "--kl-control": ("kl_control", args.kl_control),
+        "--target-kl": ("target_kl", args.target_kl),
+    }
+
+
 def _fresh_config(args: argparse.Namespace) -> PPOConfig:
     overrides = {
-        "self_play_enabled": args.self_play,
-        "microbatch": args.microbatch,
-        "score_reward_weight": args.score_reward_weight,
-        "rank_reward_weight": args.rank_reward_weight,
-        "kl_control": args.kl_control,
-        "target_kl": args.target_kl,
+        name: value
+        for name, value in _requested_overrides(args).values()
+        if value is not None
     }
     return replace(
         PPOConfig(),
-        **{name: value for name, value in overrides.items() if value is not None},
+        **overrides,
     )
 
 
 def _check_resume_overrides(args: argparse.Namespace, config: PPOConfig) -> None:
-    overrides = {
-        "--self-play": (args.self_play, config.self_play_enabled),
-        "--microbatch": (args.microbatch, config.microbatch),
-        "--score-reward-weight": (
-            args.score_reward_weight,
-            config.score_reward_weight,
-        ),
-        "--rank-reward-weight": (
-            args.rank_reward_weight,
-            config.rank_reward_weight,
-        ),
-        "--kl-control": (args.kl_control, config.kl_control),
-        "--target-kl": (args.target_kl, config.target_kl),
-    }
-    for option, (requested, checkpoint_value) in overrides.items():
+    for option, (name, requested) in _requested_overrides(args).items():
+        checkpoint_value = getattr(config, name)
         if requested is not None and requested != checkpoint_value:
             raise ValueError(
                 f"{option} cannot override the resumed checkpoint value "
                 f"{checkpoint_value!r}"
             )
+
+
+_FORKABLE_CONFIG = {
+    "self_play_enabled",
+    "self_play_fraction",
+    "historical_snapshot_probability",
+    "opponent_refresh_updates",
+    "frozen_snapshot_limit",
+}
+
+
+def _fork_config(args: argparse.Namespace, source: PPOConfig) -> PPOConfig:
+    overrides: dict[str, Any] = {}
+    for option, (name, requested) in _requested_overrides(args).items():
+        if requested is None:
+            continue
+        source_value = getattr(source, name)
+        if name not in _FORKABLE_CONFIG and requested != source_value:
+            raise ValueError(
+                f"{option} cannot override the forked checkpoint value "
+                f"{source_value!r}"
+            )
+        if name in _FORKABLE_CONFIG:
+            overrides[name] = requested
+    return replace(source, **overrides)
 
 
 def run(args: argparse.Namespace) -> None:
@@ -247,8 +326,9 @@ def run(args: argparse.Namespace) -> None:
         raise ValueError("evaluation and checkpoint intervals must be positive")
     if args.eval_games <= 0 or args.eval_games % 4 != 0:
         raise ValueError("--eval-games must be a positive multiple of four")
-    if args.smoke and args.resume is not None:
-        raise ValueError("--smoke cannot be combined with --resume")
+    checkpoint_path = args.resume if args.resume is not None else args.fork
+    if args.smoke and checkpoint_path is not None:
+        raise ValueError("--smoke cannot be combined with --resume or --fork")
 
     random.seed(args.seed)
     np.random.seed(args.seed)
@@ -258,10 +338,19 @@ def run(args: argparse.Namespace) -> None:
     if device.type == "cuda" and not torch.cuda.is_available():
         raise RuntimeError("CUDA was requested but torch.cuda.is_available() is false")
 
-    resume_model_config = None
+    restored_model_config = None
+    source_config = None
+    if checkpoint_path is not None:
+        restored_model_config, source_config = checkpoint_configs(checkpoint_path)
     if args.resume is not None:
-        resume_model_config, config = checkpoint_configs(args.resume)
+        if source_config is None:
+            raise RuntimeError("resumed run has no PPO configuration")
+        config = source_config
         _check_resume_overrides(args, config)
+    elif args.fork is not None:
+        if source_config is None:
+            raise RuntimeError("forked run has no PPO configuration")
+        config = _fork_config(args, source_config)
     else:
         config = _fresh_config(args)
     smoke_updates = 0
@@ -282,14 +371,14 @@ def run(args: argparse.Namespace) -> None:
         args.eval_games = 8
         args.checkpoint_every = 1
         smoke_updates = 2
-    if args.resume is None and args.microbatch is not None:
+    if checkpoint_path is None and args.microbatch is not None:
         if args.microbatch <= 0:
             raise ValueError("--microbatch must be positive")
 
-    if args.resume is not None:
-        if resume_model_config is None:
-            raise RuntimeError("resumed run has no model configuration")
-        model = BloodFlowTransformer(resume_model_config).to(device)
+    if checkpoint_path is not None:
+        if restored_model_config is None:
+            raise RuntimeError("restored run has no model configuration")
+        model = BloodFlowTransformer(restored_model_config).to(device)
     elif args.init_actor is not None:
         model = load_actor_checkpoint(args.init_actor, device)
     else:
@@ -298,23 +387,29 @@ def run(args: argparse.Namespace) -> None:
     collector = RolloutCollector(config, device, seed=args.seed + 1)
 
     if args.output_dir is None:
-        args.output_dir = (
-            args.resume.parent if args.resume is not None else Path("runs/transformer")
-        )
+        if args.resume is not None:
+            args.output_dir = args.resume.parent
+        elif args.fork is not None:
+            raise ValueError("--fork requires a new --output-dir")
+        else:
+            args.output_dir = Path("runs/transformer")
     if args.resume is not None and args.output_dir.resolve() != args.resume.parent.resolve():
         raise ValueError("a resumed run must use the checkpoint directory")
+    if args.fork is not None and args.output_dir.resolve() == args.fork.parent.resolve():
+        raise ValueError("a fork must use a new output directory")
 
     update = 0
     transitions = 0
     previous_ppo_seconds = 0.0
-    if args.resume is not None:
+    if checkpoint_path is not None:
         update, transitions, previous_ppo_seconds = load_checkpoint(
-            args.resume,
+            checkpoint_path,
             model,
             optimizer,
             device,
             config,
             collector,
+            expected_checkpoint_config=source_config,
         )
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -335,6 +430,7 @@ def run(args: argparse.Namespace) -> None:
                     | {
                         "output_dir": str(args.output_dir),
                         "resume": None,
+                        "fork": str(args.fork) if args.fork is not None else None,
                         "init_actor": (
                             str(args.init_actor) if args.init_actor is not None else None
                         ),
@@ -352,6 +448,7 @@ def run(args: argparse.Namespace) -> None:
         hour
         for hour in milestone_hours
         if (args.output_dir / f"snapshot_{hour}h.pt").exists()
+        or previous_ppo_seconds >= hour * 3600.0
     }
     initial_transitions = transitions
     initial_update = update
@@ -380,6 +477,32 @@ def run(args: argparse.Namespace) -> None:
                 "eval_every": args.eval_every,
                 "eval_games": args.eval_games,
                 "checkpoint_every": args.checkpoint_every,
+            },
+        )
+    elif args.fork is not None:
+        synchronize()
+        evaluation_start = time.perf_counter()
+        baseline = evaluate_against_rule_ev(
+            model,
+            device,
+            games=args.eval_games,
+            envs=min(config.envs, args.eval_games),
+            seed=_PERIODIC_EVALUATION_SEED,
+        )
+        synchronize()
+        collector.pool.update_rule_evaluation(baseline)
+        _append_record(
+            metrics_path,
+            {
+                "phase": "fork",
+                "checkpoint": str(args.fork),
+                "update": update,
+                "transitions": transitions,
+                "previous_run_elapsed_seconds": previous_ppo_seconds,
+                "target_hours": args.hours,
+                "schedule_hours": config.schedule_hours,
+                "evaluation": baseline,
+                "evaluation_seconds": time.perf_counter() - evaluation_start,
             },
         )
     else:
@@ -411,15 +534,11 @@ def run(args: argparse.Namespace) -> None:
         if smoke_updates and update - initial_update >= smoke_updates:
             break
         progress = min(elapsed_seconds() / schedule_seconds, 1.0)
-        if (
-            config.self_play_enabled
-            and collector.pool.rule_mix_streak >= config.rule_gate_consecutive_evals
-            and (
-                not collector.pool.frozen_ready
-                or update % config.opponent_refresh_updates == 0
-            )
-        ):
-            collector.pool.refresh_snapshot(model, device)
+        if config.self_play_enabled and collector.pool.gate_ready:
+            if collector.pool.snapshot_due(update):
+                collector.pool.refresh_snapshot(model, device, update=update)
+            else:
+                collector.pool.select_snapshot()
 
         learning_rate = cosine_learning_rate(config, progress)
         for parameter_group in optimizer.param_groups:
@@ -471,10 +590,10 @@ def run(args: argparse.Namespace) -> None:
             ),
             "active_snapshot": rollout.active_snapshot,
             "snapshot_count": len(collector.pool.snapshots),
+            "last_snapshot_update": collector.pool.last_snapshot_update,
             "rule_ev_score_delta": collector.pool.rule_score_delta,
             "rule_ev_first_rate": collector.pool.rule_first_rate,
-            "rule_mix_streak": collector.pool.rule_mix_streak,
-            "rule_league_streak": collector.pool.rule_league_streak,
+            "rule_gate_streak": collector.pool.rule_gate_streak,
             **rollout.cache_stats,
             **statistics,
         }
@@ -493,8 +612,7 @@ def run(args: argparse.Namespace) -> None:
             collector.pool.update_rule_evaluation(record["evaluation"])
             record["rule_ev_score_delta"] = collector.pool.rule_score_delta
             record["rule_ev_first_rate"] = collector.pool.rule_first_rate
-            record["rule_mix_streak"] = collector.pool.rule_mix_streak
-            record["rule_league_streak"] = collector.pool.rule_league_streak
+            record["rule_gate_streak"] = collector.pool.rule_gate_streak
             record["next_opponent_stage"] = collector.pool.stage()
         _append_record(metrics_path, record)
 

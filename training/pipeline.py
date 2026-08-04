@@ -73,10 +73,11 @@ class PPOConfig:
     improving_coefficient: float = 0.01
     auxiliary_decay_fraction: float = 0.10
     self_play_enabled: bool = False
-    rule_mix_score_delta: float = -500.0
-    rule_league_score_delta: float = 0.0
-    rule_gate_consecutive_evals: int = 3
-    opponent_refresh_updates: int = 10
+    self_play_fraction: float = 0.25
+    self_play_gate_score_delta: float = 0.0
+    self_play_gate_consecutive_evals: int = 3
+    historical_snapshot_probability: float = 0.50
+    opponent_refresh_updates: int = 200
     frozen_snapshot_limit: int = 4
 
     def __post_init__(self) -> None:
@@ -87,7 +88,7 @@ class PPOConfig:
             "minibatch",
             "microbatch",
             "history_cache_min_batch",
-            "rule_gate_consecutive_evals",
+            "self_play_gate_consecutive_evals",
             "opponent_refresh_updates",
             "frozen_snapshot_limit",
         ):
@@ -104,6 +105,18 @@ class PPOConfig:
             self.kl_control == "rollback" and self.target_kl <= 0.0
         ):
             raise ValueError("target KL must be finite and positive in rollback mode")
+        if not math.isfinite(self.self_play_fraction) or not (
+            0.0 <= self.self_play_fraction < 1.0
+        ):
+            raise ValueError("self-play fraction must be in [0, 1)")
+        if self.self_play_enabled and self.self_play_fraction == 0.0:
+            raise ValueError("enabled self-play requires a positive fraction")
+        if not math.isfinite(self.self_play_gate_score_delta):
+            raise ValueError("self-play gate score delta must be finite")
+        if not math.isfinite(self.historical_snapshot_probability) or not (
+            0.0 <= self.historical_snapshot_probability <= 1.0
+        ):
+            raise ValueError("historical snapshot probability must be in [0, 1]")
 
 
 def focal_ranks(scores: np.ndarray, seats: np.ndarray) -> np.ndarray:
@@ -412,7 +425,7 @@ def _inference_chunk(
 
 
 class OpponentPool:
-    """Rule opponents and optional frozen-policy curriculum.
+    """Rule opponents and an optional fixed-ratio frozen-policy pool.
 
     Opponent types are assigned per *absolute seat*, not once per game.  This
     gives the learner mixed three-player tables while keeping every policy
@@ -431,10 +444,10 @@ class OpponentPool:
         self.rule_ev_config = bm.RuleEvConfig.standard()
         self.snapshots: list[BloodFlowTransformer] = []
         self.active_snapshot: int | None = None
+        self.last_snapshot_update: int | None = None
         self.rule_first_rate: float | None = None
         self.rule_score_delta: float | None = None
-        self.rule_mix_streak = 0
-        self.rule_league_streak = 0
+        self.rule_gate_streak = 0
 
     @property
     def frozen_model(self) -> BloodFlowTransformer | None:
@@ -446,12 +459,12 @@ class OpponentPool:
     def frozen_ready(self) -> bool:
         return self.frozen_model is not None
 
-    def _competence_stage(self) -> str:
-        if self.rule_mix_streak < self.config.rule_gate_consecutive_evals:
-            return "bootstrap"
-        if self.rule_league_streak < self.config.rule_gate_consecutive_evals:
-            return "mixed"
-        return "league"
+    @property
+    def gate_ready(self) -> bool:
+        return (
+            self.rule_gate_streak
+            >= self.config.self_play_gate_consecutive_evals
+        )
 
     def stage(self) -> str:
         """Return the executable opponent stage from rule competence.
@@ -460,21 +473,27 @@ class OpponentPool:
         consecutive evaluations are required so a noisy small evaluation
         cannot promote the learner into a harder opponent distribution.
         """
-        if not self.config.self_play_enabled:
+        if (
+            not self.config.self_play_enabled
+            or not self.gate_ready
+            or not self.frozen_ready
+        ):
             return "bootstrap"
-        competence_stage = self._competence_stage()
-        if competence_stage != "bootstrap" and not self.frozen_ready:
-            return "bootstrap"
-        return competence_stage
+        return "self_play"
 
     def probabilities(self) -> np.ndarray:
         """Probability of each policy for one non-learner seat."""
-        stage = self.stage()
-        if stage == "bootstrap":
+        if self.stage() == "bootstrap":
             return np.array([1.0 / 3.0, 2.0 / 3.0, 0.0], dtype=np.float64)
-        if stage == "mixed":
-            return np.array([13.0 / 60.0, 13.0 / 30.0, 0.35], dtype=np.float64)
-        return np.array([7.0 / 60.0, 7.0 / 30.0, 0.65], dtype=np.float64)
+        rule_fraction = 1.0 - self.config.self_play_fraction
+        return np.array(
+            [
+                rule_fraction / 3.0,
+                2.0 * rule_fraction / 3.0,
+                self.config.self_play_fraction,
+            ],
+            dtype=np.float64,
+        )
 
     def assign_seats(self, learner_seats: np.ndarray) -> np.ndarray:
         """Return opponent kinds with shape ``[env, absolute_seat]``.
@@ -497,30 +516,43 @@ class OpponentPool:
         self,
         model: BloodFlowTransformer,
         device: torch.device,
+        *,
+        update: int | None = None,
     ) -> int | None:
-        """Freeze the learner and select a current or historical snapshot.
-
-        Snapshot creation starts only after the rule competence gate. During
-        the mixed stage the latest snapshot is preferred. In the league stage a
-        quarter of rollouts deliberately use a retained historical snapshot;
-        this protects against immediately overfitting the newest policy while
-        requiring only one frozen forward batch per rollout.
-        """
-        if not self.config.self_play_enabled or (
-            self.rule_mix_streak < self.config.rule_gate_consecutive_evals
-        ):
+        """Add a frozen learner snapshot after the rule competence gate."""
+        if not self.config.self_play_enabled or not self.gate_ready:
             return None
         self.snapshots.append(clone_model(model, device))
         overflow = len(self.snapshots) - self.config.frozen_snapshot_limit
-        if overflow > 0:
-            del self.snapshots[:overflow]
+        if self.config.frozen_snapshot_limit == 1:
+            self.snapshots[:] = self.snapshots[-1:]
+        elif overflow > 0:
+            # Keep the fork anchor and evict the oldest post-fork policies.
+            # This leaves one stable reference while the remaining slots track
+            # recent learner generations.
+            del self.snapshots[1 : 1 + overflow]
+        self.last_snapshot_update = update
+        return self.select_snapshot()
 
+    def snapshot_due(self, update: int) -> bool:
+        """Return whether the learner should create a new frozen policy."""
+        return (
+            not self.frozen_ready
+            or self.last_snapshot_update is None
+            or update - self.last_snapshot_update
+            >= self.config.opponent_refresh_updates
+        )
+
+    def select_snapshot(self) -> int | None:
+        """Select one batched frozen opponent for the next rollout."""
+        if not self.snapshots:
+            self.active_snapshot = None
+            return None
         latest = len(self.snapshots) - 1
-        if self.stage() == "league" and len(self.snapshots) > 1:
-            if self.random.random() < 0.25:
-                self.active_snapshot = int(self.random.integers(0, latest))
-            else:
-                self.active_snapshot = latest
+        if latest > 0 and (
+            self.random.random() < self.config.historical_snapshot_probability
+        ):
+            self.active_snapshot = int(self.random.integers(0, latest))
         else:
             self.active_snapshot = latest
         return self.active_snapshot
@@ -531,24 +563,18 @@ class OpponentPool:
         score_delta = float(evaluation["mean_score_delta"])
         self.rule_first_rate = first_rate
         self.rule_score_delta = score_delta
-        required = self.config.rule_gate_consecutive_evals
-        if score_delta >= self.config.rule_mix_score_delta:
-            self.rule_mix_streak += 1
+        required = self.config.self_play_gate_consecutive_evals
+        if score_delta >= self.config.self_play_gate_score_delta:
+            self.rule_gate_streak += 1
         else:
-            self.rule_mix_streak = 0
-            self.rule_league_streak = 0
-            return
-        if score_delta >= self.config.rule_league_score_delta:
-            self.rule_league_streak += 1
-        else:
-            self.rule_league_streak = 0
-        self.rule_mix_streak = min(self.rule_mix_streak, required)
-        self.rule_league_streak = min(self.rule_league_streak, required)
+            self.rule_gate_streak = 0
+        self.rule_gate_streak = min(self.rule_gate_streak, required)
 
     def set_frozen(self, model: BloodFlowTransformer | None) -> None:
         """Install a frozen model, primarily for tests and explicit resume."""
         self.snapshots.clear()
         self.active_snapshot = None
+        self.last_snapshot_update = None
         if model is not None:
             model.eval()
             for parameter in model.parameters():
@@ -560,11 +586,11 @@ class OpponentPool:
         return {
             "rng_state": self.random.bit_generator.state,
             "active_snapshot": self.active_snapshot,
+            "last_snapshot_update": self.last_snapshot_update,
             "snapshots": [snapshot.state_dict() for snapshot in self.snapshots],
             "rule_first_rate": self.rule_first_rate,
             "rule_score_delta": self.rule_score_delta,
-            "rule_mix_streak": self.rule_mix_streak,
-            "rule_league_streak": self.rule_league_streak,
+            "rule_gate_streak": self.rule_gate_streak,
         }
 
     def load_state_dict(
@@ -577,10 +603,15 @@ class OpponentPool:
             return
         self.random.bit_generator.state = state["rng_state"]
         self.snapshots = []
+        last_snapshot_update = state.get("last_snapshot_update")
+        self.last_snapshot_update = (
+            int(last_snapshot_update) if last_snapshot_update is not None else None
+        )
         self.rule_first_rate = state.get("rule_first_rate")
         self.rule_score_delta = state.get("rule_score_delta")
-        self.rule_mix_streak = int(state.get("rule_mix_streak", 0))
-        self.rule_league_streak = int(state.get("rule_league_streak", 0))
+        self.rule_gate_streak = int(
+            state.get("rule_gate_streak", state.get("rule_league_streak", 0))
+        )
         for snapshot_state in state.get("snapshots", []):
             snapshot = BloodFlowTransformer(model_config).to(device)
             snapshot.load_state_dict(snapshot_state)
@@ -1504,7 +1535,31 @@ def _model_config_from_state(state: Any) -> TransformerConfig:
 def _ppo_config_from_state(state: Any) -> PPOConfig:
     if not isinstance(state, dict):
         raise ValueError("checkpoint PPO configuration is invalid")
+    state = dict(state)
     expected = {field.name for field in fields(PPOConfig)}
+    legacy_curriculum = {
+        "rule_mix_score_delta",
+        "rule_league_score_delta",
+        "rule_gate_consecutive_evals",
+    }
+    current_curriculum = {
+        "self_play_fraction",
+        "self_play_gate_score_delta",
+        "self_play_gate_consecutive_evals",
+        "historical_snapshot_probability",
+    }
+    if legacy_curriculum <= set(state) and not (current_curriculum & set(state)):
+        league_score_delta = state.pop("rule_league_score_delta")
+        gate_evaluations = state.pop("rule_gate_consecutive_evals")
+        state.pop("rule_mix_score_delta")
+        state.update(
+            {
+                "self_play_fraction": 0.25,
+                "self_play_gate_score_delta": league_score_delta,
+                "self_play_gate_consecutive_evals": gate_evaluations,
+                "historical_snapshot_probability": 0.50,
+            }
+        )
     legacy_additions = {
         "kl_control": "monitor",
         "score_reward_weight": 1.0,
@@ -1533,6 +1588,29 @@ def checkpoint_configs(path: Path) -> tuple[TransformerConfig, PPOConfig]:
 
 def checkpoint_model_config(path: Path) -> TransformerConfig:
     return checkpoint_configs(path)[0]
+
+
+def load_checkpoint_model(
+    path: Path,
+    device: torch.device,
+) -> BloodFlowTransformer:
+    """Load and validate the complete policy from a PPO checkpoint.
+
+    The arena evaluator needs the policy weights but does not need the
+    optimizer or rollout state. Keeping this loader next to the checkpoint
+    validators prevents evaluation tools from silently accepting a checkpoint
+    from a different engine or observation schema.
+    """
+    checkpoint = torch.load(path, map_location="cpu", weights_only=False)
+    _validate_checkpoint_header(checkpoint)
+    model = BloodFlowTransformer(
+        _model_config_from_state(checkpoint.get("model_config"))
+    )
+    state = checkpoint.get("model")
+    if not isinstance(state, dict):
+        raise ValueError("checkpoint model state is invalid")
+    model.load_state_dict(state)
+    return model.to(device).eval()
 
 
 def save_checkpoint(
@@ -1583,12 +1661,16 @@ def load_checkpoint(
     device: torch.device,
     config: PPOConfig,
     collector: RolloutCollector,
+    *,
+    expected_checkpoint_config: PPOConfig | None = None,
 ) -> tuple[int, int, float]:
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     _validate_checkpoint_header(checkpoint)
     if _model_config_from_state(checkpoint.get("model_config")) != model.config:
         raise ValueError("checkpoint model configuration does not match")
-    if _ppo_config_from_state(checkpoint.get("ppo_config")) != config:
+    stored_config = _ppo_config_from_state(checkpoint.get("ppo_config"))
+    expected_config = expected_checkpoint_config or config
+    if stored_config != expected_config:
         raise ValueError("checkpoint PPO configuration does not match")
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
