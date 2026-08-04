@@ -7,3 +7,8 @@ __pycache__/
 .pytest_cache/
 .vscode/
 runs/
+
+# WASM / JS build artifacts (regenerate with engine/wasm/build.sh)
+/engine/wasm/pkg/
+/engine/wasm/js/dist/
+/engine/wasm/js/node_modules/

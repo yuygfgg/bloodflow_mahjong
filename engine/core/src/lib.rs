@@ -7,6 +7,7 @@
 #![forbid(unsafe_code)]
 
 mod action;
+mod binding;
 mod game;
 mod hand;
 mod rng;
@@ -19,14 +20,16 @@ pub use action::{
     ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, Action, ActionId, ActionMask,
     LEGAL_ACTION_MASK_WORDS,
 };
+pub use binding::{ENGINE_CONSTANTS, EngineConstant};
 pub use game::{
     Batch, Decision, DiscardEvent, DrawEvent, DrawNotice, ENGINE_RULES_VERSION,
     EVENT_FLAG_AFTER_KONG, EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE,
     EVENT_FLAG_OPENING_DISCARD, EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG,
     EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY, EVENT_RECORD_WIDTH, EventKind, Game, GameError,
-    LegalActions, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, ORACLE_TILE_COUNT_PLANES,
-    ORACLE_TILE_COUNT_WIDTH, Phase, PlayerStepOutcome, RIVER_OBSERVATION_WIDTH, STEP_RECORD_WIDTH,
-    StepOutcome, TILE_OBSERVATION_WIDTH, TerminationReason,
+    LegalActions, MELD_FIELDS, MELD_OBSERVATION_WIDTH, MELD_SLOTS, META_OBSERVATION_WIDTH,
+    ORACLE_TILE_COUNT_PLANES, ORACLE_TILE_COUNT_WIDTH, Phase, PlayerStepOutcome, RIVER_FIELDS,
+    RIVER_OBSERVATION_WIDTH, RIVER_TILE_CAPACITY, STEP_RECORD_WIDTH, StepOutcome,
+    TILE_OBSERVATION_PLANES, TILE_OBSERVATION_WIDTH, TerminationReason,
 };
 pub use hand::{
     MaxWaitEvaluation, Pattern, PatternSet, SHANTEN_COMPLETE, SHANTEN_MAX, SHANTEN_TERMINAL,
@@ -47,4 +50,4 @@ pub use rules::planner::{
     RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
     RulePlannerSearchAnalysis, RulePlannerSearchOutcome,
 };
-pub use types::{ExchangeDirection, Meld, MeldKind, Seat, Suit, Tile, WinSource};
+pub use types::{ExchangeDirection, Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile, WALL_TILE_COUNT, WinSource};

@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | [`core/`](core/) | `bloodflow-mahjong` | Rust 库和四个诊断 benchmark |
 | [`pybind/`](pybind/) | `bloodflow-mahjong-pybind` | Python 扩展 `bloodflow_mahjong` |
+| [`wasm/`](wasm/) | `bloodflow-mahjong-wasm` | WebAssembly 绑定与 TypeScript 封装 |
 | [`tools/rule-tournament/`](tools/rule-tournament/) | `bloodflow-mahjong-rule-tournament` | `rule-tournament` CLI |
 
 workspace 使用 Rust 2024 edition，最低 Rust 版本为 1.85。release profile 使用单 codegen unit、fat LTO 和 `panic=abort`。
@@ -26,6 +27,14 @@ cargo doc \
 ```
 
 PyBind cdylib 与 core crate 使用同一个 Rust lib 名称，不能共用 rustdoc 输出路径。Python API 以 [`pybind/README.md`](pybind/README.md) 和 `bloodflow_mahjong.pyi` 为准。
+
+WebAssembly 绑定与 TypeScript 封装见 [`wasm/README.md`](wasm/README.md)。完整 Node 测试 harness 执行：
+
+```bash
+./engine/wasm/build.sh
+cd engine/wasm/js && npm test
+```
+
 
 需要完整 release 产物时执行：
 
@@ -59,7 +68,7 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
   --policy-b rule-fast
 ```
 
-该命令是 smoke test。统计方法、预算参数和长测命令见 [`tools/rule-tournament/README.md`](tools/rule-tournament/README.md)。
+该命令只做 `rule-tournament` 的短路径冒烟。统计方法、预算参数和长测命令见 [`tools/rule-tournament/README.md`](tools/rule-tournament/README.md)。
 
 使用仓库中的 ONNX 模型检查 Rust 加载和推理：
 

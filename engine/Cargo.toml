@@ -2,6 +2,7 @@
 members = [
     "core",
     "pybind",
+    "wasm",
     "tools/rule-tournament",
 ]
 resolver = "3"

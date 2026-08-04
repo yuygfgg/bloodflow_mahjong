@@ -2,17 +2,14 @@ use ::bloodflow_mahjong as core_engine;
 #[cfg(feature = "rule-nn")]
 use core_engine::RuleNn;
 use core_engine::{
-    ACTION_ADDED_KONG_OFFSET, ACTION_CHOOSE_MISSING_OFFSET, ACTION_CONCEALED_KONG_OFFSET,
-    ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
-    ACTION_PASS, ACTION_PONG, ACTION_SPACE_SIZE, ActionId, Batch, ENGINE_RULES_VERSION,
-    EVENT_FLAG_AFTER_KONG, EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE,
-    EVENT_FLAG_OPENING_DISCARD, EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG,
-    EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY, EVENT_RECORD_WIDTH, EventKind, ExchangeDirection,
-    Game, GameError, LEGAL_ACTION_MASK_WORDS, MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH,
-    MeldKind, ORACLE_TILE_COUNT_PLANES, Phase, RIVER_OBSERVATION_WIDTH, RULE_EV_ACTION_TERMINAL,
-    RULE_PLANNER_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense, RulePlannerConfig, SHANTEN_COMPLETE,
-    SHANTEN_MAX, SHANTEN_TERMINAL, SIMPLE_RULE_ACTION_TERMINAL, STEP_RECORD_WIDTH, Seat,
-    StepOutcome, TILE_OBSERVATION_WIDTH, TerminationReason,
+    ACTION_SPACE_SIZE, ActionId, Batch, ENGINE_CONSTANTS, EVENT_FLAG_AFTER_KONG,
+    EVENT_FLAG_EARTHLY, EVENT_FLAG_HEAVENLY, EVENT_FLAG_LAST_WALL_TILE, EVENT_FLAG_OPENING_DISCARD,
+    EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG, EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY,
+    EVENT_RECORD_WIDTH, EventKind, ExchangeDirection, Game, GameError, LEGAL_ACTION_MASK_WORDS,
+    MELD_FIELDS, MELD_SLOTS, META_OBSERVATION_WIDTH, MeldKind, ORACLE_TILE_COUNT_PLANES,
+    PLAYER_COUNT, Phase, RIVER_FIELDS, RIVER_TILE_CAPACITY, RuleEvConfig, RuleEvDefense,
+    RulePlannerConfig, STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_KIND_COUNT,
+    TILE_OBSERVATION_PLANES, TerminationReason,
 };
 use numpy::{
     PyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray,
@@ -22,13 +19,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-const PLAYER_COUNT: usize = 4;
-const TILE_KIND_COUNT: usize = 27;
-const TILE_OBSERVATION_PLANES: usize = 10;
-const MELD_SLOTS: usize = 4;
-const MELD_FIELDS: usize = 3;
-const RIVER_TILE_CAPACITY: usize = 108;
-const RIVER_FIELDS: usize = 2;
 
 type StepRecordTuple = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
 
@@ -1536,52 +1526,8 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyGame>()?;
     module.add_class::<PyBatch>()?;
     add_event_enums(module)?;
-    module.add("ACTION_SPACE_SIZE", ACTION_SPACE_SIZE)?;
-    module.add("ACTION_EXCHANGE_TILE_OFFSET", ACTION_EXCHANGE_TILE_OFFSET)?;
-    module.add("ACTION_CHOOSE_MISSING_OFFSET", ACTION_CHOOSE_MISSING_OFFSET)?;
-    module.add("ACTION_DISCARD_OFFSET", ACTION_DISCARD_OFFSET)?;
-    module.add("ACTION_HU", ACTION_HU)?;
-    module.add("ACTION_PONG", ACTION_PONG)?;
-    module.add("ACTION_EXPOSED_KONG", ACTION_EXPOSED_KONG)?;
-    module.add("ACTION_CONCEALED_KONG_OFFSET", ACTION_CONCEALED_KONG_OFFSET)?;
-    module.add("ACTION_ADDED_KONG_OFFSET", ACTION_ADDED_KONG_OFFSET)?;
-    module.add("ACTION_PASS", ACTION_PASS)?;
-    module.add("LEGAL_ACTION_MASK_WORDS", LEGAL_ACTION_MASK_WORDS)?;
-    module.add("STEP_RECORD_WIDTH", STEP_RECORD_WIDTH)?;
-    module.add("EVENT_RECORD_WIDTH", EVENT_RECORD_WIDTH)?;
-    module.add("EVENT_HISTORY_CAPACITY", EVENT_HISTORY_CAPACITY)?;
-    module.add("ENGINE_RULES_VERSION", ENGINE_RULES_VERSION)?;
-    module.add("SHANTEN_COMPLETE", SHANTEN_COMPLETE)?;
-    module.add("SHANTEN_MAX", SHANTEN_MAX)?;
-    module.add("SHANTEN_TERMINAL", SHANTEN_TERMINAL)?;
-    module.add("SIMPLE_RULE_ACTION_TERMINAL", SIMPLE_RULE_ACTION_TERMINAL)?;
-    module.add("RULE_EV_ACTION_TERMINAL", RULE_EV_ACTION_TERMINAL)?;
-    module.add("RULE_PLANNER_ACTION_TERMINAL", RULE_PLANNER_ACTION_TERMINAL)?;
-    module.add("TILE_OBSERVATION_WIDTH", TILE_OBSERVATION_WIDTH)?;
-    module.add("TILE_OBSERVATION_PLANES", TILE_OBSERVATION_PLANES)?;
-    module.add("MELD_OBSERVATION_WIDTH", MELD_OBSERVATION_WIDTH)?;
-    module.add("MELD_SLOTS", MELD_SLOTS)?;
-    module.add("MELD_FIELDS", MELD_FIELDS)?;
-    module.add("RIVER_OBSERVATION_WIDTH", RIVER_OBSERVATION_WIDTH)?;
-    module.add("RIVER_TILE_CAPACITY", RIVER_TILE_CAPACITY)?;
-    module.add("RIVER_FIELDS", RIVER_FIELDS)?;
-    module.add("META_OBSERVATION_WIDTH", META_OBSERVATION_WIDTH)?;
-    module.add("ORACLE_TILE_COUNT_PLANES", ORACLE_TILE_COUNT_PLANES)?;
-    module.add("PLAYER_COUNT", PLAYER_COUNT)?;
-    module.add("TILE_KIND_COUNT", TILE_KIND_COUNT)?;
-    module.add("PHASE_EXCHANGE", phase_code(Phase::Exchange))?;
-    module.add("PHASE_CHOOSE_MISSING", phase_code(Phase::ChooseMissing))?;
-    module.add("PHASE_TURN", phase_code(Phase::Turn))?;
-    module.add("PHASE_HU_RESPONSE", phase_code(Phase::HuResponse))?;
-    module.add("PHASE_MELD_RESPONSE", phase_code(Phase::MeldResponse))?;
-    module.add("PHASE_FINISHED", phase_code(Phase::Finished))?;
-    module.add(
-        "TERMINATION_WALL_EXHAUSTED",
-        TerminationReason::WallExhausted.code(),
-    )?;
-    module.add(
-        "TERMINATION_THREE_PLAYERS_BANKRUPT",
-        TerminationReason::ThreePlayersBankrupt.code(),
-    )?;
+    for constant in ENGINE_CONSTANTS {
+        module.add(constant.name, constant.value)?;
+    }
     Ok(())
 }

@@ -27,12 +27,22 @@ pub const STEP_RECORD_WIDTH: usize = 12;
 pub const EVENT_RECORD_WIDTH: usize = 8;
 /// Retained event history per environment. Older events are overwritten.
 pub const EVENT_HISTORY_CAPACITY: usize = 512;
+/// Viewer-scoped tile-count planes in the ordinary observation tensor.
+pub const TILE_OBSERVATION_PLANES: usize = 10;
 /// Ten viewer-scoped tile-count channels of 27 tile kinds each.
-pub const TILE_OBSERVATION_WIDTH: usize = 10 * TILE_KIND_COUNT;
+pub const TILE_OBSERVATION_WIDTH: usize = TILE_OBSERVATION_PLANES * TILE_KIND_COUNT;
+/// Meld slots stored per relative seat in the ordinary observation tensor.
+pub const MELD_SLOTS: usize = 4;
+/// Fields stored per meld slot: tile, kind, source_relative.
+pub const MELD_FIELDS: usize = 3;
 /// Four relative players, four meld slots, and three fields per meld.
-pub const MELD_OBSERVATION_WIDTH: usize = PLAYER_COUNT * 4 * 3;
+pub const MELD_OBSERVATION_WIDTH: usize = PLAYER_COUNT * MELD_SLOTS * MELD_FIELDS;
+/// Maximum chronological river entries retained in the observation tensor.
+pub const RIVER_TILE_CAPACITY: usize = WALL_TILE_COUNT;
+/// Fields stored per river entry: tile, owner_relative.
+pub const RIVER_FIELDS: usize = 2;
 /// Up to 108 chronological discards with tile and relative owner fields.
-pub const RIVER_OBSERVATION_WIDTH: usize = WALL_TILE_COUNT * 2;
+pub const RIVER_OBSERVATION_WIDTH: usize = RIVER_TILE_CAPACITY * RIVER_FIELDS;
 /// Scalar state plus four relative-player feature groups.
 pub const META_OBSERVATION_WIDTH: usize = 34;
 /// Training-only perfect-information tile-count planes: four concealed hands,

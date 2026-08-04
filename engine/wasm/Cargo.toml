@@ -1,0 +1,26 @@
+[package]
+name = "bloodflow-mahjong-wasm"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-only"
+description = "WebAssembly bindings for the Blood Flow Mahjong rules engine"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "bloodflow_mahjong_wasm"
+crate-type = ["cdylib", "rlib"]
+path = "src/lib.rs"
+
+[features]
+default = ["rule-nn"]
+rule-nn = ["bloodflow-mahjong/rule-nn"]
+
+[dependencies]
+bloodflow-mahjong = { path = "../core" }
+console_error_panic_hook = "0.1"
+wasm-bindgen = "=0.2.126"
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
