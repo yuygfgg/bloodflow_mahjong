@@ -2,7 +2,7 @@
 name = "bloodflow-mahjong-pybind"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 description = "High-performance Python bindings for the Blood Flow Mahjong rules engine"
 rust-version = "1.85"
 publish = false

@@ -2,7 +2,7 @@
 name = "bloodflow-mahjong-rule-tournament"
 version = "0.1.0"
 edition = "2024"
-license = "MIT"
+license = "AGPL-3.0-only"
 description = "Balanced tournament evaluator for deterministic rule policies"
 rust-version = "1.85"
 publish = false

@@ -1,709 +1,505 @@
-# 可见局面复盘：严格可形成校验与强类型 REPL
+# Web Client Rewrite Plan
 
-## 摘要
+## 1. Purpose and success criteria
 
-core 接受可见局面，构造一个与该局面投影一致的合法 `Game`，再调用现有策略给出最佳动作。REPL 用紧凑命令录入公开事件和 viewer 私有信息。
+This plan replaces the PySide6 desktop client with a browser client for the Rust Blood Flow Mahjong engine. The client must be easy to try from a static web deployment. A user must not need Python, Rust, a compiler, or a model-training environment to play one complete local game.
 
-任何被接受的会话状态都必须满足以下条件：至少存在一个完整、规则合法的 `Game`，其公开信息与 viewer 私有信息投影等于当前可见局面。解析失败、转移非法或无法具体化时，REPL 拒绝整行输入并保持状态不变。
+The UI requirement is to copy OpenRiichi as closely as possible. The Chinese shorthand for this requirement is “照抄”. Minimize free-form design work. The target is OpenRiichi's visual language and interaction rhythm:
 
-## 目标
+- a full-screen four-sided table;
+- a deep perspective camera with the local player at the bottom;
+- a dark wood frame and a large textured table surface;
+- physical-looking tiles with strong edge highlights and shadows;
+- large player names, seats, scores, and wind indicators around the table;
+- a central status panel;
+- translucent action buttons along the lower edge;
+- short, readable result overlays;
+- tile movement, flip, draw, discard, meld, and score animations.
 
-- 常用事件只输入无法从牌局状态推导的信息。
-- 每类命令只有一种签名。actor 要么必填，要么禁止输入。
-- 建议输出使用 REPL 的规范记号，并可直接作为下一条输入执行。
-- 用户可以在换三张、定缺、出牌和响应阶段请求一个最佳动作。
-- viewer 和牌结构由已知手牌计算。非 viewer 和牌使用结构简称。
+The client must copy OpenRiichi's general UI behavior whenever that behavior is reusable. Engineers must read the corresponding OpenRiichi code and translate the generic logic instead of inventing a new interaction model. Translate the implementation to TypeScript/Three.js and translate the text to the project's language; change rules only where Blood Flow Mahjong differs. Do not copy Japanese riichi rules into the game. Every tile, button, label, animation, and result panel must represent `GAME_RULES.md`. The engine remains the only authority for legal actions, hidden information, scoring, and termination.
 
-## 不包含的范围
+### 1.1 Definition of done
 
-- 不扩展 Python pybind。
-- 不默认输出 `planner-analysis` 的详细分析。
-- 不反推唯一开局 seed，也不重放隐藏牌历史。
-- 不验证非 viewer 的隐藏手牌是否真能组成其声明的 `ShapeSpec`。
-- 不实现第二套完整规则引擎。core 的既有规则仍是最终依据。
+The first public milestone is complete when all of the following are true:
 
-## 座位模型
+1. A user can open a hosted page and start a game with one click.
+2. The page runs one human seat against three deterministic local bots.
+3. The bot settings include `rule-fast`, `rule-ev`, and `rule-nn`; the NN bot can play a complete seeded game.
+4. The user can complete exchange, missing-suit choice, ordinary turns, wins, kongs, and response windows.
+5. The UI shows every Blood Flow-specific transition without exposing hidden tiles.
+6. The user can pause, restart, choose a seed, and copy a replay identifier.
+7. The same seed and action sequence produce the same event log and final score.
+8. The initial page is usable on a 1280x720 desktop viewport and remains playable on a 1024x768 viewport.
+9. A production build does not require a local toolchain.
 
-### 决定：REPL 使用相对座位
+## 2. Scope and non-goals
 
-REPL 的数字不绑定东、南、西、北。数字以 viewer 为原点，并沿引擎行牌方向递增：
+### 2.1 In scope
 
-| `RelativeSeat` | 含义 |
+- Local single-player games with `rule-fast` and `rule-ev` bots.
+- `rule-nn` browser inference with the bundled micro model.
+- OpenRiichi-faithful 3D table, tile, HUD, menu, animation, and sound presentation.
+- Blood Flow-specific exchange, missing-suit, repeat-win, kong, payment, flower-pig, and dajiao presentation.
+- Deterministic replay export and import.
+- Static deployment and offline cache after the first load.
+
+### 2.2 Out of scope for the first release
+
+- Internet multiplayer. A client-side authoritative game would reveal hidden hands.
+- Accounts, matchmaking, chat, ranking, and a persistent server database.
+- A second rules implementation in TypeScript.
+- Full parity with OpenRiichi's Vala networking or native rendering code.
+- `rule-planner` browser inference. This is a later optional enhancement.
+
+## 3. Rules authority and UI contract
+
+`engine/core` is authoritative. The browser must submit an `ActionId` only after reading the current legal mask from WASM. The UI may group legal actions for presentation, but it must not infer legality from visual state.
+
+The WASM wrapper must expose a UI snapshot separate from the training observation. The snapshot must use explicit fields and viewer-relative seats. It must not expose the full `Game` struct, opponent concealed hands, wall order, or unfiltered events.
+
+### 3.1 Required snapshot fields
+
+The snapshot protocol should contain:
+
+- `engine_rules_version`;
+- `phase`;
+- `decision_actor`;
+- `dealer`;
+- `exchange_direction`;
+- `wall_remaining`;
+- `scores`;
+- `missing_suits`;
+- `hands` for the viewer and concealed tile counts for opponents;
+- `locked_tiles` for all seats;
+- `melds`;
+- `rivers` with relative owners;
+- `pending_source`, `pending_tile`, and pending response kind;
+- `draw_tile` only when visible to the viewer;
+- `has_won`;
+- `legal_action_mask`;
+- `event_history` and `step_events` after observer filtering;
+- `termination_reason`;
+- final rankings and payment summary when finished.
+
+The protocol should be versioned. A transition contains the accepted action, filtered events, the next snapshot, and an animation hint list. Animation hints are derived from events and do not affect rules.
+
+### 3.2 Worker boundary
+
+`engine.worker.ts` owns the WASM `Game` instance. The main thread sends:
+
+- `new_game(seed, human_seat, bot_profiles)`;
+- `submit(action_id)`;
+- `request_hint(policy)`;
+- `pause` and `resume`;
+- `export_replay`;
+- `load_replay`.
+
+The worker returns `ready`, `snapshot`, `transition`, `hint`, `replay`, and `error` messages. AI steps run inside the worker as the single owner of the WASM game. The worker boundary is an ownership and protocol decision; it is not a claim that the micro NN model needs special performance treatment. The first release includes `rule-fast`, `rule-ev`, and `rule-nn`. Bundle the NN model with the initial Web build and load it when the worker starts. Its CPU inference cost is expected to be small, so lazy loading and model splitting are not first-release requirements.
+
+## 4. Recommended technology stack
+
+### 4.1 Rust and WASM
+
+- `bloodflow-mahjong` remains the rules crate.
+- Add `engine/wasm` as a small `cdylib` wrapper.
+- Use `wasm-bindgen` for typed JavaScript entry points.
+- Use `serde`/`serde-wasm-bindgen` or a compact explicit binary encoder for snapshots. Start with typed JSON-compatible values for debuggability.
+- Build with `wasm-pack` or `wasm-bindgen-cli` from a reproducible toolchain.
+- Include the `rule-nn` feature and the bundled model in the required first-release build. Keep `rule-planner` separate until a later release.
+
+The core uses an explicit seed and `ChaCha8Rng`. Keep this property. Do not introduce browser-dependent randomness into the rules path.
+
+### 4.2 Browser application
+
+- TypeScript, React, Vite, and pnpm.
+- Zustand or a small reducer for UI-only state. Do not mirror authoritative game state in multiple stores.
+- Three.js for the table, tiles, walls, discard ponds, melds, and camera.
+- React DOM for menus, action bars, score panels, help, replay controls, and accessibility text.
+- Web Worker for WASM and AI.
+- Vitest for reducers and protocol tests.
+- Playwright for browser smoke tests and replay tests.
+
+Use React for composition and controls. Use Three.js for continuous visual transforms. Avoid a DOM element for every tile in the 3D table. When OpenRiichi already has a matching control, state transition, camera behavior, menu, animation timing, or layout rule, port that behavior first and only then apply the language and Blood Flow rule substitutions.
+
+## 5. OpenRiichi-faithful visual language
+
+### 5.0 Copy-first implementation constraint
+
+This project must not treat OpenRiichi as a loose mood board. It must use OpenRiichi as the primary UI specification. The default decision is “copy the OpenRiichi behavior”; a new design needs a concrete reason such as a Blood Flow rule, browser limitation, accessibility requirement, or hidden-information constraint.
+
+For every major UI subsystem, identify the corresponding OpenRiichi source before implementation:
+
+- main window and scene composition;
+- camera and table transforms;
+- player and tile render objects;
+- hand sorting and tile selection;
+- action button construction and ordering;
+- center status and scoring overlays;
+- menu navigation and pause behavior;
+- animation queue and sound triggers;
+- replay and game-log views.
+
+Translate common logic directly from the OpenRiichi code. Keep the same state transitions, control placement, visual hierarchy, timing, and interaction rhythm whenever the behavior is generic. For generic behavior, change only the implementation language (Vala/native APIs to TypeScript/Three.js/browser APIs) and the displayed language. Do not redesign the behavior. Blood Flow rule differences are the only product-level reason to add or remove an interaction. Change only:
+
+1. implementation language and browser APIs;
+2. displayed language and terminology;
+3. tile inventory and model bindings;
+4. Blood Flow rules and legal-action mapping;
+5. browser-specific input, performance, and accessibility details.
+
+Do not add a second visual system because it is easier to implement. A simplified debug renderer is allowed only as a temporary development tool and must not become the production design.
+
+### 5.1 Table composition
+
+The main scene uses a perspective camera looking toward the table center. The viewer's hand sits near the bottom edge. Opponent hands sit at the top, left, and right edges. The center contains a compact status board rather than a large rule explanation.
+
+Use these visual layers:
+
+1. Background: a dark blue-green or space-like texture with low contrast.
+2. Table frame: dark wood with visible depth and bevel.
+3. Felt: a bright, high-contrast material. Blood Flow variants may use blue-green or marble textures, but the tile faces must remain readable.
+4. Tile layer: white or dark-backed physical tiles with bevels, highlights, and shadows.
+5. HUD layer: large player labels and scores, centered status text, and lower action buttons.
+6. Overlay layer: response prompts, scoring results, pause menu, replay controls, and errors.
+
+The design should feel like a physical board with a theatrical game overlay. Keep action labels large and short. Do not reproduce OpenRiichi's Japanese-only action names.
+
+### 5.2 Camera and responsive layout
+
+- Use a fixed logical table aspect ratio and letterbox the scene when necessary.
+- Preserve the bottom hand as the visual anchor.
+- Scale tile geometry and labels together.
+- Keep the action bar inside the safe area on short screens.
+- Permit camera rotation and zoom only from the pause/settings menu in the first release.
+- Keep all critical actions available by keyboard and accessible DOM controls.
+
+### 5.3 Tile language
+
+Use the OpenRiichi tile silhouette, proportions, shading, spacing, and depth language. Convert native models to GLB and use a shared material. Maintain one stable tile coordinate system so a tile can move between wall, hand, river, meld, and overlay positions without visual snapping.
+
+Blood Flow uses 27 suited tiles: characters, bamboo, and dots. Do not display honor tiles. The tile atlas must include a back, all 27 faces, a selected state, a disabled state, and a locked/winning state.
+
+## 6. Blood Flow-specific interaction design
+
+This section is mandatory. The client must make each non-riichi rule visible and understandable.
+
+### 6.1 Opening exchange: 换三张
+
+Engine phase: `Exchange`. The opening hand contains 14 tiles for the dealer and 13 for each other player. Each player selects three tiles of one suit. The engine collects three sequential tile actions and applies the exchange only after all twelve selections are complete.
+
+UI behavior:
+
+- Show a centered banner: `换三张` and the exchange direction (`左`, `对家`, or `右`).
+- Show the viewer's hand in the normal bottom position with a visible selection tray above it.
+- Highlight the first selected tile with a gold outline. After the first selection, constrain the hand to tiles of the same suit and dim all other tiles.
+- Show `已选 1/3`, `已选 2/3`, or `已选 3/3` beside the action bar.
+- Do not let the user select a fourth tile or a different suit. The disabled appearance must match the OpenRiichi button and tile language.
+- Provide `确认换牌` only when exactly three tiles are selected. The button maps to the third engine action; it does not perform a client-side exchange.
+- Animate selected tiles lifting from the hand, moving along the chosen direction, rotating face-down while travelling, then settling into the recipient hand.
+- Keep opponent selections face-down. Show progress badges such as `下家 2/3` only if the engine event stream makes that progress public.
+- On completion, play one exchange-complete event and move to missing-suit choice.
+
+The exchange direction is public. The selected tile identities of other players are not public until the rules expose them.
+
+### 6.2 Missing suit: 定缺
+
+Engine phase: `ChooseMissing`. Every player chooses one suit to declare missing. All four choices become public together.
+
+UI behavior:
+
+- Replace the exchange banner with a centered `定缺` banner.
+- Present three large suit buttons: `万`, `条`, `筒`. Use the same textured button treatment as OpenRiichi's lower action bar.
+- Add a short instruction: `选择本局定缺花色`. Do not use a radio form that looks unrelated to the table.
+- Before submission, show the chosen suit as a gold wind-indicator-style marker near the local name.
+- Disable submission until one suit is selected. Do not allow a second click to change a submitted choice.
+- When all choices are collected, animate four suit markers appearing around the table at the same time.
+- From this point, tiles of the declared missing suit receive a clear but restrained red/orange warning tint in the viewer hand.
+- During the forced-missing discard period, dim non-missing tiles and make missing-suit tiles the only enabled discard targets.
+
+Do not reveal opponent concealed counts or selected tiles as part of the missing-suit presentation.
+
+### 6.3 Normal turn and missing-suit enforcement
+
+Engine phase: `Turn`. A player draws, then must discard, self-draw win, concealed kong, or added kong when legal. Before all missing-suit tiles are discarded, only tiles from the declared missing suit may be discarded.
+
+UI behavior:
+
+- Animate the draw from the wall into the local hand. Label a replacement draw as `杠后补牌`, and label a last-wall draw as `海底` when the event flags require it.
+- Mark the drawn tile with a small lift and a short glow. Do not use a permanent floating tooltip.
+- Keep the local hand sorted unless the player has selected manual ordering in settings.
+- Disable locked winning tiles. Show them in a separate, slightly raised row or with a gold edge.
+- If missing-suit enforcement is active, use a red edge for the required suit and a muted gray edge for forbidden tiles.
+- Use a single discard action: click an enabled tile. The action bar may show `出牌`, but the tile itself remains the primary control.
+- If `胡`, `暗杠`, or `碰杠` is legal, show them as short lower buttons. Do not show disabled buttons unless the user enables an accessibility setting.
+- For a self-draw, label the action `自摸` in the Blood Flow vocabulary.
+
+### 6.4 Discard response: 胡、碰、直杠、过
+
+After a discard, the engine first opens `HuResponse` for all eligible players. Only if nobody wins does it open `MeldResponse` for pong or exposed kong.
+
+UI behavior:
+
+- Pause the normal camera motion and add a compact center banner: `响应 6万` (using the actual tile).
+- For the local player, show only legal response buttons: `胡`, `碰`, `直杠`, and `过`.
+- Use OpenRiichi-style large horizontal buttons with distinct colors: warm red for `胡`, gold for `杠`, blue-green for `碰`, gray for `过`.
+- Show the source seat and tile in the center, but do not show hidden response reasons.
+- If the local player has multiple legal responses, order them `胡`, `直杠`, `碰`, `过`; keep the order stable.
+- A response button must submit exactly one engine action. No local animation may imply a response before the worker accepts it.
+- When one or more players win, suppress pong and kong animations for that discard.
+- For multiple winners, queue winner overlays in seat order and show each payment as a separate transfer.
+
+### 6.5 Blood Flow win: 和牌后继续
+
+Winning does not end the hand. The winner's winning structure becomes locked and the player continues to participate according to engine rules.
+
+UI behavior:
+
+- Show a brief `和牌` overlay with the winning tile, shape multiplier, event multipliers, and immediate payment.
+- Move the winning subset into a locked row. Locked tiles use a gold border and a subtle vertical offset.
+- Keep the winner's seat active in the table. Do not replace the whole table with a terminal result screen.
+- Show a small `已和 N 次` badge near the seat name.
+- On the next turn, render only the unlocked hand as selectable.
+- If another win is legal, keep the `和`/`自摸` action prominent.
+- If the player cannot continue a winning structure, let the engine transition normally; the client must not invent a “pass after win” state.
+- Use a short lock animation: the winning tiles move to the locked row, their face remains visible, and the active hand contracts around them.
+
+The visual distinction between active and locked tiles is essential. A player must understand why a tile cannot be discarded or reused.
+
+### 6.6 Kongs and replacement draws
+
+Support concealed kong, exposed kong, and added kong. Added kong opens the same rob-kong (`抢杠胡`) response flow as the engine.
+
+UI behavior:
+
+- Use `暗杠`, `直杠`, and `碰杠` labels. Do not use the generic `Kan` label.
+- Show a kong declaration as a four-tile group with the OpenRiichi meld spacing and orientation.
+- For a concealed kong, hide the appropriate tile faces if the rules require a face-down presentation; preserve the actual viewer visibility contract.
+- Animate the replacement draw from the wall tail and label it `杠后补牌`.
+- For an added kong, show a short center banner `声明碰杠，等待抢杠胡`.
+- During that response, show only `胡` and `过` when legal.
+- If robbed, keep the kong incomplete in the visual history, show `抢杠胡`, and do not play a payment for the cancelled kong.
+- If not robbed, complete the meld and play the replacement draw.
+
+### 6.7 Last-wall and terminal events
+
+- Mark a last-wall draw with a small `海底` tag next to the active seat.
+- Keep the table visible through the final response window.
+- For wall exhaustion, show `牌墙摸完` before settlement.
+- Show flower-pig settlement first, then dajiao settlement, matching engine order.
+- Render each payment as a moving score token from payer to receiver. Clamp displayed payments to the actual engine payment.
+- Show the final four-seat score panel only after all settlement events complete.
+
+### 6.8 Flower pig and dajiao settlement
+
+These are Blood Flow terminal rules, not generic “draw” results.
+
+- Use a two-step result overlay: `查花猪` followed by `查大叫`.
+- For flower pig, mark the violating seat with a red suit icon and list the missing-suit tiles that remain.
+- For dajiao, show the ready/waiting seats and the maximum structural multiplier used by the engine.
+- Do not show event multipliers that the engine excludes from dajiao calculation.
+- Animate payments after each stage, not as one merged number.
+- Keep the score history accessible from the result panel.
+
+## 7. Scene and component structure
+
+### 7.1 Three.js scene
+
+Suggested scene nodes:
+
+```text
+TableScene
+├── CameraRig
+├── TableFrame
+├── TableSurface
+├── CenterBoard
+├── WallRing
+├── Seat[0..3]
+│   ├── Hand
+│   ├── River
+│   ├── Melds
+│   ├── LockedWins
+│   └── SeatMarker
+├── AnimationLayer
+└── EffectsLayer
+```
+
+Use object pools for tiles, score tokens, and text labels. A finished game must not retain an unbounded number of animation objects.
+
+### 7.2 React components
+
+Suggested components:
+
+- `GamePage`;
+- `TableCanvas`;
+- `CenterStatus`;
+- `SeatHud`;
+- `ActionBar`;
+- `ExchangePanel`;
+- `MissingSuitPanel`;
+- `ResponsePanel`;
+- `WinOverlay`;
+- `SettlementOverlay`;
+- `PauseMenu`;
+- `ReplayPanel`;
+- `AccessibilityPanel`;
+- `AssetLoadingOverlay`.
+
+The action bar selects its contents from `legal_action_mask` and phase. Blood Flow panels are phase-specific views, not independent rule engines.
+
+## 8. Asset migration and licensing
+
+The repository is AGPLv3. See `LICENSE`. OpenRiichi is GPLv3. GPLv3 section 13 expressly permits combining a covered work with a work licensed under AGPLv3, so the OpenRiichi GPLv3 material and this AGPLv3 project may be combined under the compatible copyleft terms. Keep the applicable license and copyright notices in the distributed Web client.
+
+Copy the OpenRiichi assets used by the native client as directly as possible. Convert them only when the Web runtime requires a format change:
+
+Recommended conversion pipeline:
+
+1. Import OBJ/MTL into Blender or a reproducible command-line converter.
+2. Export GLB with a stable scale, origin, and orientation.
+3. Pack tile faces into one atlas and generate a machine-readable tile map.
+4. Compress textures to WebP or KTX2 after visual comparison.
+5. Convert audio to Ogg Opus.
+6. Subset the font and convert it to WOFF2.
+7. Use the converted asset in the copied OpenRiichi scene and compare the result at the reference viewport.
+
+## 9. Replay and protocol design
+
+Store a replay as:
+
+```json
+{
+  "protocol_version": 1,
+  "engine_rules_version": 6,
+  "seed": 42,
+  "human_seat": 0,
+  "actions": [0, 1, 2]
+}
+```
+
+The action list is authoritative. Event history and UI animation hints are derived data. Reject a replay when the engine version is incompatible or when one action is illegal. Never trust a client-provided final score.
+
+Replay tests must compare:
+
+- phase after every action;
+- legal action mask;
+- filtered step events;
+- score vector;
+- final rankings and termination reason.
+
+## 10. Delivery phases
+
+### Phase A: Contract and build foundation
+
+- Add `engine/wasm`.
+- Define snapshot and worker message schemas.
+- Add a no-UI worker test that plays a seeded game.
+- Add TypeScript project, lint, format, and test commands.
+- Build and verify the required WASM game path with `rule-nn`, including model loading and one deterministic inference step.
+- Verify native and WASM deterministic replay.
+
+Exit criteria: a browser worker can start, step, and finish a game without rendering.
+
+### Phase B: Playable 2D/debug client
+
+- Render every snapshot with plain HTML and debug tile shapes.
+- Implement exchange, missing-suit, turn, response, win, kong, and settlement controls.
+- Show event and score logs.
+- Add keyboard navigation and an error boundary.
+
+Exit criteria: all engine phases are playable and observable before 3D work starts.
+
+### Phase C: OpenRiichi-style table
+
+- Add the perspective camera, wood frame, table material, center board, wall, seats, rivers, melds, and hand geometry.
+- Add responsive camera scaling and safe-area layout.
+- Add tile atlas and material states.
+- Preserve the Phase B controls as an accessibility/debug overlay.
+
+Exit criteria: the table is recognizably an OpenRiichi translation, with only language, browser implementation, and Blood Flow rule differences.
+
+### Phase D: Animation and audio
+
+- Implement event-to-animation mapping.
+- Add exchange, draw, discard, meld, lock, win, payment, and settlement animations.
+- Add sound cues with a mute setting and user-gesture audio unlock.
+- Add skip-animation and reduced-motion modes.
+
+Exit criteria: a complete seeded game can be watched without debug controls.
+
+### Phase E: Replay, performance, and release
+
+- Add replay import/export.
+- Add Playwright visual smoke tests.
+- Measure first contentful paint, WASM load, memory, and frame time.
+- Treat planner, music, and high-resolution texture splitting as optional post-release optimizations. NN lazy loading and model splitting are also optional later optimizations, not initial requirements.
+- Add static hosting, cache headers, and a license notice page.
+
+Exit criteria: a fresh browser can start a game quickly on a normal desktop connection and the release contains the required license notices.
+
+## 11. Testing strategy
+
+### 11.1 Engine and WASM
+
+- Keep all existing Rust rule tests.
+- Add snapshot schema tests for every phase.
+- Add tests that opponent draws and concealed hands remain hidden.
+- Add deterministic replay tests across native and WASM builds.
+- Add action atomicity tests: an illegal action changes no state or RNG state.
+
+### 11.2 UI state tests
+
+Test each Blood Flow phase with fixtures:
+
+- exchange at selection counts 0, 1, 2, and 3;
+- each exchange direction;
+- missing-suit selection and simultaneous reveal;
+- forced missing-suit discard;
+- normal draw and discard;
+- self-draw, discard win, multiple winners, and repeat win;
+- concealed, exposed, and added kongs;
+- robbed added kong;
+- last-wall draw;
+- flower-pig and dajiao settlement.
+
+Each fixture must assert enabled controls, visible tiles, labels, seat-relative positions, and event order.
+
+### 11.3 Visual tests
+
+- Capture the reference viewport at 1280x720 and 1024x768.
+- Compare table camera, tile readability, action bar placement, and overlay contrast.
+- Run reduced-motion snapshots so animation timing does not make tests flaky.
+- Check that the copied OpenRiichi style does not reduce the contrast of Blood Flow warnings.
+
+## 12. Performance and accessibility budgets
+
+- First page shell visible within 1 second on a warm desktop load.
+- Measure the WASM, JavaScript, and bundled NN model payload. Do not make a specific payload target or lazy-loading strategy a first-release gate.
+- Keep steady-state rendering at 60 FPS on an integrated desktop GPU.
+- Keep the required local bot path responsive. The NN path is part of the initial build; planner isolation and later inference optimizations are optional follow-up work.
+- Use keyboard focus for every action.
+- Provide text labels for all 3D actions.
+- Support reduced motion, high contrast, and color-independent missing-suit indicators.
+- Do not use color as the only signal for disabled, locked, or winning tiles.
+
+## 13. Risks and mitigations
+
+| Risk | Mitigation |
 | --- | --- |
-| `0` | viewer，也就是“我” |
-| `1` | viewer 的下一家 |
-| `2` | viewer 的对家 |
-| `3` | viewer 的上一家 |
-
-相对座位适合实时复盘。用户不需要先输入自己的绝对方位，同一套输入在换座后仍保持相同含义。策略 observation 也使用 viewer 相对视角。
-
-绑定东、南、西、北只在跨 viewer 合并牌谱时更直接。本工具维护单一 viewer 的可见局面，不承担跨视角牌谱交换。若以后增加牌谱导入导出，序列化 `SeatMap` 即可保留绝对方位，无需改变 REPL 命令。
-
-绝对座位只存在于 core 边界。`SeatMap` 负责双向转换：
-
-```rust
-#[repr(transparent)]
-struct RelativeSeat(u8);
-
-struct SeatMap {
-    dealer: RelativeSeat,
-}
-```
-
-引擎继续把绝对座位 `0` 作为庄家。若 REPL 中庄家是相对座位 `d`，则：
-
-```text
-absolute(relative) = (relative + 4 - d) mod 4
-relative(absolute) = (absolute + d) mod 4
-```
-
-`VisiblePosition` 使用 `RelativeSeat`。`Game::from_visible_position` 在写入 `Game` 时转换为绝对 `Seat`，`project_visible` 在比较投影前转换回来。业务逻辑不得直接混用两种座位类型。
-
-REPL 不提供 `viewer` 命令。viewer 永远是相对座位 `0`。`:dealer <Seat>` 设置庄家的相对座位，默认值为 `0`。
-
-## Core 契约
-
-### 可形成性
-
-状态 `V` 可形成，当且仅当存在一个 seed，使以下条件全部成立：
-
-1. `Game::from_visible_position(V, seed)` 成功。
-2. 具体化后的 `G` 满足引擎状态不变量：
-   - 手牌张数与阶段、origin、副露和已和状态一致
-   - 副露槽稠密
-   - `locked[t] <= concealed[t]`
-   - 每种牌的物理副本数不超过 4
-   - 对手暗手与牌墙填充后，牌集闭合
-   - 定缺与阶段一致
-3. `project_visible(G, SeatMap) == V`：
-   - 副露、牌河、定缺、分数和历史最高结构倍率一致
-   - viewer 暗手与锁牌一致
-   - 当前行牌权、pending event 和来源一致
-4. 若 `V` 存在 viewer 决策：
-   - `G.decision().actor` 映射为相对座位 `0`
-   - `G.legal_action_mask()` 与 `V` 可推出的 mask 一致
-5. 对 `Turn`、`Exchange` 和 `ChooseMissing`，至少有一个 seed 能使 `G.resample_information_set(seed)` 成功。
-
-响应窗的合法集合依赖暗手。具体化时遵循引擎现有约定，固定响应窗相关手牌并重采样牌墙。
-
-### Core API
-
-建议新增 `engine/core/src/review.rs`，并从 `lib.rs` 导出：
-
-- `RelativeSeat`
-- `SeatMap`
-- `VisiblePosition`
-- `PendingEvent`
-- `ReviewPolicy`
-  - `Fast`
-  - `Ev(RuleEvConfig)`
-  - `Planner(RulePlannerConfig)`
-- `PositionError`
-  - `Inventory`
-  - `StateInvariant`
-  - `Unformable`
-  - `ProjectionMismatch`
-  - `DecisionMismatch`
-- `validate_visible_position(&VisiblePosition) -> Result<(), PositionError>`
-- `Game::from_visible_position(&VisiblePosition, seed) -> Result<Game, PositionError>`
-- `project_visible(&Game, SeatMap) -> VisiblePosition`
-- `advise_visible_position(&VisiblePosition, policy, seed) -> Result<ActionId, PositionError>`
-
-`PositionError` 不包含 REPL 语法错误。lexer、parser 和状态 reducer 使用 tool 自己的错误类型。
-
-三种策略实现保持不变。REPL 状态机不能进入 core。
-
-### 确定性校验
-
-#### 牌的物理计数
-
-每种牌统计以下已知副本：
-
-- viewer 暗手
-- 非 viewer 已公开的锁牌
-- 牌河
-- 碰牌者提供的 2 张
-- 直杠或碰杠者提供的 3 张
-- 暗杠的 4 张
-
-被调用的弃牌仍保留在牌河中，因此碰和直杠只增加响应者提供的副本。点炮引用 pending discard，不增加新的物理副本。每种牌总数必须小于或等于 4。
-
-四家暗手张数按阶段和副露推导：
-
-- 未和：`13 - 3 * meld_count`
-- 已和：`14 - 3 * meld_count`
-- 当前 actor 在 `Draw` 或 `AfterPong` origin 时再加 1
-
-`:len` 可以覆盖非 viewer 的推断值。覆盖后仍必须有足够牌填充其余暗手和牌墙。
-
-其他库存约束：
-
-- `wall_remaining` 默认取未知池填充对手暗手后的剩余张数。
-- `:wall` 只覆盖默认值，且必须保持牌集闭合。
-- 每家最多有 4 个副露。
-- 碰杠必须先存在同牌的碰。
-- 暗杠来源固定为 actor。
-
-#### 阶段与公开事件
-
-- 行牌阶段要求四家均已定缺。
-- 换三张和定缺阶段不得存在行牌副露或牌河。
-- 牌河按事件时间排序。
-- 碰、直杠和点炮必须消费类型匹配的 pending event。
-- tile 和 source 只从 pending event 读取。命令不得重复提供。
-- 抢杠胡必须消费一个 pending 碰杠声明。
-- viewer 输入 `+Tile` 前，该牌必须还有物理副本。
-- `=<Tiles>` 设置的 viewer 手牌不得与公开牌和锁牌冲突。
-
-#### Viewer 决策
-
-- `+Tile` 只在相对座位 `0` 即将摸牌时合法。
-- viewer 正常摸牌后，`?` 必须看到一个 `Turn` 决策。
-- 他人弃牌后，core 用 viewer 手牌计算 `HuResponse` 或 `MeldResponse`。
-- viewer 存在响应时，下一公开事件不能替 viewer 隐式选择 pass。用户必须输入对应动作或 `.`。
-- viewer 已和后只能弃未锁牌。`:lock` 必须是 viewer 暗手的子集。
-
-#### 非 Viewer 和牌
-
-非 viewer 和牌只验证以下可见事实：
-
-- 转移来源合法。
-- `ShapeSpec` 语法和组合合法。
-- 存在一个满足全局库存与张数约束的隐藏暗手填充。
-
-REPL 不验证该隐藏暗手能否组成声明牌型。`ShapeSpec` 只用于 `has_won`、结构倍率和计分。
-
-分数默认由已知杠和和牌事件自动结算，计分基数为 100。`:score` 覆盖要求每家分数非负，且总分为 40000。
-
-### 自动推断
-
-- viewer 固定为相对座位 `0`。
-- dealer 默认是相对座位 `0`。
-- 初始分数为每家 10000。
-- 对手普通摸牌不可见，不需要输入。
-- 弃牌 actor 由当前行牌权推导。
-- 碰和直杠的 tile 与 source 从 pending discard 取得。
-- 点炮和抢杠胡的 tile 与 source 从 pending event 取得；非 viewer 自摸必须输入公开和牌张。
-- 碰杠的 source 从已有碰取得；暗杠的 source 固定为 actor。
-- 对手暗手张数按阶段公式推导。
-- `Turn.can_hu` 和 viewer 的和牌结构由引擎分析器计算。
-- 事件番从 pending kind、前一事件、墙数和开局状态推导。
-
-### 具体化算法
-
-1. 用 `SeatMap` 把相对座位转换为引擎绝对座位。
-2. 放入全部已知公开牌和 viewer 私有牌。
-3. 计算未知池：`4 * 27 - 已知物理副本`。
-4. 按推断值或 `:len` 覆盖填充非 viewer 暗手。
-5. 把剩余牌放入牌墙，并满足定缺相关约束。
-6. 写入 phase、turn origin 和 reaction kind。
-7. 用引擎计算 viewer 的 `can_hu` 和 legal mask。
-8. 比较 `project_visible(G, SeatMap)` 与输入 `V`。
-
-任一步失败都返回 `PositionError`，且不返回部分构造的 `Game`。
-
-## 强类型 REPL
-
-路径：`engine/tools/review`
-二进制：`review`
-
-### 会话与事务
-
-会话保存：
-
-- `VisiblePosition`
-- `ReviewPolicy`
-- seed
-- 深度至少为 32 的 undo 栈
-
-每条变更命令在会话副本上执行。REPL 依次完成解析、类型检查、状态转移、确定性校验和具体化检查。全部成功后才替换当前会话并压入 undo 快照。失败不能改变状态、undo 栈或随机数进度。
-
-### 交互提示符
-
-prompt 显示 REPL 当前等待的事件。弃牌 prompt 使用相对座位：
-
-| Prompt | 含义 |
-| --- | --- |
-| `0> ` | 下一弃牌者是 viewer |
-| `1> ` | 下一弃牌者是相对座位 `1` |
-| `2> ` | 下一弃牌者是相对座位 `2` |
-| `3> ` | 下一弃牌者是相对座位 `3` |
-| `0+> ` | 等待 viewer 输入可见摸牌 |
-| `0?> ` | 等待 viewer 的胡、碰、直杠或 pass 响应 |
-| `x> ` | 等待 viewer 选择换三张 |
-| `d> ` | 等待 viewer 选择定缺 |
-| `*> ` | 当前没有唯一可显示的下一弃牌者，等待其他公开事件 |
-| `done> ` | 牌局已结束；动作命令拒绝 |
-
-`0> ` 只表示 `VisiblePosition.next_discarder == 0`。在 viewer 的普通回合中，REPL 先显示 `0+> `；用户输入 `+5s` 后才显示 `0> `。碰后无需摸牌，viewer 碰牌成功后直接显示 `0> `。
-
-非 viewer 的隐藏摸牌由 reducer 合成，因此 prompt 可以从 `0> ` 直接变为 `1> `。`1> ` 表示下一张弃牌若发生，其 actor 必须是相对座位 `1`；该座位仍可先声明杠或自摸。
-
-prompt 由强类型状态生成：
-
-```rust
-enum PromptState {
-    Exchange,
-    ChooseMissing,
-    ViewerDraw,
-    ViewerResponse,
-    Discard(RelativeSeat),
-    PublicEvent,
-    Finished,
-}
-```
-
-prompt formatter 的优先级固定为：终局、viewer 开局决策、viewer 摸牌、viewer 响应、`next_discarder`、其他公开事件。formatter 不读取上一条命令文本。
-
-交互模式把 prompt 和错误写到 stderr。`?` 的规范动作、`s` 的状态和帮助写到 stdout。只有 stdin 和 stderr 都是 TTY 时才默认输出 prompt；`--no-prompt` 可以关闭 prompt。prompt 使用固定 ASCII 文本，不包含 ANSI 颜色，也不进入命令 parser。
-
-输入成功后，REPL 根据新状态重绘 prompt。输入失败时状态不变，并重绘相同 prompt。`Ctrl-C` 取消当前行且不修改状态；空行上的 `Ctrl-D` 等价于 `q`。
-
-示例：
-
-```text
-0+> +5s
-0> -5s
-1> -3p
-0?> .
-2> -9m
-```
-
-### 命令签名规则
-
-命令不存在“默认 actor”或“可选 actor”。每类命令固定采用以下一种规则：
-
-- 弃牌不接受座位。reducer 根据行牌权确定 actor。
-- 碰、杠和胡必须接受座位，包括 viewer 自己。
-- viewer 摸牌不接受座位，因为只有 viewer 的摸牌牌面可见。
-- viewer pass 不接受座位。只有 viewer 的 pass 需要录入。
-- 换三张和单人定缺是 viewer 决策，不接受座位。
-- 四家定缺使用固定长度的 `Suit4`，不逐个输入座位。
-
-这条规则删除 `Actor = epsilon` 一类上下文默认值。parser 对每个 action 只构造一个明确签名。
-
-### 词法类型
-
-```text
-Seat        ::= "0" | "1" | "2" | "3"
-Other       ::= "1" | "2" | "3"
-Suit        ::= "m" | "s" | "p"
-Rank        ::= "1" | "2" | ... | "9"
-Tile        ::= Rank Suit
-TileGroup   ::= Rank { Rank } Suit
-Tiles       ::= TileGroup { TileGroup }
-Suit4       ::= Suit Suit Suit Suit
-UInt        ::= Digit { Digit }
-ParamName   ::= Lower { Lower | Digit | "-" | "_" }
-ParamValue  ::= non-empty token without ASCII whitespace or "="
-Param       ::= ParamName "=" ParamValue
-ShapeSpec   ::= ShapeCode { SP ShapeCode }
-```
-
-`Tiles` 解析为按牌种计数的 multiset。构造时拒绝第五张同牌。`ExchangeTiles` 是 `Tiles` 的精化类型：同一花色、1 至 3 张，并且加上本阶段已选张后不超过 3 张。
-
-只接受 `m/s/p`。不接受 `w/t/b` 等同义花色。
-
-### Command grammar
-
-以下 grammar 定义规范输出。parser 可以忽略 token 边界处的 ASCII 空白，但 formatter 只输出下列形式。`SP` 表示至少一个 ASCII 空格。
-
-```text
-Command         ::= Reset | Action | Directive | Control
-Reset           ::= "=" Tiles
-
-Action          ::= Exchange | Missing | Draw | Discard
-                  | Pong | Kong | Hu | Pass
-Exchange        ::= "x" Tiles
-Missing         ::= "d" Suit | "d" Suit4
-Draw            ::= "+" Tile
-Discard         ::= "-" Tile
-Pong            ::= Seat ":p"
-Kong            ::= Seat ":k"
-                  | Seat ":ak" Tile
-                  | Seat ":ck" Tile
-Hu              ::= "0:h"
-                  | Other ":h" SP ShapeSpec
-                  | Other ":h+" Tile SP ShapeSpec
-Pass            ::= "."
-
-Directive       ::= ":lock" SP (Tiles | "auto")
-                  | ":len" SP Other SP (UInt | "auto")
-                  | ":score" SP (UInt SP UInt SP UInt SP UInt | "auto")
-                  | ":wall" SP (UInt | "auto")
-                  | ":dealer" SP Seat
-                  | ":seed" SP UInt
-                  | ":policy" SP Policy { SP Param }
-
-Policy          ::= "fast" | "ev" | "planner"
-Control         ::= "?" | "s" | "u" | "??" | "q"
-```
-
-`dSuit` 与 `dSuit4` 按 suit 数量区分。其他数量属于语法错误。注释和尾随自由文本不属于 v1 grammar。
-
-以下输入必须拒绝：
-
-- `1:-3p`：弃牌不接受座位。
-- `p`：碰必须带座位。
-- `ck3p`：杠必须带座位。
-- `h`：胡必须带座位。
-- `0:h ph`：viewer 和牌结构必须由引擎计算。
-- `1:h`：非 viewer 和牌必须带 `ShapeSpec`。
-
-### 强类型 AST
-
-lexer 和 parser 必须直接构造强类型值。reducer 不得重新解析字符串。
-
-```rust
-enum Command {
-    Reset(ConcealedTiles),
-    Action(ObservedAction),
-    Directive(Directive),
-    Advise,
-    Status,
-    Undo,
-    Help,
-    Quit,
-}
-
-#[repr(transparent)]
-struct OtherSeat(RelativeSeat);
-
-enum ObservedAction {
-    SelectExchange(ExchangeTiles),
-    ChooseMissing(Suit),
-    ChooseAllMissing([Suit; 4]),
-    Draw(Tile),
-    Discard(Tile),
-    Pong { actor: RelativeSeat },
-    ExposedKong { actor: RelativeSeat },
-    AddedKong { actor: RelativeSeat, tile: Tile },
-    ConcealedKong { actor: RelativeSeat, tile: Tile },
-    ViewerHu,
-    HiddenClaimHu { winner: OtherSeat, shapes: ShapeSpec },
-    HiddenSelfDrawHu {
-        winner: OtherSeat,
-        tile: Tile,
-        shapes: ShapeSpec,
-    },
-    ViewerPass,
-}
-
-enum Override<T> {
-    Auto,
-    Value(T),
-}
-
-enum Directive {
-    Lock(Override<ConcealedTiles>),
-    ConcealedLength {
-        seat: OtherSeat,
-        value: Override<ConcealedCount>,
-    },
-    Scores(Override<[Score; 4]>),
-    Wall(Override<WallCount>),
-    Dealer(RelativeSeat),
-    Seed(u64),
-    Policy(ReviewPolicy),
-}
-```
-
-`OtherSeat` 只接受 `1..3`。`HiddenClaimHu` 和 `HiddenSelfDrawHu` 无法保存 viewer。`ViewerHu` 固定来自 `0:h`。这些类型分支消除 `ShapeSpec` 是否必填的运行时猜测。
-
-`ConcealedCount` 和 `WallCount` 是有界整数类型。`Score` 非负，`Scores` 构造器检查总分。`ReviewPolicy` 构造器检查参数名、类型和范围。
-
-### 动作语义
-
-| 输入 | AST | 语义 |
-| --- | --- | --- |
-| `=<Tiles>` | `Reset` | 清空牌局状态并设置 viewer 当前暗手；保留 dealer、seed 和 policy |
-| `x<Tiles>` | `SelectExchange` | 原子提交 1 至 3 个 viewer 换牌选择 |
-| `d<Suit>` | `ChooseMissing` | viewer 选择定缺，例如 `dp` |
-| `d<Suit4>` | `ChooseAllMissing` | 按相对座位 `0..3` 设置四家定缺，例如 `dmspm` |
-| `+<Tile>` | `Draw` | viewer 摸牌，例如 `+5s` |
-| `-<Tile>` | `Discard` | 当前 actor 弃牌，例如 `-5s` |
-| `<Seat>:p` | `Pong` | 指定座位碰当前 pending discard |
-| `<Seat>:k` | `ExposedKong` | 指定座位直杠当前 pending discard |
-| `<Seat>:ak<Tile>` | `AddedKong` | 指定座位碰杠 |
-| `<Seat>:ck<Tile>` | `ConcealedKong` | 指定座位暗杠 |
-| `0:h` | `ViewerHu` | viewer 执行当前合法胡动作，结构由引擎计算 |
-| `<Other>:h <ShapeSpec>` | `HiddenClaimHu` | 非 viewer 对当前 pending 弃牌或碰杠声明胡牌 |
-| `<Other>:h+<Tile> <ShapeSpec>` | `HiddenSelfDrawHu` | 非 viewer 自摸，并记录公开和牌张 |
-| `.` | `ViewerPass` | viewer 在当前响应窗选择 pass |
-
-`p` 和 `k` 不接受 tile 或 source。两者从 pending discard 读取这些值。`h` 点炮也从 pending event 读取 tile 和 source。缺少相应 pending event 时，reducer 返回明确的 `TransitionError`。
-
-所有杠命令都带 actor。即使当前行牌权已经能推出碰杠或暗杠的 actor，REPL 仍要求座位。该规则使碰、杠、胡三类公开声明使用同一个 actor 约定。
-
-### 弃牌 actor 推导
-
-`Discard(Tile)` 不保存 actor。reducer 在执行命令时读取 `VisiblePosition.next_discarder`：
-
-- viewer 输入 `+Tile` 后，下一弃牌者是 `0`。
-- 碰成功后，下一弃牌者是碰牌者。
-- 普通无人响应弃牌后，下一弃牌者是原出牌者的下一家。
-- 和牌后，下一弃牌者按引擎既有轮转规则确定。
-- 杠后，下一弃牌者仍是杠牌者，但必须先完成补牌。
-
-当前 actor 是非 viewer 时，`-Tile` 会先合成一次牌面不可见的普通摸牌，再记录弃牌并减少墙数。当前 actor 是 viewer 时，普通回合必须先输入 `+Tile`；`AfterPong` origin 不要求摸牌。
-
-非 viewer 的公开回合动作使用同一套摸牌规则。若状态要求先摸牌：
-
-- `Seat:akTile` 和 `Seat:ckTile` 先合成未知摸牌，再校验 actor 和动作。
-- `Other:h+Tile ShapeSpec` 把命令中的 tile 作为本次已公开的摸牌。
-- 杠后的 `-Tile`、`Seat:akTile` 或 `Seat:ckTile` 先合成未知补牌，并从墙尾扣牌。
-
-viewer 的普通摸牌和补牌都必须显式输入 `+Tile`。当前 phase 和 origin 决定该牌来自墙头还是墙尾。
-
-actor 不确定时，`-Tile` 返回 `UnknownDiscarder`。REPL 不允许用户用座位前缀绕过缺失状态。
-
-### Pending event
-
-- 弃牌创建 `Pending::Discard { source, tile }`。
-- 碰杠声明创建 `Pending::AddedKong { source, tile }`。
-- `Seat:p` 和 `Seat:k` 消费 pending discard。
-- `Other:h ShapeSpec` 消费 pending discard 或 pending added-kong。
-- 一炮多响期间保留 pending event。每名 winner 只能记录一次，source 不能成为 winner。
-- 第一条非胡公开事件关闭剩余的非 viewer 胡响应。
-- viewer 有合法响应时，只有 `0:h`、`0:p`、`0:k` 或 `.` 可以关闭该响应。后续事件不能隐式代替 viewer pass。
-- 非 viewer pass 不录入。状态机从下一条相容的公开事件推导。
-
-### Directive 与控制命令
-
-| 输入 | 作用 |
-| --- | --- |
-| `:lock <Tiles>` | 覆盖 viewer 锁牌 |
-| `:lock auto` | 恢复空锁牌默认值 |
-| `:len <Other> <UInt>` | 覆盖非 viewer 暗手张数 |
-| `:len <Other> auto` | 恢复该座位的张数推导 |
-| `:score <a> <b> <c> <d>` | 覆盖四家分数 |
-| `:score auto` | 恢复事件自动计分 |
-| `:wall <UInt>` | 覆盖墙数 |
-| `:wall auto` | 恢复墙数推导 |
-| `:dealer <Seat>` | 设置相对庄家；首个换牌、定缺或行牌事件后拒绝 |
-| `:seed <UInt>` | 设置具体化和策略采样 seed |
-| `:policy fast\|ev\|planner [Param...]` | 设置策略和参数 |
-| `?` | 输出一个最佳动作的规范记号 |
-| `s` | 输出手牌、定缺、副露、河尾、阶段、下一弃牌者、prompt state、墙数和策略 |
-| `u` | 恢复上一条成功变更前的会话快照 |
-| `??` | 输出帮助 |
-| `q` | 退出 |
-
-Directive 使用完整英文词根。高频牌局事件使用短记号，低频覆盖项优先保证含义明确。
-
-`:dealer` 可以在 `=<Tiles>` 前后使用，但必须早于首个换牌、定缺或行牌事件。修改 dealer 会重新计算首个 actor，不改变相对座位标号。
-
-### 错误分层与处理管线
-
-1. Lexer 生成带源位置的 token。非法字符返回 `LexError`。
-2. Parser 按 grammar 构造 `Command`。签名不匹配返回 `ParseError { span, expected }`。
-3. 精化类型构造器检查范围、张数和 `ShapeSpec`。失败返回 `TypeError`。
-4. Reducer 在会话副本上执行 typed command。行牌权或 pending event 不匹配时返回 `TransitionError`。
-5. Core 执行确定性校验、具体化和投影检查。失败返回 `PositionError`。
-6. REPL 只提交通过前五步的变更命令。
-
-每层错误只描述该层事实。状态机不能根据错误字符串修正输入，也不能在 reducer 中再次解析 tile、seat 或 pattern。
-
-## `ShapeSpec`
-
-`ShapeSpec` 只用于非 viewer 的隐藏和牌结构。每个 code 映射到 core 的一个 `Pattern`：
-
-| Code | `Pattern` | 牌型 |
-| --- | --- | --- |
-| `ph` | `Plain` | 平胡 |
-| `dy` | `AllSimples` | 断幺九 |
-| `pp` | `AllTriplets` | 碰碰胡 |
-| `qpp` | `PureAllTriplets` | 清碰碰胡 |
-| `7` | `SevenPairs` | 七对 |
-| `q7` | `PureSevenPairs` | 清七对 |
-| `j7` | `TwoFiveEightSevenPairs` | 将七对 |
-| `l7` | `DragonSevenPairs` | 龙七对 |
-| `ql7` | `PureDragonSevenPairs` | 清龙七对 |
-| `2l7` | `DoubleDragonSevenPairs` | 双龙七对 |
-| `3l7` | `TripleDragonSevenPairs` | 三龙七对 |
-| `j2l7` | `TwoFiveEightDoubleDragonSevenPairs` | 将双龙七对 |
-| `j3l7` | `TwoFiveEightTripleDragonSevenPairs` | 将三龙七对 |
-| `18` | `EighteenArhats` | 十八罗汉 |
-| `q18` | `PureEighteenArhats` | 清十八罗汉 |
-| `yj` | `TerminalsInEveryGroup` | 幺九 |
-| `qyj` | `AllTerminals` | 清幺九 |
-| `qy` | `PureOneSuit` | 清一色 |
-| `jg` | `GoldenHook` | 金钩钓 |
-| `qjg` | `PureGoldenHook` | 清金钩钓 |
-
-`ShapeSpec` 构造器执行以下校验：
-
-- 至少包含一个 code。
-- 重复 code 非法。
-- `ph` 只能单独出现。
-- 同一牌型族最多选择一个 code。
-- 复合 code 不能与其已包含的 code 并列，例如 `qpp pp`、`qpp qy`、`q7 7` 和 `q18 18`。
-- 结构冲突非法，例如 `pp 7`、`7 18`、`dy yj` 和 `dy qyj`。
-- formatter 按 `Pattern` 稳定序号输出，不保留输入顺序。
-
-牌型族、包含关系、冲突关系、倍率和帮助文本由一个 `ShapeSchema` 表维护。parser、validator、计分和帮助输出必须共用该表，不能各自维护条件链。
-
-抢杠胡、杠上炮、杠上开花、海底捞月、天胡和地胡从事件上下文推导。REPL 不接受这些事件番简称。
-
-## 阶段推进
-
-- `=<Tiles>` 创建无行牌历史的新局面。
-- `x<Tiles>` 用于换三张阶段。整行包含的 1 至 3 个选择原子提交。
-- `d<Suit4>` 可直接建立换三张完成后的定缺状态。viewer 当前手牌视为换牌后的手牌。
-- `+Tile` 进入 viewer 的 `Turn { origin = Draw }`。
-- `-Tile` 记录当前 actor 弃牌并创建响应流程。
-- `Seat:p` 成功后，`next_discarder = Seat`，origin 为 `AfterPong`。
-- `Seat:k`、`Seat:akTile` 和 `Seat:ckTile` 成功后，actor 必须先补牌。
-- viewer 补牌使用 `+Tile`。非 viewer 补牌在其下一公开动作前自动合成。
-- 碰杠先进入抢杠响应。无人胡后才升级副露并结算杠分。
-
-## `?` 输出
-
-`?` 只打印一个规范动作，不排序，不解释。示例：
-
-```text
-x1m
-dp
--5s
-0:h
-0:p
-0:k
-0:ck2m
-0:ak3p
-.
-```
-
-每一行都能在产生该建议的状态中直接输入。建议 formatter、命令 formatter 和帮助输出共用同一实现。
-
-## 会话示例
-
-以下脚本从行牌阶段开始。相对座位 `0` 是 viewer：
-
-```text
-=1123456m123789s
-dpppp
-+5s
-?
--5s
--1m
-?
-0:h
-```
-
-第二个弃牌命令没有座位。第一个弃牌后的轮转状态将 actor 推导为相对座位 `1`。
-
-其他公开动作示例：
-
-```text
-2:p
-1:k
-3:ak5s
-0:ck2m
-1:h qpp
-3:h+5s 7
-```
-
-这些行展示独立命令形式，不表示同一段连续牌局。
-
-## Workspace 与文档
-
-- workspace 增加 `engine/tools/review`。
-- `engine/tools/review/README.md` 包含 30 秒上手、prompt 表、命令表、`ShapeSpec` 和错误示例。
-- 根 `README.md` 与 `engine/README.md` 增加 review 工具入口。
-- `engine/core/README.md` 说明 `VisiblePosition`、`SeatMap` 和 `advise_visible_position`。
-
-## 实现顺序
-
-1. Core：`RelativeSeat`、`SeatMap`、`VisiblePosition` 和 `project_visible`。
-2. Core：`validate_visible_position` 的确定性校验。
-3. Core：`Game::from_visible_position` 的具体化与投影反查。
-4. Core：`advise_visible_position` 和策略配置封装。
-5. Core：合法、非法、可形成和不可形成单测。
-6. Tool：lexer、parser、精化类型、`ShapeSchema` 和 formatter。
-7. Tool：typed reducer、actor 推导和 pending event。
-8. Tool：事务会话、prompt formatter、undo、集成测试和文档。
-
-## 测试计划
-
-### 座位
-
-- `RelativeSeat` 只接受 `0..3`。
-- 四种 dealer 相对位置都能与绝对 `Seat` 双向 round-trip。
-- observation、牌河、meld source 和 decision actor 经两次映射后不变。
-- REPL 不存在 `viewer` directive。
-- `:dealer` 在只设置手牌后仍可执行，在首个牌局事件后拒绝。
-
-### Parser 与类型
-
-- 全部规范动作都能构造预期 AST。
-- `parse(format(command)) == command`。
-- formatter 不输出非规范空白。
-- `1:-3p`、`p`、`ck3p`、`h`、`0:h ph` 和 `1:h` 均拒绝。
-- `missme`、`miss`、`m`、`hu`、`undo` 和 `help` 均拒绝。
-- 第五张同牌、非法 `ExchangeTiles` 和越界整数均拒绝。
-- `ShapeSchema` 覆盖全部 code、倍率、包含关系和冲突关系。
-- 帮助输出的 ShapeCode 集合等于 `ShapeSchema` 集合。
-
-### 交互界面
-
-- `next_discarder = 0..3` 分别格式化为 `0> `、`1> `、`2> ` 和 `3> `。
-- viewer 普通回合先显示 `0+> `；输入摸牌后显示 `0> `。
-- viewer 碰牌成功后直接显示 `0> `。
-- viewer 响应、换三张、定缺、未知公开事件和终局使用各自的固定 prompt。
-- 非法输入后 prompt 文本不变。
-- stdin 或 stderr 不是 TTY 时不输出 prompt；`--no-prompt` 也关闭 prompt。
-- prompt 与错误进入 stderr；建议和状态进入 stdout。
-
-### Reducer
-
-- 普通轮转、碰后弃牌、和牌后轮转和杠后补牌都能推导唯一 `next_discarder`。
-- actor 不唯一时，`-Tile` 返回 `UnknownDiscarder`。
-- 非 viewer 的 `-Tile` 合成隐藏摸牌；viewer 普通回合缺 `+Tile` 时拒绝。
-- 非 viewer 的暗杠、碰杠和自摸按各自规则合成未知或已公开摸牌。
-- non-viewer 杠后的下一公开回合动作从墙尾合成补牌。
-- `Seat:p`、`Seat:k` 和 claim hu 只消费匹配的 pending event。
-- viewer 有响应时，后续事件不能隐式 pass。
-- non-viewer pass 可从下一条相容公开事件推导。
-- 一炮多响保留 pending event，直到第一条非胡事件。
-
-### Core 校验与具体化
-
-- 库存、副露来源、张数公式、定缺阶段和分数和均有边界测试。
-- 合法最短局具体化成功，且投影相等。
-- 至少一个信息集重采样成功。
-- 对手张数无法填充、响应窗矛盾和 `:wall` 不闭合时拒绝。
-- `?` 返回 legal mask 中的动作。
-- `?` 输出可解析，并能在原状态执行。
-
-### 事务
-
-- 非法行不改变状态、undo 栈或随机数进度。
-- `u` 恢复完整会话快照。
-- 恢复后再次执行 `?` 得到相同结果。
-- 文档中的最短脚本作为 smoke test 执行。
-
-## 默认值
-
-- 策略：`rule-ev` 与 `RuleEvConfig::STANDARD`。
-- viewer：相对座位 `0`，不可配置。
-- dealer：相对座位 `0`，可在首个牌局事件前用 `:dealer` 修改。
-- 分数：每家 10000。
-- 锁牌：空。
-- 墙数和非 viewer 手牌张数：自动推导。
-- “可形成”表示存在一个合法完整具体化，并通过投影、决策和信息集检查。
-
-## 不进入命令面的字段
-
-用户不输入以下派生字段：
-
-- phase
-- actor
-- `can_hu`
-- 完整 response remaining 集合
-- turn origin
-- 弃牌 actor
-- 碰、直杠或点炮的 tile 与 source
-- 可从事件上下文推导的事件番
-- 仅修改 `has_won` 的标记
-
-状态机和 core 校验共同维护这些字段。无法推导时返回明确错误，不增加临时覆盖命令。
+| A direct OpenRiichi translation becomes difficult in the browser | Keep the original subsystem structure and port the generic behavior before simplifying it |
+| Optional planner increases load or compute cost | Defer it until after the first release; if implemented, isolate it in the existing worker and optimize later |
+| Planner blocks the browser | Run all AI in a worker; add cancellation and time budgets |
+| UI duplicates engine rules | Use legal mask and typed snapshots only |
+| 3D scene is hard to test | Keep a 2D/debug renderer and event fixtures |
+| Hidden information leaks | Filter snapshots and events in Rust before serialization |
+| Small screens hide actions | Safe-area action bar, keyboard controls, and responsive scaling |
+| Animation desynchronizes from rules | Animate accepted worker transitions only; allow skip and resync |
+
+## 14. Immediate next tasks
+
+1. Create `engine/wasm` and define the first snapshot schema.
+2. Add the worker protocol and a deterministic no-render browser test.
+3. Add a minimal TypeScript/Vite app with a debug renderer.
+4. Implement exchange and missing-suit panels before ordinary-turn polish.
+5. Add a Blood Flow fixture pack for repeat wins, locked tiles, kongs, and settlement.
+6. Convert the first table, tile, and button assets and port their matching OpenRiichi render and interaction logic.
+7. Keep the existing desktop client as a test oracle until the Web client reaches Phase D.
