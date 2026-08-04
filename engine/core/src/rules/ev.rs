@@ -315,7 +315,6 @@ fn wait_quality(holding: &Holding, exposure: &[u8; TILE_KIND_COUNT]) -> WaitQual
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct DiscardDanger {
-    certain_winners: u8,
     expected_loss: u64,
 }
 
@@ -432,15 +431,6 @@ fn heuristic_discard_danger(
         if opponent == actor || game.missing_suit(opponent) == Some(tile.suit()) {
             continue;
         }
-        if let Some(multiplier) = certain_wait_multiplier(game, opponent, tile) {
-            danger.certain_winners += 1;
-            danger.expected_loss = danger.expected_loss.saturating_add(
-                (f64::from(multiplier.min(WAIT_MULTIPLIER_CAP))
-                    * RISK_SCALE as f64
-                    * known_risk_factor) as u64,
-            );
-            continue;
-        }
         let posterior =
             opponent_win_posterior(game, opponent, tile, exposure) * uncertain_risk_factor;
         let multiplier = expected_discard_multiplier(game, opponent);
@@ -457,8 +447,9 @@ fn opponent_win_posterior(
     tile: Tile,
     exposure: &[u8; TILE_KIND_COUNT],
 ) -> f64 {
+    let public_win_tiles = game.public_win_tiles(opponent);
     let hidden = game.concealed_len(opponent).saturating_sub(
-        game.locked(opponent)
+        public_win_tiles
             .iter()
             .map(|&count| usize::from(count))
             .sum(),
@@ -561,20 +552,8 @@ fn binomial(n: usize, k: usize) -> usize {
 }
 
 fn expected_discard_multiplier(game: &Game, opponent: Seat) -> u32 {
-    // Exact waits use the scoring engine. Unknown hands use only public melds.
+    // Hidden hands are estimated from public melds only.
     1 + (game.meld_count(opponent) as u32).min(3)
-}
-
-fn certain_wait_multiplier(game: &Game, opponent: Seat, tile: Tile) -> Option<u32> {
-    if !game.has_won(opponent) || game.missing_suit(opponent) == Some(tile.suit()) {
-        return None;
-    }
-    let mut holding = Holding::from_game(game, opponent);
-    holding.concealed = holding.locked;
-    holding
-        .after_draw(tile)?
-        .evaluate_win(Some(tile), WinFlags::NONE)
-        .map(|evaluation| evaluation.multiplier)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -627,9 +606,6 @@ fn choose_turn(game: &Game, actor: Seat, legal: &LegalActions, config: RuleEvCon
     }
 
     for tile in mask_tiles(legal.added_kong_mask) {
-        if discard_danger(game, actor, tile, &exposure, config.defense).certain_winners != 0 {
-            continue;
-        }
         let Some(after) = holding.after_added_kong(tile) else {
             continue;
         };
@@ -776,6 +752,10 @@ const _: () = assert!(PLAYER_COUNT == 4);
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::game::{
+        MELD_OBSERVATION_WIDTH, META_OBSERVATION_WIDTH, RIVER_OBSERVATION_WIDTH,
+        TILE_OBSERVATION_WIDTH,
+    };
 
     fn tile(suit: Suit, rank: u8) -> Tile {
         Tile::from_suit_rank(suit, rank - 1).expect("test rank is valid")
@@ -797,6 +777,32 @@ mod tests {
             missing: None,
             has_won: false,
         }
+    }
+
+    fn observation_for(
+        game: &Game,
+        viewer: Seat,
+    ) -> (
+        [u8; TILE_OBSERVATION_WIDTH],
+        [u8; MELD_OBSERVATION_WIDTH],
+        [u8; RIVER_OBSERVATION_WIDTH],
+        [i32; META_OBSERVATION_WIDTH],
+    ) {
+        let mut observation = (
+            [0; TILE_OBSERVATION_WIDTH],
+            [0; MELD_OBSERVATION_WIDTH],
+            [0; RIVER_OBSERVATION_WIDTH],
+            [0; META_OBSERVATION_WIDTH],
+        );
+        game.observation_into(
+            viewer,
+            &mut observation.0,
+            &mut observation.1,
+            &mut observation.2,
+            &mut observation.3,
+        )
+        .expect("test observation buffers have the required dimensions");
+        observation
     }
 
     #[test]
@@ -870,7 +876,6 @@ mod tests {
                 ..safe.quality
             },
             danger: DiscardDanger {
-                certain_winners: 1,
                 expected_loss: 100 * RISK_SCALE,
             },
             exposure: 1,
@@ -905,5 +910,56 @@ mod tests {
             },
             false,
         ));
+    }
+
+    #[test]
+    fn rule_ev_does_not_read_opponent_hidden_winning_base() {
+        let mut game = Game::new(8);
+        for _ in 0..52 {
+            let action = game
+                .simple_rule_action()
+                .expect("the fixture remains active");
+            game.step_id(action).expect("the rule action is legal");
+        }
+
+        let actor = Seat::ALL[1];
+        let opponent = Seat::ALL[2];
+        assert_eq!(game.decision().map(|decision| decision.actor), Some(actor));
+        assert!(game.has_won(opponent));
+
+        let left = game
+            .resample_information_set(0)
+            .expect("the information set can be sampled");
+        let right = game
+            .resample_information_set(1)
+            .expect("the information set can be sampled");
+        assert_ne!(left.win_base(opponent), right.win_base(opponent));
+        assert_ne!(left.locked(opponent), right.locked(opponent));
+        assert_eq!(
+            observation_for(&left, actor),
+            observation_for(&right, actor)
+        );
+
+        let discard_dangers = |sampled: &Game| {
+            let legal = sampled
+                .legal_actions()
+                .expect("the sampled game remains on the actor's turn");
+            let exposure = public_exposure(sampled, actor);
+            mask_tiles(legal.discard_mask)
+                .map(|tile| {
+                    (
+                        tile,
+                        heuristic_discard_danger(sampled, actor, tile, &exposure),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(discard_dangers(&left), discard_dangers(&right));
+        for config in [RuleEvConfig::FAST, RuleEvConfig::STANDARD] {
+            assert_eq!(
+                left.rule_ev_action_with_config(config),
+                right.rule_ev_action_with_config(config)
+            );
+        }
     }
 }
