@@ -12,11 +12,11 @@ name = "bloodflow_mahjong"
 crate-type = ["cdylib"]
 
 [features]
-default = []
+default = ["rule-nn"]
 extension-module = ["pyo3/extension-module"]
+rule-nn = ["bloodflow-mahjong/rule-nn"]
 
 [dependencies]
 bloodflow-mahjong = { path = "../core" }
 numpy = "0.27"
 pyo3 = { version = "0.27", features = ["abi3-py310"] }
-

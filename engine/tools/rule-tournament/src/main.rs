@@ -1,6 +1,8 @@
 //! Balanced tournament evaluation for deterministic rule policies.
 
 use std::num::NonZeroUsize;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -98,6 +100,9 @@ struct Config {
     a_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     a_defense: Defense,
+    /// ONNX model used when `--policy-a rule-nn` is selected.
+    #[arg(long)]
+    a_nn_model: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "rule-fast")]
     policy_b: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
@@ -145,6 +150,9 @@ struct Config {
     b_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     b_defense: Defense,
+    /// ONNX model used when `--policy-b rule-nn` is selected.
+    #[arg(long)]
+    b_nn_model: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -155,6 +163,8 @@ enum PolicyKind {
     Ev,
     #[value(name = "rule-planner")]
     Planner,
+    #[value(name = "rule-nn")]
+    Nn,
 }
 
 impl PolicyKind {
@@ -163,6 +173,7 @@ impl PolicyKind {
             Self::Fast => "rule-fast",
             Self::Ev => "rule-ev",
             Self::Planner => "rule-planner",
+            Self::Nn => "rule-nn",
         }
     }
 }
@@ -235,10 +246,11 @@ impl PlannerContinuation {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 enum Policy {
     Fast,
     Ev(RuleEvConfig),
+    Nn(Arc<bloodflow_mahjong::RuleNn>),
     Planner {
         config: RulePlannerConfig,
         root_belief: PlannerRootBelief,
@@ -267,6 +279,9 @@ impl Policy {
             Self::Fast => RulePlannerContinuationPolicy::Fast,
             Self::Ev(config) => RulePlannerContinuationPolicy::Ev(*config),
             Self::Planner { config, .. } => RulePlannerContinuationPolicy::PlannerBaseline(*config),
+            // NN continuation is only a fallback for planner diagnostics. The
+            // model itself is still used for all root decisions.
+            Self::Nn(_) => RulePlannerContinuationPolicy::Fast,
         }
     }
 
@@ -281,6 +296,10 @@ impl Policy {
                 .map(PolicyDecision::without_search),
             Self::Ev(config) => game
                 .rule_ev_action_with_config(*config)
+                .map(PolicyDecision::without_search),
+            Self::Nn(model) => model
+                .action(game)
+                .expect("rule-nn inference failed")
                 .map(PolicyDecision::without_search),
             Self::Planner {
                 config,
@@ -323,6 +342,7 @@ impl Default for Config {
             a_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
             a_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             a_defense: Defense::Heuristic,
+            a_nn_model: None,
             policy_b: PolicyKind::Fast,
             b_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
             b_hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
@@ -334,6 +354,7 @@ impl Default for Config {
             b_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
             b_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             b_defense: Defense::Heuristic,
+            b_nn_model: None,
         }
     }
 }
@@ -894,7 +915,7 @@ fn print_searches(name: &str, stats: PlannerSearchStats) {
     );
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PolicySettings {
     argument_prefix: &'static str,
     kind: PolicyKind,
@@ -908,10 +929,11 @@ struct PolicySettings {
     response_worlds: u16,
     search_iterations: u16,
     defense: Defense,
+    nn_model: Option<PathBuf>,
 }
 
 fn invalid_policy_value(
-    settings: PolicySettings,
+    settings: &PolicySettings,
     argument: &str,
     value: impl std::fmt::Display,
     expected: impl std::fmt::Display,
@@ -933,7 +955,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
             let policy = RuleEvConfig::with_search_depth(settings.lookahead_depth)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "lookahead-depth",
                         settings.lookahead_depth,
                         "an integer from 0 through 3",
@@ -954,7 +976,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_hand_changes(settings.hand_changes)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "hand-changes",
                         settings.hand_changes,
                         "an integer from 0 through 2",
@@ -963,7 +985,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_draw_horizon(settings.draw_horizon)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "draw-horizon",
                         settings.draw_horizon,
                         "an integer from 0 through 32",
@@ -972,7 +994,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_candidate_states(settings.candidate_states)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "candidate-states",
                         settings.candidate_states,
                         "an integer from 1 through 200000",
@@ -981,7 +1003,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_belief_worlds(settings.belief_worlds)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "belief-worlds",
                         settings.belief_worlds,
                         "an integer from 0 through 256",
@@ -990,7 +1012,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_response_worlds(settings.response_worlds)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "response-worlds",
                         settings.response_worlds,
                         "an integer from 0 through 256",
@@ -999,7 +1021,7 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 .with_search_iterations(settings.search_iterations)
                 .ok_or_else(|| {
                     invalid_policy_value(
-                        settings,
+                        &settings,
                         "search-iterations",
                         settings.search_iterations,
                         "an integer from 0 through 4096",
@@ -1021,6 +1043,36 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                     settings.search_iterations,
                     settings.root_belief.name_suffix(),
                     settings.continuation.name_suffix(),
+                ),
+            ))
+        }
+        PolicyKind::Nn => {
+            let path = settings.nn_model.ok_or_else(|| {
+                clap::Error::raw(
+                    ErrorKind::MissingRequiredArgument,
+                    format!(
+                        "--{}-nn-model is required when --policy-{} is rule-nn",
+                        settings.argument_prefix, settings.argument_prefix
+                    ),
+                )
+            })?;
+            let bytes = std::fs::read(&path).map_err(|error| {
+                clap::Error::raw(
+                    ErrorKind::InvalidValue,
+                    format!("failed to read NN model {}: {error}", path.display()),
+                )
+            })?;
+            let model = bloodflow_mahjong::RuleNn::from_onnx_bytes(&bytes).map_err(|error| {
+                clap::Error::raw(
+                    ErrorKind::InvalidValue,
+                    format!("failed to load NN model {}: {error}", path.display()),
+                )
+            })?;
+            Ok((
+                Policy::Nn(Arc::new(model)),
+                format!(
+                    "rule_nn_{}",
+                    path.file_stem().and_then(|s| s.to_str()).unwrap_or("model")
                 ),
             ))
         }
@@ -1067,6 +1119,7 @@ fn run(config: Config) -> Result<(), clap::Error> {
         response_worlds: config.a_response_worlds,
         search_iterations: config.a_search_iterations,
         defense: config.a_defense,
+        nn_model: config.a_nn_model,
     };
     let settings_b = PolicySettings {
         argument_prefix: "b",
@@ -1081,6 +1134,7 @@ fn run(config: Config) -> Result<(), clap::Error> {
         response_worlds: config.b_response_worlds,
         search_iterations: config.b_search_iterations,
         defense: config.b_defense,
+        nn_model: config.b_nn_model,
     };
     let (policy_a, policy_a_name) = build_policy(settings_a)?;
     let (policy_b, policy_b_name) = build_policy(settings_b)?;
@@ -1464,6 +1518,7 @@ mod tests {
                 a_response_worlds: 0,
                 a_search_iterations: 16,
                 a_defense: Defense::Heuristic,
+                a_nn_model: None,
                 policy_b: PolicyKind::Ev,
                 b_lookahead_depth: 0,
                 b_hand_changes: 0,
@@ -1475,6 +1530,7 @@ mod tests {
                 b_response_worlds: 0,
                 b_search_iterations: 64,
                 b_defense: Defense::None,
+                b_nn_model: None,
             }
         );
     }
@@ -1494,6 +1550,29 @@ mod tests {
     }
 
     #[test]
+    fn rule_nn_requires_a_model_path() {
+        let result = build_policy(PolicySettings {
+            argument_prefix: "a",
+            kind: PolicyKind::Nn,
+            lookahead_depth: 0,
+            hand_changes: 0,
+            draw_horizon: 0,
+            candidate_states: 1,
+            belief_worlds: 0,
+            root_belief: PlannerRootBelief::Posterior,
+            continuation: PlannerContinuation::Current,
+            response_worlds: 0,
+            search_iterations: 0,
+            defense: Defense::None,
+            nn_model: None,
+        });
+        let Err(error) = result else {
+            panic!("rule-nn requires --a-nn-model");
+        };
+        assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+    }
+
+    #[test]
     fn rule_ev_ignores_planner_only_parameters() {
         let settings = PolicySettings {
             argument_prefix: "a",
@@ -1508,8 +1587,9 @@ mod tests {
             response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
             search_iterations: 256,
             defense: Defense::Heuristic,
+            nn_model: None,
         };
-        let with_budget = build_policy(settings).unwrap();
+        let with_budget = build_policy(settings.clone()).unwrap();
         let without_budget = build_policy(PolicySettings {
             search_iterations: 0,
             root_belief: PlannerRootBelief::Posterior,
@@ -1541,6 +1621,7 @@ mod tests {
             response_worlds: config.a_response_worlds,
             search_iterations: config.a_search_iterations,
             defense: config.a_defense,
+            nn_model: config.a_nn_model,
         })
         .expect("the default planner budget is valid");
 

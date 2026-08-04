@@ -11,7 +11,7 @@ maturin develop --release --manifest-path engine/pybind/Cargo.toml
 python -m pytest engine/pybind/tests
 ```
 
-PyO3 使用 `abi3-py310`。模块公开 `Game`、`Batch`、事件枚举、常量，以及 `rule-fast`、`rule-ev` 和 `rule-planner` 三种内置策略。后两种策略使用不可变配置对象 `RuleEvConfig` 和 `RulePlannerConfig`。
+PyO3 使用 `abi3-py310`。模块公开 `Game`、`Batch`、事件枚举、常量、三种规则策略和 `RuleNn`。`rule-ev` 和 `rule-planner` 使用不可变配置对象 `RuleEvConfig` 和 `RulePlannerConfig`。默认构建启用 feature `rule-nn`。
 
 ## 快速开始
 
@@ -39,6 +39,20 @@ planner_action = game.rule_planner_action(planner_config)
 
 `RuleEvConfig` 提供 `fast()` 和 `standard()`。`RulePlannerConfig` 只有一个默认配置：`hand_changes=0`、`draw_horizon=1`、`candidate_states=1`、`belief_worlds=64`、`response_worlds=0`、`search_iterations=64`。构造函数会拒绝超出 core 约束的预算。
 
+`RuleNn` 从 ONNX 文件或字节加载模型。模型加载会检查固定输入和输出契约。一个实例可以在多个 `Game` 决策中复用：
+
+```python
+import bloodflow_mahjong as bm
+
+policy = bm.RuleNn.from_file("model/latest.onnx")
+game = bm.Game(seed=42)
+
+while (action := policy.action(game)) is not None:
+    game.step_id(action)
+```
+
+模型只输出原始 logits。Rust core 应用当前 `Game` 的合法动作 mask，因此 `RuleNn.action` 不会返回非法动作。当前接口不支持 `Batch` 神经网络推理。
+
 ## 固定动作空间
 
 策略动作空间固定为 115 维：
@@ -62,7 +76,7 @@ planner_action = game.rule_planner_action(planner_config)
 `Game` 提供单局接口：
 
 - reset、阶段、当前决策和合法动作 mask；
-- 三种内置策略的单局动作接口和 `step_id`；
+- 三种规则策略的单局动作接口、`RuleNn.action` 和 `step_id`；
 - observation、事件和全知 tile count 写入；
 - 四家分数、缺门、暗手、锁牌、面子、弃牌、排名和终局原因；
 - 信息集重采样。
@@ -71,12 +85,12 @@ planner_action = game.rule_planner_action(planner_config)
 
 - 按索引重置、克隆和 swap-remove；
 - 批量信息集或 live-wall 重采样；
-- 三种内置策略的普通和 masked `*_actions_into` 接口；
+- 三种规则策略的普通和 masked `*_actions_into` 接口；
 - masked step 和融合 step；
 - 向听分析；
 - 只为指定绝对座位写入事件历史。
 
-数组 dtype、shape、C-contiguous、对齐和内存不重叠是 API 合约。无效数组在状态推进前返回错误。Batch 执行 reset、mask、策略和 step 时释放 GIL，并在 batch 足够大时使用 Rayon。单局 `rule_ev_action` 和 `rule_planner_action` 也会释放 GIL。
+数组 dtype、shape、C-contiguous、对齐和内存不重叠是 API 合约。无效数组在状态推进前返回错误。Batch 执行 reset、mask、策略和 step 时释放 GIL，并在 batch 足够大时使用 Rayon。单局 `rule_ev_action`、`rule_planner_action` 和 `RuleNn.action` 也会释放 GIL。
 
 ## Step record
 

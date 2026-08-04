@@ -50,7 +50,7 @@ fn play(seed: u64) -> Result<Game, GameError> {
 
 ## 策略 API
 
-三种策略按计算预算递进：`rule-fast` 是轻量基准，`rule-ev` 是中等预算，`rule-planner` 的预算最高。
+core 提供三种不依赖模型文件的规则策略：`rule-fast` 是轻量基准，`rule-ev` 是中等预算，`rule-planner` 的预算最高。feature `rule-nn` 额外提供 ONNX 神经网络策略。
 
 ### `rule-fast`
 
@@ -95,6 +95,38 @@ feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAn
 
 `OracleHidden` 读取权威隐藏状态，`KnownPolicies` 读取评测器提供的策略身份。两者只能用于诊断，不能用于部署或正式策略成绩。
 
+### `rule-nn`
+
+`RuleNn` 通过 `tract-onnx` 加载 Actor 图。core 默认不启用该依赖；调用者必须启用 feature `rule-nn`。仓库中的当前模型位于 [`../../model/latest.onnx`](../../model/latest.onnx)。模型应在进程启动时加载一次，并在后续决策中复用。
+
+```rust
+use std::error::Error;
+
+use bloodflow_mahjong::{Game, RuleNn};
+
+fn main() -> Result<(), Box<dyn Error>> {
+    let bytes = std::fs::read("../../model/latest.onnx")?;
+    let policy = RuleNn::from_onnx_bytes(&bytes)?;
+    let game = Game::new(7);
+    let action = policy.action(&game)?;
+    println!("{action:?}");
+    Ok(())
+}
+```
+
+模型使用固定 batch size 1 的接口：
+
+| 名称 | dtype | shape |
+| --- | --- | --- |
+| `tile_obs` | `uint8` | `[1, 10, 27]` |
+| `melds` | `uint8` | `[1, 4, 4, 3]` |
+| `meta` | `int32` | `[1, 34]` |
+| `events` | `int32` | `[1, 192, 8]` |
+| `event_lengths` | `int64` | `[1]` |
+| `logits` | `float32` | `[1, 115]` |
+
+ONNX 图只输出未屏蔽的 Actor logits。`RuleNn::action` 从当前行动者视角生成 observation 和事件历史，再使用引擎的 legal mask 选择最高有限 logit。模型不能提交非法动作。相同 logit 使用最小动作 ID。`rule-nn` 当前没有 `Batch` 推理接口。
+
 ## Batch
 
 `Batch` 的高吞吐接口由调用者分配输出缓冲区。常用能力包括：
@@ -113,4 +145,12 @@ feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAn
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
   --all-targets --features planner-analysis
+cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
+  --all-targets --features rule-nn
+
+cargo run --release --manifest-path ../Cargo.toml \
+  -p bloodflow-mahjong \
+  --features rule-nn \
+  --example rule_nn_smoke -- \
+  ../../model/latest.onnx
 ```

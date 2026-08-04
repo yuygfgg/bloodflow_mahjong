@@ -9,7 +9,8 @@
 - `Game` 保存单局完整状态并执行游戏规则；
 - 手牌分析器判断胡牌结构、向听数、有效牌和最大待牌倍率；
 - `Batch` 批量执行多个独立 `Game`；
-- `simple_rule_action`、`rule_ev_action` 和 `rule_planner_action` 是三种策略入口；
+- `simple_rule_action`、`rule_ev_action` 和 `rule_planner_action` 是三种规则策略入口；
+- feature `rule-nn` 的 `RuleNn::action` 是固定契约 ONNX 策略入口；
 - observation 和事件接口为指定观察者过滤私有信息。
 
 `Game` 为模拟、测试和重放公开全知状态。全知接口不等于策略可见信息。部署策略必须只使用当前行动者的私有状态、公开状态和观察者视角事件（见"信息边界"）。
@@ -98,15 +99,17 @@ Turn 内行动者可直接 胡（含自摸、杠上开花）、暗杠、碰杠�
 
 事件历史为每局 512 条固定宽度环形记录。事件数组使用观察者相对座位。摸牌牌面只对摸牌者可见。终局没有行动者时，observation 以庄家作为相对座位 `0`。
 
+`RuleNn::action` 只能通过 `Game::observation_into`、`Game::events_into` 和 legal mask 获取策略输入。ONNX 图不接收 `Game`、对手暗手或牌墙。图输出 115 个原始 logits，Rust core 在推理后应用 legal mask。该边界使模型无法选择非法动作，也防止模型绕过观察者信息过滤。
+
 ## 批量执行
 
 `Batch` 保存多个独立 `Game`，并在批量足够大时使用 Rayon。`*_into` 接口由调用者提供输出缓冲区，避免热路径分配。主要能力包括重置、克隆、按索引删除、信息集与 live-wall 重采样、合法动作/向听分析/observation/事件写入，以及普通、masked 和融合 step。
 
-`rule-planner` 目前只有单局 `Game` 接口。锦标赛在局级并行执行 planner，不通过 `Batch` 调用。
+三种规则策略都提供 `Batch` 接口。`rule-nn` 当前只有单局 `Game` 接口。锦标赛对所有策略使用单局接口，并在牌局层并行执行，不通过 `Batch` 调用。
 
 ## 策略约束
 
-- 三种策略必须返回 legal mask 中的动作；
+- 所有策略必须返回 legal mask 中的动作；
 - 策略不得读取对手身份；
 - 策略强弱通过独立 seed block 的锦标赛测量，方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
@@ -117,4 +120,3 @@ Turn 内行动者可直接 胡（含自摸、杠上开花）、暗杠、碰杠�
 牌墙耗尽后先查花猪，再查大叫。每个阶段按付款者座位 `0..3` 处理。每名付款者完成该阶段全部付款后，引擎检查是否已有三家分数为零。
 
 查大叫只计算牌型和根形成的结构倍率，不计算自摸、抢杠胡、杠上炮、杠上开花、海底捞月、天胡或地胡等状态/事件番，也不要求待牌在剩余牌墙中仍有副本。已经胡过的玩家同时保留历史最高牌型与根倍率，供终局赔付比较。
-

@@ -435,7 +435,8 @@ class HistoryEncoder(nn.Module):
         key_valid = positions[None, :] < lengths[:, None]
         if length:
             empty_rows = lengths == 0
-            key_valid[:, 0] |= empty_rows
+            first_valid = key_valid[:, :1] | empty_rows[:, None]
+            key_valid = torch.cat((first_valid, key_valid[:, 1:]), dim=1)
         for block in self.blocks:
             hidden, _ = block(
                 hidden, causal=True, key_valid=key_valid, positions=positions

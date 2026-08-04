@@ -34,6 +34,39 @@ python -m training.train \
   --output-dir /tmp/bloodflow-ppo-smoke
 ```
 
+## ONNX export
+
+Export a complete PPO checkpoint to the fixed `rule-nn` contract:
+
+```bash
+python -m training.export_onnx \
+  runs/ppo-self-play-25-from16h-seed7/latest.pt \
+  model/latest.onnx
+```
+
+The exporter moves the policy to CPU and writes raw Actor logits with shape
+`[1, 115]`. The graph accepts `tile_obs`, `melds`, `meta`, 192 viewer-scoped
+events, and the event length. The engine applies the legal-action mask after
+inference.
+
+The command checks the ONNX graph and compares one deterministic input against
+PyTorch by default. It reports maximum and mean absolute error and requires the
+argmax to match. The checkpoint model must support at least 192 history events.
+Use `--no-check` or `--no-parity` only for isolated exporter diagnostics.
+
+Run one game through the Rust loader from the repository root:
+
+```bash
+cargo run --release --manifest-path engine/Cargo.toml \
+  -p bloodflow-mahjong \
+  --features rule-nn \
+  --example rule_nn_smoke -- \
+  model/latest.onnx 7
+```
+
+See [`../engine/tools/rule-tournament/README.md`](../engine/tools/rule-tournament/README.md)
+for balanced `rule-nn` evaluation.
+
 ## Rule-EV supervised start
 
 The supervised stage labels every current-actor state with deterministic

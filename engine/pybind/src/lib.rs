@@ -1,4 +1,6 @@
 use ::bloodflow_mahjong as core_engine;
+#[cfg(feature = "rule-nn")]
+use core_engine::RuleNn;
 use core_engine::{
     ACTION_ADDED_KONG_OFFSET, ACTION_CHOOSE_MISSING_OFFSET, ACTION_CONCEALED_KONG_OFFSET,
     ACTION_DISCARD_OFFSET, ACTION_EXCHANGE_TILE_OFFSET, ACTION_EXPOSED_KONG, ACTION_HU,
@@ -29,6 +31,41 @@ const RIVER_TILE_CAPACITY: usize = 108;
 const RIVER_FIELDS: usize = 2;
 
 type StepRecordTuple = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
+
+#[cfg(feature = "rule-nn")]
+#[pyclass(frozen, name = "RuleNn", module = "bloodflow_mahjong")]
+struct PyRuleNn {
+    inner: RuleNn,
+}
+
+#[cfg(feature = "rule-nn")]
+#[pymethods]
+impl PyRuleNn {
+    #[new]
+    fn new(py: Python<'_>, onnx: &[u8]) -> PyResult<Self> {
+        py.detach(|| RuleNn::from_onnx_bytes(onnx))
+            .map(|inner| Self { inner })
+            .map_err(rule_nn_model_error)
+    }
+
+    #[staticmethod]
+    fn from_file(py: Python<'_>, path: std::path::PathBuf) -> PyResult<Self> {
+        let onnx = std::fs::read(path)?;
+        py.detach(move || RuleNn::from_onnx_bytes(&onnx))
+            .map(|inner| Self { inner })
+            .map_err(rule_nn_model_error)
+    }
+
+    fn action(&self, py: Python<'_>, game: &PyGame) -> PyResult<Option<u8>> {
+        py.detach(|| self.inner.action(&game.inner))
+            .map(|action| action.map(|id| id.index() as u8))
+            .map_err(rule_nn_inference_error)
+    }
+
+    fn __repr__(&self) -> &'static str {
+        "RuleNn()"
+    }
+}
 
 #[pyclass(frozen, name = "RuleEvConfig", module = "bloodflow_mahjong")]
 struct PyRuleEvConfig {
@@ -1186,6 +1223,16 @@ fn game_error(error: GameError) -> PyErr {
     }
 }
 
+#[cfg(feature = "rule-nn")]
+fn rule_nn_model_error(error: core_engine::RuleNnError) -> PyErr {
+    PyValueError::new_err(error.to_string())
+}
+
+#[cfg(feature = "rule-nn")]
+fn rule_nn_inference_error(error: core_engine::RuleNnError) -> PyErr {
+    PyRuntimeError::new_err(error.to_string())
+}
+
 fn require_shape<'py>(
     array: &impl PyUntypedArrayMethods<'py>,
     expected: &[usize],
@@ -1482,6 +1529,8 @@ fn outcome_tuple(outcome: StepOutcome) -> StepRecordTuple {
 
 #[pymodule]
 fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    #[cfg(feature = "rule-nn")]
+    module.add_class::<PyRuleNn>()?;
     module.add_class::<PyRuleEvConfig>()?;
     module.add_class::<PyRulePlannerConfig>()?;
     module.add_class::<PyGame>()?;

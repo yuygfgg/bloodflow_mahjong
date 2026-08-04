@@ -6,6 +6,8 @@ use crate::game::{Batch, Game, GameError, PARALLEL_BATCH_THRESHOLD};
 pub(crate) mod ev;
 pub(crate) mod fast;
 pub(crate) mod hand;
+#[cfg(feature = "rule-nn")]
+pub(crate) mod nn;
 pub(crate) mod opening;
 pub(crate) mod planner;
 

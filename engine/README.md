@@ -42,13 +42,14 @@ cargo build --release --workspace --all-targets
 - `Tile`、`Suit`、`Seat`、`Meld` 和相关枚举；
 - 和牌、牌型、向听数和最大待牌倍率分析；
 - `Batch` 批量环境和 caller-owned `*_into` 缓冲区接口；
-- `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。
+- `rule-fast`、`rule-ev` 和 `rule-planner` 三种规则策略；
+- feature `rule-nn` 提供固定契约 ONNX 策略。
 
 详细 Rust API 和配置示例见 [`core/README.md`](core/README.md)。状态机和信息边界见 [`../IMPLEMENTATION.md`](../IMPLEMENTATION.md)。
 
 ## 策略测评
 
-`rule-tournament` 支持三种内置策略的任意两两组合。每个 block 运行 6 局平衡座位分配，并按 block bootstrap 置信区间（以整个 block 为重采样单位）。
+`rule-tournament` 支持三种规则策略和 `rule-nn` 的任意两两组合。每个 block 运行 6 局平衡座位分配，并按 block bootstrap 置信区间（以整个 block 为重采样单位）。选择 `rule-nn` 时，必须用对应侧的 `--*-nn-model` 参数提供模型路径。
 
 ```bash
 cargo run --release -p bloodflow-mahjong-rule-tournament -- \
@@ -59,6 +60,17 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
 ```
 
 该命令是 smoke test。统计方法、预算参数和长测命令见 [`tools/rule-tournament/README.md`](tools/rule-tournament/README.md)。
+
+使用仓库中的 ONNX 模型检查 Rust 加载和推理：
+
+```bash
+cargo run --release -p bloodflow-mahjong-rule-tournament -- \
+  --blocks 1 \
+  --bootstrap-samples 100 \
+  --policy-a rule-nn \
+  --a-nn-model ../model/latest.onnx \
+  --policy-b rule-fast
+```
 
 ## 诊断 benchmark
 
@@ -82,4 +94,4 @@ benchmark 只用于定位性能变化。策略强弱必须通过平衡锦标赛�
 
 ## Python 绑定
 
-安装、数组格式和示例见 [`pybind/README.md`](pybind/README.md)。绑定需要 Python 3.10 或更高版本，并公开 `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。
+安装、数组格式和示例见 [`pybind/README.md`](pybind/README.md)。绑定需要 Python 3.10 或更高版本，并公开三种规则策略和 `RuleNn`。`RuleNn` 从 ONNX 文件或字节加载模型，并只提供单局 `Game` 推理。

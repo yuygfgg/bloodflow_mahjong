@@ -1,6 +1,6 @@
 # 血流麻将引擎
 
-四人血流麻将 Rust 引擎，附带三种智能体作为虚拟玩家策略、策略锦标赛工具和 Python 绑定。
+四人血流麻将 Rust 引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具和 Python 绑定。
 
 ## 功能
 
@@ -10,7 +10,7 @@
 - 全部结构牌型、状态/事件番与即时计分；
 - 牌墙耗尽后查花猪、查大叫，分数下限为 0；
 - 115 维固定动作空间、观察者视角事件和批量环境；
-- 三种内置策略和任意两两平衡测评。
+- 三种规则策略、ONNX 神经网络策略和任意两两平衡测评。
 
 完整玩法与计分规范见 [`GAME_RULES.md`](GAME_RULES.md)。
 
@@ -25,14 +25,16 @@
 | [`engine/core/README.md`](engine/core/README.md) | `Game`/`Batch`/策略/手牌分析的 API 与配置示例 |
 | [`engine/pybind/README.md`](engine/pybind/README.md) | 安装、数组规格、事件与 observation 格式 |
 | [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md) | 统计方法、全部 CLI 参数和输出解释 |
+| [`training/README.md`](training/README.md) | 训练、checkpoint 和 ONNX 导出流程 |
 
 ## 仓库结构
 
 | 路径 | 职责 |
 | --- | --- |
-| [`engine/core`](engine/core/) | 游戏状态、计分、分析、批量环境和内置策略 |
+| [`engine/core`](engine/core/) | 游戏状态、计分、分析、批量环境和策略接口 |
 | [`engine/pybind`](engine/pybind/) | PyO3 和 NumPy 兼容接口 |
-| [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种内置策略的平衡测评工具 |
+| [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种受支持策略的平衡测评工具 |
+| [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 使用的 ONNX 模型 |
 
 Rust workspace 包含三个 package：
 
@@ -65,19 +67,20 @@ fn main() -> Result<(), GameError> {
 
 `Game` 是权威模拟状态，为测试和重放提供全知接口。部署策略必须只读取观察者视角的 observation 和过滤后的 transition，见 [`IMPLEMENTATION.md`](IMPLEMENTATION.md) "信息边界"一节。更多 API 见 [`engine/core/README.md`](engine/core/README.md)。
 
-## 内置策略
+## 策略
 
 | CLI 标识符 | 设计 | 公开接口 |
 | --- | --- | --- |
 | `rule-fast` | 低成本、确定性的基准策略 | Rust/Python `Game` 和 `Batch` |
 | `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust/Python `Game` 和 `Batch` |
 | `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust/Python `Game` 和 `Batch` |
+| `rule-nn` | ONNX Actor；引擎负责 observation 编码和合法动作过滤 | Rust/Python `RuleNn` 和锦标赛 |
 
-三种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
+前三种策略不需要外部模型。`rule-nn` 需要 [`model/latest.onnx`](model/latest.onnx)，并且当前只提供单局推理，不提供 `Batch` 推理。四种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
 ## Python 绑定
 
-需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样，以及 `rule-fast`、`rule-ev` 和 `rule-planner` 三种策略。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
+需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样、三种规则策略和 `RuleNn`。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
 
 ## 构建与验证
 
