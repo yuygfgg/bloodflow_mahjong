@@ -113,7 +113,10 @@ impl PlanningHand {
             &evaluation.used,
             required,
         );
-        debug_assert!(applied, "a planned legal win must match its physical hand");
+        debug_assert!(
+            applied.is_some(),
+            "a planned legal win must match its physical hand"
+        );
         self.holding.has_won = true;
         self.max_win_multiplier = self.max_win_multiplier.max(evaluation.shape_multiplier);
         self

@@ -27,9 +27,11 @@ pub use game::{
     EVENT_FLAG_OPENING_DISCARD, EVENT_FLAG_REPLACEMENT_DRAW, EVENT_FLAG_ROB_KONG,
     EVENT_FLAG_SELF_DRAW, EVENT_HISTORY_CAPACITY, EVENT_RECORD_WIDTH, EventKind, Game, GameError,
     LegalActions, MELD_FIELDS, MELD_OBSERVATION_WIDTH, MELD_SLOTS, META_OBSERVATION_WIDTH,
-    ORACLE_TILE_COUNT_PLANES, ORACLE_TILE_COUNT_WIDTH, Phase, PlayerStepOutcome, RIVER_FIELDS,
-    RIVER_OBSERVATION_WIDTH, RIVER_TILE_CAPACITY, STEP_RECORD_WIDTH, StepOutcome,
-    TILE_OBSERVATION_PLANES, TILE_OBSERVATION_WIDTH, TerminationReason,
+    ORACLE_TILE_COUNT_PLANES, ORACLE_TILE_COUNT_WIDTH, PLAYER_UI_STATS_FIELDS,
+    PLAYER_UI_STATS_WIDTH, Phase, PlayerStepOutcome, RIVER_FIELDS, RIVER_OBSERVATION_WIDTH,
+    RIVER_TILE_CAPACITY, STEP_RECORD_WIDTH, SettlementStage, StepOutcome, TILE_OBSERVATION_PLANES,
+    TILE_OBSERVATION_WIDTH, TerminationReason, WALL_SETTLEMENT_FIELDS, WALL_SETTLEMENT_HANDS_WIDTH,
+    WALL_SETTLEMENT_META_WIDTH, WallSettlementSummary, WinSummary,
 };
 pub use hand::{
     MaxWaitEvaluation, Pattern, PatternSet, SHANTEN_COMPLETE, SHANTEN_MAX, SHANTEN_TERMINAL,
@@ -50,4 +52,7 @@ pub use rules::planner::{
     RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
     RulePlannerSearchAnalysis, RulePlannerSearchOutcome,
 };
-pub use types::{ExchangeDirection, Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile, WALL_TILE_COUNT, WinSource};
+pub use types::{
+    ExchangeDirection, Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile,
+    WALL_TILE_COUNT, WinSource,
+};

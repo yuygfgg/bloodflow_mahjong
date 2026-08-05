@@ -56,6 +56,7 @@ export interface WasmGame {
   handAnalysis(seat: number): Int32Array;
   concealedInto(seat: number, output: Uint8Array): void;
   lockedInto(seat: number, output: Uint8Array): void;
+  winBaseInto(seat: number, output: Uint8Array): void;
   exchangeSelectionInto(seat: number, output: Uint8Array): void;
   melds(seat: number): Uint8Array;
   discards(): Uint8Array;
@@ -68,6 +69,8 @@ export interface WasmGame {
   ): void;
   eventsInto(viewer: number, output: Int32Array): number;
   stepEventsInto(viewer: number, output: Int32Array): number;
+  playerUiStatsInto(viewer: number, output: Int32Array): void;
+  wallSettlementInto(viewer: number, meta: Int32Array, hands: Uint8Array): boolean;
   oracleTileCountsInto(output: Uint8Array): void;
   resampleInformationSet(seed: bigint): WasmGame;
 }
@@ -119,6 +122,7 @@ export interface WasmModule {
 
 export interface ObservationBuffers {
   tileObs: Uint8Array;
+  winBase: Uint8Array;
   melds: Uint8Array;
   river: Uint8Array;
   meta: Int32Array;
@@ -166,6 +170,7 @@ export function wasmConst(wasm: WasmModule, name: string): number {
 export function createObservationBuffers(): ObservationBuffers {
   return {
     tileObs: new Uint8Array(TILE_OBSERVATION_WIDTH()),
+    winBase: new Uint8Array(TILE_KIND_COUNT()),
     melds: new Uint8Array(MELD_OBSERVATION_WIDTH()),
     river: new Uint8Array(RIVER_OBSERVATION_WIDTH()),
     meta: new Int32Array(META_OBSERVATION_WIDTH()),

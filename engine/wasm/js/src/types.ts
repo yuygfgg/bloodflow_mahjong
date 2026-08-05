@@ -25,6 +25,21 @@ export interface RiverEntry {
   ownerRelative: number;
 }
 
+export interface WinSummary {
+  shapeMultiplier: number;
+  multiplier: number;
+  patterns: number;
+  flags: number;
+}
+
+export interface WallSettlementSummary {
+  flowerPig: readonly [boolean, boolean, boolean, boolean];
+  ready: readonly [boolean, boolean, boolean, boolean];
+  maxShapeMultipliers: readonly [number, number, number, number];
+  /** Concealed terminal hands, public only after wall settlement. */
+  hands: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
+}
+
 /**
  * Viewer-relative UI snapshot.
  *
@@ -49,8 +64,14 @@ export interface UiSnapshot {
   ownHand: Uint8Array;
   /** Viewer playable tiles after subtracting locked counts. */
   unlockedHand: Uint8Array;
+  /** Stable winning base for the viewer; empty before the first win. */
+  winBase: Uint8Array;
   /** Viewer exchange selection histogram. */
   exchangeSelection: Uint8Array;
+  /** Tiles the viewer has staged for the exchange, 0..3. */
+  exchangeSelectedCount: number;
+  /** Suit the exchange selection is locked to once non-empty; -1 when unset. */
+  exchangeSelectionSuit: number;
   /** Locked winning-tile histograms for relative seats 0..3. */
   lockedTiles: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
   /** Per-relative-seat discard histograms. */
@@ -76,8 +97,16 @@ export interface UiSnapshot {
   replacementDraw: boolean;
   hasWon: readonly [boolean, boolean, boolean, boolean];
   maxWinMultipliers: readonly [number, number, number, number];
-  /** Little-endian legal mask words `[low, high]`. */
-  legalActionMask: readonly [bigint, bigint];
+  winCounts: readonly [number, number, number, number];
+  lastWins: readonly [
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+  ];
+  /** Viewer legal mask words, or `["0", "0"]` while another seat acts. */
+  legalActionMask: readonly [string, string];
+  /** Viewer legal action ids; empty while another seat acts. */
   legalActionIds: readonly number[];
   /** Full retained history visible to the viewer. */
   eventHistory: readonly EventRecord[];
@@ -86,15 +115,21 @@ export interface UiSnapshot {
   terminationReason: number | null;
   /** Relative rankings when finished; otherwise null. */
   rankings: readonly [number, number, number, number] | null;
+  /** Wall-exhaustion settlement, including terminal revealed hands. */
+  wallSettlement: WallSettlementSummary | null;
 }
 
 export interface ObservationBuffers {
   tileObs: Uint8Array;
+  winBase: Uint8Array;
   melds: Uint8Array;
   river: Uint8Array;
   meta: Int32Array;
   events: Int32Array;
   stepEvents: Int32Array;
+  playerUiStats: Int32Array;
+  settlementMeta: Int32Array;
+  settlementHands: Uint8Array;
 }
 
 /** Narrow structural view of the WASM Game class used by the snapshot builder. */
@@ -117,6 +152,13 @@ export interface GameLike {
     river: Uint8Array,
     meta: Int32Array,
   ): void;
+  winBaseInto(viewer: number, output: Uint8Array): void;
   eventsInto(viewer: number, output: Int32Array): number;
   stepEventsInto(viewer: number, output: Int32Array): number;
+  playerUiStatsInto(viewer: number, output: Int32Array): void;
+  wallSettlementInto(
+    viewer: number,
+    meta: Int32Array,
+    hands: Uint8Array,
+  ): boolean;
 }

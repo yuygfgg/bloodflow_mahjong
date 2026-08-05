@@ -274,10 +274,7 @@ impl JsGame {
 
     /// `rule-planner` action with an explicit borrowed config.
     #[wasm_bindgen(js_name = rulePlannerActionWithConfig)]
-    pub fn rule_planner_action_with_config(
-        &self,
-        config: &JsRulePlannerConfig,
-    ) -> Option<u8> {
+    pub fn rule_planner_action_with_config(&self, config: &JsRulePlannerConfig) -> Option<u8> {
         self.inner
             .rule_planner_action_with_config(config.inner)
             .map(|action| action.index() as u8)
@@ -320,10 +317,7 @@ impl JsGame {
     pub fn events_into(&self, viewer: u8, output: &mut [i32]) -> Result<u32, JsValue> {
         let viewer = seat_value(viewer)?;
         let capacity = validate_event_buffer(output, "output")?;
-        let written = self
-            .inner
-            .events_into(viewer, output)
-            .map_err(game_error)?;
+        let written = self.inner.events_into(viewer, output).map_err(game_error)?;
         debug_assert!(written <= capacity);
         Ok(written as u32)
     }
@@ -339,6 +333,40 @@ impl JsGame {
             .map_err(game_error)?;
         debug_assert!(written <= capacity);
         Ok(written as u32)
+    }
+
+    /// Write viewer-relative win summaries into `[4 * 5]` `i32` fields.
+    ///
+    /// Each row is `[winCount, lastShapeMultiplier, lastMultiplier,
+    /// lastPatternBits, lastEventFlags]`. Last-win fields are `-1` when the
+    /// relative player has not won.
+    #[wasm_bindgen(js_name = playerUiStatsInto)]
+    pub fn player_ui_stats_into(&self, viewer: u8, output: &mut [i32]) -> Result<(), JsValue> {
+        let viewer = seat_value(viewer)?;
+        require_len(output, core_engine::PLAYER_UI_STATS_WIDTH, "output")?;
+        self.inner
+            .player_ui_stats_into(viewer, output)
+            .map_err(game_error)
+    }
+
+    /// Write viewer-relative wall-settlement metadata and revealed hands.
+    ///
+    /// Metadata rows are `[flowerPig, ready, maxShapeMultiplier]` and hands
+    /// are four consecutive concealed 27-tile histograms. Returns `false`
+    /// before a wall-exhaustion settlement is available.
+    #[wasm_bindgen(js_name = wallSettlementInto)]
+    pub fn wall_settlement_into(
+        &self,
+        viewer: u8,
+        meta: &mut [i32],
+        hands: &mut [u8],
+    ) -> Result<bool, JsValue> {
+        let viewer = seat_value(viewer)?;
+        require_len(meta, core_engine::WALL_SETTLEMENT_META_WIDTH, "meta")?;
+        require_len(hands, core_engine::WALL_SETTLEMENT_HANDS_WIDTH, "hands")?;
+        self.inner
+            .wall_settlement_into(viewer, meta, hands)
+            .map_err(game_error)
     }
 
     /// Write the partial-information observation for one viewer.
@@ -370,11 +398,7 @@ impl JsGame {
     /// Write perfect-information tile counts. Training and diagnostics only.
     #[wasm_bindgen(js_name = oracleTileCountsInto)]
     pub fn oracle_tile_counts_into(&self, output: &mut [u8]) -> Result<(), JsValue> {
-        require_len(
-            output,
-            core_engine::ORACLE_TILE_COUNT_PLANES * 27,
-            "output",
-        )?;
+        require_len(output, core_engine::ORACLE_TILE_COUNT_PLANES * 27, "output")?;
         self.inner
             .oracle_tile_counts_into(output)
             .map_err(game_error)
@@ -422,6 +446,18 @@ impl JsGame {
         let seat = seat_value(seat)?;
         require_len(output, 27, "output")?;
         output.copy_from_slice(self.inner.locked(seat));
+        Ok(())
+    }
+
+    /// Copy one seat's stable winning base into a length-27 buffer.
+    ///
+    /// The browser requests this for the viewer seat so it can keep the base
+    /// in place while presenting only newly accumulated winning references.
+    #[wasm_bindgen(js_name = winBaseInto)]
+    pub fn win_base_into(&self, seat: u8, output: &mut [u8]) -> Result<(), JsValue> {
+        let seat = seat_value(seat)?;
+        require_len(output, 27, "output")?;
+        output.copy_from_slice(self.inner.win_base(seat));
         Ok(())
     }
 
@@ -608,11 +644,8 @@ fn encode_outcome_i32(outcome: StepOutcome) -> [i32; core_engine::STEP_RECORD_WI
         .discard
         .map_or(-1, |discard| i32::from(discard.tile.as_u8()));
     for (index, delta) in outcome.score_delta.iter().enumerate() {
-        record[5 + index] = i32::try_from(*delta).unwrap_or(if *delta < 0 {
-            i32::MIN
-        } else {
-            i32::MAX
-        });
+        record[5 + index] =
+            i32::try_from(*delta).unwrap_or(if *delta < 0 { i32::MIN } else { i32::MAX });
     }
     record[9] = outcome
         .next

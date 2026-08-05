@@ -1,6 +1,6 @@
 # 血流麻将引擎
 
-本仓库按 GNU Affero General Public License v3.0（AGPLv3）发布，完整文本见 [`LICENSE`](LICENSE)。仓库内新建代码默认继承 AGPLv3。OpenRiichi 的 GPLv3 代码和资源可以依据 GPLv3 第 13 条与 AGPLv3 组合发布；Web 客户端应保留相应许可证和版权声明。
+本仓库按 GNU Affero General Public License v3.0（AGPLv3）发布，完整文本见 [`LICENSE`](LICENSE)。
 
 四人血流麻将 Rust 引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具和 Python 绑定。
 

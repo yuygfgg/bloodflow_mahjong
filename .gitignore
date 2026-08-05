@@ -12,3 +12,7 @@ runs/
 /engine/wasm/pkg/
 /engine/wasm/js/dist/
 /engine/wasm/js/node_modules/
+
+# Browser client dependencies and generated static output
+/web/node_modules/
+/web/dist/

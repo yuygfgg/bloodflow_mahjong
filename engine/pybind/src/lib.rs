@@ -19,7 +19,6 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-
 type StepRecordTuple = (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64);
 
 #[cfg(feature = "rule-nn")]

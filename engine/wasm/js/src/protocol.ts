@@ -11,6 +11,17 @@ export type BotProfile = "rule-fast" | "rule-ev" | "rule-nn";
 
 export type HintPolicy = BotProfile;
 
+export const REPLAY_PROTOCOL_VERSION = 1;
+
+export interface ReplayRecord {
+  protocolVersion: number;
+  engineRulesVersion: number;
+  seed: string;
+  humanSeat: number;
+  botProfiles: readonly [BotProfile, BotProfile, BotProfile, BotProfile];
+  actions: readonly number[];
+}
+
 export type WorkerRequest =
   | {
       type: "new_game";
@@ -44,18 +55,22 @@ export type WorkerRequest =
   | {
       type: "load_replay";
       requestId: string;
-      engineRulesVersion: number;
-      seed: number | string;
-      actions: readonly number[];
-      humanSeat: number;
+      replay: ReplayRecord;
     };
 
 export type AnimationHint =
   | { kind: "draw"; seatRelative: number; tile: number; replacement: boolean }
   | { kind: "discard"; seatRelative: number; tile: number }
   | { kind: "meld"; seatRelative: number; tile: number; meldKind: number }
-  | { kind: "hu"; seatRelative: number; tile: number; multiplier: number }
+  | {
+      kind: "hu";
+      seatRelative: number;
+      sourceRelative: number;
+      tile: number;
+      multiplier: number;
+    }
   | { kind: "payment"; payerRelative: number; payeeRelative: number; amount: number }
+  | { kind: "settlement_stage"; stage: number }
   | { kind: "exchange_complete"; direction: number }
   | { kind: "missing_revealed" }
   | { kind: "game_end" };
@@ -80,6 +95,12 @@ export type WorkerResponse =
       animationHints: readonly AnimationHint[];
     }
   | {
+      type: "progress";
+      requestId: string;
+      snapshot: UiSnapshot;
+      animationHints: readonly AnimationHint[];
+    }
+  | {
       type: "hint";
       requestId: string;
       actionId: number | null;
@@ -88,9 +109,7 @@ export type WorkerResponse =
   | {
       type: "replay";
       requestId: string;
-      engineRulesVersion: number;
-      seed: string;
-      actions: readonly number[];
+      replay: ReplayRecord;
     }
   | {
       type: "error";

@@ -1,0 +1,649 @@
+{
+  "manifestVersion": 1,
+  "notice": "Derived from OpenRiichi (https://github.com/FluffyStuff/OpenRiichi), Copyright (C) FluffyStuff, licensed GPL-3.0-or-later. Converted for the Blood Flow Mahjong web client (AGPL-3.0-only).",
+  "models": {
+    "tile_high": {
+      "file": "models/tile_high.glb",
+      "vertices": 530,
+      "triangles": 960,
+      "obb": [
+        0.350636,
+        0.248968,
+        0.452428
+      ],
+      "front": {
+        "min": [
+          -0.175318,
+          -0.068894,
+          -0.226214
+        ],
+        "max": [
+          0.175318,
+          0.123148,
+          0.226214
+        ],
+        "size": [
+          0.350636,
+          0.192042,
+          0.452428
+        ]
+      },
+      "back": {
+        "min": [
+          -0.175318,
+          -0.125816,
+          -0.226214
+        ],
+        "max": [
+          0.175318,
+          -0.06889,
+          0.226214
+        ],
+        "size": [
+          0.350636,
+          0.056926000000000004,
+          0.452428
+        ]
+      },
+      "faceUv": {
+        "min": [
+          0.0,
+          0.0
+        ],
+        "max": [
+          0.9,
+          1.0
+        ]
+      }
+    },
+    "tile_low": {
+      "file": "models/tile_low.glb",
+      "vertices": 128,
+      "triangles": 60,
+      "obb": [
+        0.351014,
+        0.255496,
+        0.452916
+      ],
+      "front": {
+        "min": [
+          -0.175507,
+          -0.061479,
+          -0.226458
+        ],
+        "max": [
+          0.175507,
+          0.129458,
+          0.226458
+        ],
+        "size": [
+          0.351014,
+          0.190937,
+          0.452916
+        ]
+      },
+      "back": {
+        "min": [
+          -0.175507,
+          -0.126038,
+          -0.226458
+        ],
+        "max": [
+          0.175507,
+          -0.061479,
+          0.226458
+        ],
+        "size": [
+          0.351014,
+          0.064559,
+          0.452916
+        ]
+      },
+      "faceUv": {
+        "min": [
+          0.0,
+          0.0
+        ],
+        "max": [
+          0.9,
+          1.0
+        ]
+      }
+    },
+    "table_high": {
+      "file": "models/table_high.glb",
+      "objects": [
+        "Cube.001_Cube"
+      ],
+      "vertices": 148,
+      "triangles": 278,
+      "min": [
+        -1.0,
+        -0.166024,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        0.09378,
+        1.0
+      ],
+      "size": [
+        2.0,
+        0.25980400000000003,
+        2.0
+      ]
+    },
+    "table_low": {
+      "file": "models/table_low.glb",
+      "objects": [
+        "Cube.001_Cube"
+      ],
+      "vertices": 44,
+      "triangles": 26,
+      "min": [
+        -1.0,
+        -0.166024,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        0.09378,
+        1.0
+      ],
+      "size": [
+        2.0,
+        0.25980400000000003,
+        2.0
+      ]
+    },
+    "table_center": {
+      "file": "models/table_center.glb",
+      "objects": [
+        "Cube"
+      ],
+      "vertices": 209,
+      "triangles": 384,
+      "min": [
+        -0.999595,
+        0.0,
+        -0.999595
+      ],
+      "max": [
+        0.999595,
+        0.083347,
+        0.999595
+      ],
+      "size": [
+        1.99919,
+        0.083347,
+        1.99919
+      ]
+    },
+    "field": {
+      "file": "models/field.glb",
+      "objects": [
+        "Plane"
+      ],
+      "vertices": 4,
+      "triangles": 2,
+      "min": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        0.0,
+        1.0
+      ],
+      "size": [
+        2.0,
+        0.0,
+        2.0
+      ]
+    },
+    "field_tile": {
+      "file": "models/field_tile.glb",
+      "objects": [
+        "Plane"
+      ],
+      "vertices": 4,
+      "triangles": 2,
+      "min": [
+        -1.0,
+        0.0,
+        -1.0
+      ],
+      "max": [
+        1.0,
+        0.0,
+        1.0
+      ],
+      "size": [
+        2.0,
+        0.0,
+        2.0
+      ]
+    },
+    "wind_indicator": {
+      "file": "models/wind_indicator.glb",
+      "objects": [
+        "Cube.001"
+      ],
+      "vertices": 54,
+      "triangles": 28,
+      "min": [
+        -0.510475,
+        -0.013726,
+        -0.399969
+      ],
+      "max": [
+        0.510475,
+        0.013726,
+        0.399969
+      ],
+      "size": [
+        1.02095,
+        0.027452,
+        0.799938
+      ]
+    },
+    "stick": {
+      "file": "models/stick.glb",
+      "objects": [
+        "Cylinder"
+      ],
+      "vertices": 196,
+      "triangles": 252,
+      "min": [
+        -3.443488,
+        -0.037247,
+        -0.320301
+      ],
+      "max": [
+        3.44757,
+        0.108675,
+        0.254574
+      ],
+      "size": [
+        6.891057999999999,
+        0.145922,
+        0.574875
+      ]
+    }
+  },
+  "textures": {
+    "table_high": {
+      "file": "textures/table_high.webp",
+      "width": 1024,
+      "height": 1024
+    },
+    "table_low": {
+      "file": "textures/table_low.webp",
+      "width": 128,
+      "height": 128
+    },
+    "field_high": {
+      "file": "textures/field_high.webp",
+      "width": 1024,
+      "height": 1024
+    },
+    "field_low": {
+      "file": "textures/field_low.webp",
+      "width": 256,
+      "height": 256
+    },
+    "field_marble": {
+      "file": "textures/field_marble.webp",
+      "width": 750,
+      "height": 750
+    },
+    "table_center": {
+      "file": "textures/table_center.webp",
+      "width": 256,
+      "height": 256
+    },
+    "stick_100": {
+      "file": "textures/stick_100.webp",
+      "width": 1024,
+      "height": 1024
+    },
+    "stick_1000": {
+      "file": "textures/stick_1000.webp",
+      "width": 1024,
+      "height": 1024
+    },
+    "button": {
+      "file": "textures/button.webp",
+      "width": 337,
+      "height": 92
+    },
+    "button_small": {
+      "file": "textures/button_small.webp",
+      "width": 109,
+      "height": 62
+    },
+    "button_big": {
+      "file": "textures/button_big.webp",
+      "width": 462,
+      "height": 92
+    },
+    "score_background": {
+      "file": "textures/score_background.webp",
+      "width": 250,
+      "height": 100
+    },
+    "marker_man": {
+      "file": "textures/marker_man.webp",
+      "glyph": "万"
+    },
+    "marker_sou": {
+      "file": "textures/marker_sou.webp",
+      "glyph": "条"
+    },
+    "marker_pin": {
+      "file": "textures/marker_pin.webp",
+      "glyph": "筒"
+    },
+    "marker_dealer": {
+      "file": "textures/marker_dealer.webp",
+      "glyph": "庄"
+    }
+  },
+  "atlas": {
+    "image": "textures/tiles.webp",
+    "width": 1152,
+    "height": 576,
+    "cell": 128,
+    "gutter": 8,
+    "pitch": 144,
+    "columns": 8,
+    "rows": 4,
+    "uvStep": [
+      0.125,
+      0.25
+    ],
+    "blankCell": 27,
+    "backCell": 28,
+    "whiteCell": 29,
+    "backColor": [
+      0.0,
+      0.5019607843137255,
+      1.0
+    ],
+    "tiles": [
+      {
+        "tile": 0,
+        "cell": 0,
+        "suit": 0,
+        "rank": 0,
+        "label": "1万",
+        "source": "Man1"
+      },
+      {
+        "tile": 1,
+        "cell": 1,
+        "suit": 0,
+        "rank": 1,
+        "label": "2万",
+        "source": "Man2"
+      },
+      {
+        "tile": 2,
+        "cell": 2,
+        "suit": 0,
+        "rank": 2,
+        "label": "3万",
+        "source": "Man3"
+      },
+      {
+        "tile": 3,
+        "cell": 3,
+        "suit": 0,
+        "rank": 3,
+        "label": "4万",
+        "source": "Man4"
+      },
+      {
+        "tile": 4,
+        "cell": 4,
+        "suit": 0,
+        "rank": 4,
+        "label": "5万",
+        "source": "Man5"
+      },
+      {
+        "tile": 5,
+        "cell": 5,
+        "suit": 0,
+        "rank": 5,
+        "label": "6万",
+        "source": "Man6"
+      },
+      {
+        "tile": 6,
+        "cell": 6,
+        "suit": 0,
+        "rank": 6,
+        "label": "7万",
+        "source": "Man7"
+      },
+      {
+        "tile": 7,
+        "cell": 7,
+        "suit": 0,
+        "rank": 7,
+        "label": "8万",
+        "source": "Man8"
+      },
+      {
+        "tile": 8,
+        "cell": 8,
+        "suit": 0,
+        "rank": 8,
+        "label": "9万",
+        "source": "Man9"
+      },
+      {
+        "tile": 9,
+        "cell": 9,
+        "suit": 1,
+        "rank": 0,
+        "label": "1条",
+        "source": "Sou1"
+      },
+      {
+        "tile": 10,
+        "cell": 10,
+        "suit": 1,
+        "rank": 1,
+        "label": "2条",
+        "source": "Sou2"
+      },
+      {
+        "tile": 11,
+        "cell": 11,
+        "suit": 1,
+        "rank": 2,
+        "label": "3条",
+        "source": "Sou3"
+      },
+      {
+        "tile": 12,
+        "cell": 12,
+        "suit": 1,
+        "rank": 3,
+        "label": "4条",
+        "source": "Sou4"
+      },
+      {
+        "tile": 13,
+        "cell": 13,
+        "suit": 1,
+        "rank": 4,
+        "label": "5条",
+        "source": "Sou5"
+      },
+      {
+        "tile": 14,
+        "cell": 14,
+        "suit": 1,
+        "rank": 5,
+        "label": "6条",
+        "source": "Sou6"
+      },
+      {
+        "tile": 15,
+        "cell": 15,
+        "suit": 1,
+        "rank": 6,
+        "label": "7条",
+        "source": "Sou7"
+      },
+      {
+        "tile": 16,
+        "cell": 16,
+        "suit": 1,
+        "rank": 7,
+        "label": "8条",
+        "source": "Sou8"
+      },
+      {
+        "tile": 17,
+        "cell": 17,
+        "suit": 1,
+        "rank": 8,
+        "label": "9条",
+        "source": "Sou9"
+      },
+      {
+        "tile": 18,
+        "cell": 18,
+        "suit": 2,
+        "rank": 0,
+        "label": "1筒",
+        "source": "Pin1"
+      },
+      {
+        "tile": 19,
+        "cell": 19,
+        "suit": 2,
+        "rank": 1,
+        "label": "2筒",
+        "source": "Pin2"
+      },
+      {
+        "tile": 20,
+        "cell": 20,
+        "suit": 2,
+        "rank": 2,
+        "label": "3筒",
+        "source": "Pin3"
+      },
+      {
+        "tile": 21,
+        "cell": 21,
+        "suit": 2,
+        "rank": 3,
+        "label": "4筒",
+        "source": "Pin4"
+      },
+      {
+        "tile": 22,
+        "cell": 22,
+        "suit": 2,
+        "rank": 4,
+        "label": "5筒",
+        "source": "Pin5"
+      },
+      {
+        "tile": 23,
+        "cell": 23,
+        "suit": 2,
+        "rank": 5,
+        "label": "6筒",
+        "source": "Pin6"
+      },
+      {
+        "tile": 24,
+        "cell": 24,
+        "suit": 2,
+        "rank": 6,
+        "label": "7筒",
+        "source": "Pin7"
+      },
+      {
+        "tile": 25,
+        "cell": 25,
+        "suit": 2,
+        "rank": 7,
+        "label": "8筒",
+        "source": "Pin8"
+      },
+      {
+        "tile": 26,
+        "cell": 26,
+        "suit": 2,
+        "rank": 8,
+        "label": "9筒",
+        "source": "Pin9"
+      }
+    ]
+  },
+  "audio": {
+    "sounds": {
+      "tile": {
+        "file": "audio/tile.opus",
+        "bytes": 2975
+      },
+      "draw": {
+        "file": "audio/draw.opus",
+        "bytes": 1988
+      },
+      "discard": {
+        "file": "audio/discard.opus",
+        "bytes": 3241
+      },
+      "slide": {
+        "file": "audio/slide.opus",
+        "bytes": 2230
+      },
+      "flip": {
+        "file": "audio/flip.opus",
+        "bytes": 2742
+      },
+      "reveal": {
+        "file": "audio/reveal.opus",
+        "bytes": 5243
+      },
+      "click": {
+        "file": "audio/click.opus",
+        "bytes": 2863
+      },
+      "mouse_over": {
+        "file": "audio/mouse_over.opus",
+        "bytes": 1361
+      },
+      "score_count": {
+        "file": "audio/score_count.opus",
+        "bytes": 2106
+      },
+      "hint": {
+        "file": "audio/hint.opus",
+        "bytes": 3011
+      },
+      "fade_in": {
+        "file": "audio/fade_in.opus",
+        "bytes": 2226
+      }
+    },
+    "music": {}
+  },
+  "font": {
+    "file": "fonts/ui.woff2",
+    "family": "BloodflowUI",
+    "glyphs": 502,
+    "bytes": 105492,
+    "source": "NotoSansCJK-VF.ttc"
+  }
+}

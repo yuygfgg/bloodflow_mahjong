@@ -727,8 +727,8 @@ pub(crate) fn bloodflow_evaluation_counts(
 }
 
 /// Locks the tiles selected by a win and establishes its stable continuation
-/// base. Returns false if the selected structure is inconsistent with the
-/// physical hand state.
+/// base. Returns the tile reference separated from the stable base, or `None`
+/// if the selected structure is inconsistent with the physical hand state.
 pub(crate) fn apply_bloodflow_win(
     concealed: &[u8; TILE_KIND_COUNT],
     locked: &mut [u8; TILE_KIND_COUNT],
@@ -736,27 +736,27 @@ pub(crate) fn apply_bloodflow_win(
     has_won: bool,
     used: &[u8; TILE_KIND_COUNT],
     required: Option<Tile>,
-) -> bool {
+) -> Option<Tile> {
     let mut next_locked = *locked;
     let mut next_base = *used;
 
     for index in 0..TILE_KIND_COUNT {
         let contribution = if has_won {
             let Some(contribution) = used[index].checked_sub(win_base[index]) else {
-                return false;
+                return None;
             };
             contribution
         } else {
             used[index]
         };
         if contribution > concealed[index].saturating_sub(locked[index]) {
-            return false;
+            return None;
         }
         let Some(updated) = next_locked[index].checked_add(contribution) else {
-            return false;
+            return None;
         };
         if updated > concealed[index] {
-            return false;
+            return None;
         }
         next_locked[index] = updated;
     }
@@ -765,16 +765,16 @@ pub(crate) fn apply_bloodflow_win(
         .map(Tile::index)
         .or_else(|| next_base.iter().position(|&count| count != 0));
     let Some(continuation_tile) = continuation_tile else {
-        return false;
+        return None;
     };
     let Some(remaining) = next_base[continuation_tile].checked_sub(1) else {
-        return false;
+        return None;
     };
     next_base[continuation_tile] = remaining;
 
     *locked = next_locked;
     *win_base = next_base;
-    true
+    Some(Tile::from_index_unchecked(continuation_tile as u8))
 }
 
 /// Removes hand tiles for a meld. Active tiles are consumed first, followed by

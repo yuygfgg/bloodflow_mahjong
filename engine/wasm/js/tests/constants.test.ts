@@ -39,6 +39,7 @@ test("WASM module exports a full engine constant table", () => {
   const constants = exportedConstants(wasm);
   const names = Object.keys(constants);
   assert.ok(names.length > 40, `expected a full constant table, got ${names.length}`);
+  assert.equal(constants.ENGINE_RULES_VERSION, 7);
   for (const name of names) {
     assert.equal(wasmConst(wasm, name), constants[name], name);
   }
@@ -58,5 +59,19 @@ test("action layout matches the fixed policy contract", () => {
       wasmConst(wasm, "ACTION_PASS"),
     ],
     [0, 27, 30, 57, 58, 59, 60, 87, 114],
+  );
+});
+
+test("UI summary buffers do not change the fixed event record", () => {
+  assert.equal(wasmConst(wasm, "EVENT_RECORD_WIDTH"), 8);
+  assert.equal(wasmConst(wasm, "PLAYER_UI_STATS_FIELDS"), 5);
+  assert.equal(wasmConst(wasm, "PLAYER_UI_STATS_WIDTH"), 20);
+  assert.equal(wasmConst(wasm, "WALL_SETTLEMENT_FIELDS"), 3);
+  assert.equal(wasmConst(wasm, "WALL_SETTLEMENT_META_WIDTH"), 12);
+  assert.equal(wasmConst(wasm, "WALL_SETTLEMENT_HANDS_WIDTH"), 108);
+  assert.equal(wasmConst(wasm, "EVENT_KIND_SETTLEMENT_STAGE"), 11);
+  assert.notEqual(
+    wasmConst(wasm, "SETTLEMENT_STAGE_FLOWER_PIG"),
+    wasmConst(wasm, "SETTLEMENT_STAGE_DAJIAO"),
   );
 });

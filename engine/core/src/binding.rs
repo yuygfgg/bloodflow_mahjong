@@ -32,6 +32,11 @@ macro_rules! with_engine_constants {
             STEP_RECORD_WIDTH = { $crate::STEP_RECORD_WIDTH as i64 };
             EVENT_RECORD_WIDTH = { $crate::EVENT_RECORD_WIDTH as i64 };
             EVENT_HISTORY_CAPACITY = { $crate::EVENT_HISTORY_CAPACITY as i64 };
+            PLAYER_UI_STATS_FIELDS = { $crate::PLAYER_UI_STATS_FIELDS as i64 };
+            PLAYER_UI_STATS_WIDTH = { $crate::PLAYER_UI_STATS_WIDTH as i64 };
+            WALL_SETTLEMENT_FIELDS = { $crate::WALL_SETTLEMENT_FIELDS as i64 };
+            WALL_SETTLEMENT_META_WIDTH = { $crate::WALL_SETTLEMENT_META_WIDTH as i64 };
+            WALL_SETTLEMENT_HANDS_WIDTH = { $crate::WALL_SETTLEMENT_HANDS_WIDTH as i64 };
             ENGINE_RULES_VERSION = { $crate::ENGINE_RULES_VERSION as i64 };
             SHANTEN_COMPLETE = { $crate::SHANTEN_COMPLETE as i64 };
             SHANTEN_MAX = { $crate::SHANTEN_MAX as i64 };
@@ -72,6 +77,9 @@ macro_rules! with_engine_constants {
             EVENT_KIND_HU = { $crate::EventKind::Hu.code() as i64 };
             EVENT_KIND_PAYMENT = { $crate::EventKind::Payment.code() as i64 };
             EVENT_KIND_GAME_END = { $crate::EventKind::GameEnd.code() as i64 };
+            EVENT_KIND_SETTLEMENT_STAGE = { $crate::EventKind::SettlementStage.code() as i64 };
+            SETTLEMENT_STAGE_FLOWER_PIG = { $crate::SettlementStage::FlowerPig.code() as i64 };
+            SETTLEMENT_STAGE_DAJIAO = { $crate::SettlementStage::Dajiao.code() as i64 };
             EVENT_FLAG_REPLACEMENT_DRAW = { $crate::EVENT_FLAG_REPLACEMENT_DRAW as i64 };
             EVENT_FLAG_LAST_WALL_TILE = { $crate::EVENT_FLAG_LAST_WALL_TILE as i64 };
             EVENT_FLAG_AFTER_KONG = { $crate::EVENT_FLAG_AFTER_KONG as i64 };
@@ -113,7 +121,10 @@ mod tests {
             .collect();
         assert_eq!(by_name["ACTION_SPACE_SIZE"], ACTION_SPACE_SIZE as i64);
         assert_eq!(by_name["ACTION_PASS"], ACTION_PASS as i64);
-        assert_eq!(by_name["ENGINE_RULES_VERSION"], i64::from(ENGINE_RULES_VERSION));
+        assert_eq!(
+            by_name["ENGINE_RULES_VERSION"],
+            i64::from(ENGINE_RULES_VERSION)
+        );
         assert_eq!(ENGINE_CONSTANTS.len(), by_name.len());
     }
 }

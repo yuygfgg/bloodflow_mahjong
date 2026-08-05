@@ -20,13 +20,23 @@ const STARTING_SCORE: i64 = 10_000;
 pub(crate) const SCORE_UNIT: i64 = 100;
 /// Increment whenever engine rule semantics or deterministic initialization
 /// change in a way that can invalidate a stored action-sequence replay.
-pub const ENGINE_RULES_VERSION: u32 = 6;
+pub const ENGINE_RULES_VERSION: u32 = 7;
 pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
 pub const EVENT_RECORD_WIDTH: usize = 8;
 /// Retained event history per environment. Older events are overwritten.
 pub const EVENT_HISTORY_CAPACITY: usize = 512;
+/// Fields stored per relative player in the UI-only win summary buffer.
+pub const PLAYER_UI_STATS_FIELDS: usize = 5;
+/// Four relative players and five fields per player.
+pub const PLAYER_UI_STATS_WIDTH: usize = PLAYER_COUNT * PLAYER_UI_STATS_FIELDS;
+/// Fields stored per relative player in the wall-settlement metadata buffer.
+pub const WALL_SETTLEMENT_FIELDS: usize = 3;
+/// Four relative players and three wall-settlement fields per player.
+pub const WALL_SETTLEMENT_META_WIDTH: usize = PLAYER_COUNT * WALL_SETTLEMENT_FIELDS;
+/// Four revealed terminal concealed hands of 27 tile kinds each.
+pub const WALL_SETTLEMENT_HANDS_WIDTH: usize = PLAYER_COUNT * TILE_KIND_COUNT;
 /// Viewer-scoped tile-count planes in the ordinary observation tensor.
 pub const TILE_OBSERVATION_PLANES: usize = 10;
 /// Ten viewer-scoped tile-count channels of 27 tile kinds each.
@@ -69,6 +79,7 @@ pub enum EventKind {
     Hu = 8,
     Payment = 9,
     GameEnd = 10,
+    SettlementStage = 11,
 }
 
 impl EventKind {
@@ -76,6 +87,24 @@ impl EventKind {
         self as u8
     }
 }
+
+/// Public stages of end-of-wall settlement.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum SettlementStage {
+    FlowerPig = 0,
+    Dajiao = 1,
+}
+
+impl SettlementStage {
+    pub const fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// For [`EventKind::SettlementStage`] records, the `flags` field contains one
+/// of the [`SettlementStage`] codes. Other event kinds keep their existing
+/// flag meanings.
 
 /// Event flags shared by the fixed-width stream schema.
 pub const EVENT_FLAG_REPLACEMENT_DRAW: u8 = 1 << 0;
@@ -167,6 +196,42 @@ pub struct DrawEvent {
 pub struct DiscardEvent {
     pub player: Seat,
     pub tile: Tile,
+}
+
+/// Public scoring details from one player's most recent completed win.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WinSummary {
+    pub shape_multiplier: u32,
+    pub multiplier: u32,
+    pub patterns: u32,
+    pub flags: u8,
+}
+
+/// Public facts calculated once when the live wall is exhausted.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct WallSettlementSummary {
+    flower_pig: [bool; PLAYER_COUNT],
+    ready: [bool; PLAYER_COUNT],
+    max_shape_multipliers: [u32; PLAYER_COUNT],
+    revealed_hands: [[u8; TILE_KIND_COUNT]; PLAYER_COUNT],
+}
+
+impl WallSettlementSummary {
+    pub const fn is_flower_pig(&self, seat: Seat) -> bool {
+        self.flower_pig[seat.index()]
+    }
+
+    pub const fn is_ready(&self, seat: Seat) -> bool {
+        self.ready[seat.index()]
+    }
+
+    pub const fn max_shape_multiplier(&self, seat: Seat) -> u32 {
+        self.max_shape_multipliers[seat.index()]
+    }
+
+    pub const fn revealed_hand(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
+        &self.revealed_hands[seat.index()]
+    }
 }
 
 /// Public information retained for one chronological river entry.
@@ -332,6 +397,8 @@ struct Player {
     score: i64,
     has_drawn: bool,
     has_won: bool,
+    win_count: u32,
+    last_win: Option<WinSummary>,
     max_win_multiplier: u32,
 }
 
@@ -347,6 +414,8 @@ impl Player {
             score: STARTING_SCORE,
             has_drawn: false,
             has_won: false,
+            win_count: 0,
+            last_win: None,
             max_win_multiplier: 0,
         }
     }
@@ -504,6 +573,7 @@ pub struct Game {
     // recorded hand also contains that same physical tile. One entry is kept
     // for every such hand reference so public tile counts can remove it.
     duplicate_win_references: [u8; TILE_KIND_COUNT],
+    wall_settlement: Option<WallSettlementSummary>,
     transition_draw: Option<DrawEvent>,
     transition_discard: Option<DiscardEvent>,
     events: [StoredEvent; EVENT_HISTORY_CAPACITY],
@@ -559,6 +629,7 @@ impl Game {
             discard_len: 0,
             hand_revisions: [0; PLAYER_COUNT],
             duplicate_win_references: [0; TILE_KIND_COUNT],
+            wall_settlement: None,
             transition_draw: None,
             transition_discard: None,
             events: [StoredEvent::EMPTY; EVENT_HISTORY_CAPACITY],
@@ -1387,7 +1458,12 @@ impl Game {
         })
     }
 
-    pub(crate) fn win_base(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
+    /// Returns the stable winning base for a seat.
+    ///
+    /// The browser uses this only for the viewer's own seat. Opponent bases
+    /// remain hidden; their public winning references are exposed through
+    /// `public_win_tiles` and the ordinary observation.
+    pub fn win_base(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
         &self.players[seat.index()].win_base
     }
 
@@ -1415,9 +1491,82 @@ impl Game {
         self.players[seat.index()].has_won
     }
 
+    /// Number of completed wins for one player in this game.
+    pub fn win_count(&self, seat: Seat) -> u32 {
+        self.players[seat.index()].win_count
+    }
+
+    /// Most recent completed win for one player, if any.
+    pub fn last_win(&self, seat: Seat) -> Option<WinSummary> {
+        self.players[seat.index()].last_win
+    }
+
     /// Highest shape multiplier from this player's completed wins.
     pub fn max_win_multiplier(&self, seat: Seat) -> u32 {
         self.players[seat.index()].max_win_multiplier
+    }
+
+    /// Viewer-relative win summaries for UI presentation.
+    ///
+    /// Each player record is `[win_count, last_shape_multiplier,
+    /// last_multiplier, last_pattern_bits, last_event_flags]`. A player with
+    /// no completed win has `-1` in the four last-win fields.
+    pub fn player_ui_stats_into(&self, viewer: Seat, output: &mut [i32]) -> Result<(), GameError> {
+        if output.len() != PLAYER_UI_STATS_WIDTH {
+            return Err(GameError::BatchLength);
+        }
+        output.fill(-1);
+        for relative in 0..PLAYER_COUNT {
+            let player = &self.players[viewer.offset(relative as u8).index()];
+            let base = relative * PLAYER_UI_STATS_FIELDS;
+            output[base] = player.win_count.min(i32::MAX as u32) as i32;
+            if let Some(last_win) = player.last_win {
+                output[base + 1] = last_win.shape_multiplier.min(i32::MAX as u32) as i32;
+                output[base + 2] = last_win.multiplier.min(i32::MAX as u32) as i32;
+                output[base + 3] = last_win.patterns as i32;
+                output[base + 4] = i32::from(last_win.flags);
+            }
+        }
+        Ok(())
+    }
+
+    /// End-of-wall settlement facts, available only after wall settlement.
+    pub fn wall_settlement(&self) -> Option<&WallSettlementSummary> {
+        self.wall_settlement.as_ref()
+    }
+
+    /// Writes viewer-relative end-of-wall settlement metadata and hands.
+    ///
+    /// Each metadata record is `[flower_pig, ready, max_shape_multiplier]`.
+    /// Revealed concealed hands are four consecutive 27-tile histograms. If
+    /// no wall settlement is public, this method clears both buffers and
+    /// returns `false`.
+    pub fn wall_settlement_into(
+        &self,
+        viewer: Seat,
+        meta: &mut [i32],
+        hands: &mut [u8],
+    ) -> Result<bool, GameError> {
+        if meta.len() != WALL_SETTLEMENT_META_WIDTH || hands.len() != WALL_SETTLEMENT_HANDS_WIDTH {
+            return Err(GameError::BatchLength);
+        }
+        meta.fill(-1);
+        hands.fill(0);
+        let Some(summary) = self.wall_settlement() else {
+            return Ok(false);
+        };
+        debug_assert_eq!(self.phase(), Phase::Finished);
+        for relative in 0..PLAYER_COUNT {
+            let seat = viewer.offset(relative as u8);
+            let meta_base = relative * WALL_SETTLEMENT_FIELDS;
+            meta[meta_base] = i32::from(u8::from(summary.is_flower_pig(seat)));
+            meta[meta_base + 1] = i32::from(u8::from(summary.is_ready(seat)));
+            meta[meta_base + 2] = summary.max_shape_multiplier(seat).min(i32::MAX as u32) as i32;
+            let hand_base = relative * TILE_KIND_COUNT;
+            hands[hand_base..hand_base + TILE_KIND_COUNT]
+                .copy_from_slice(summary.revealed_hand(seat));
+        }
+        Ok(true)
     }
 
     /// Returns conventional structural shanten and improving tiles for a seat.
@@ -1946,12 +2095,10 @@ impl Game {
                 unlocked |= 1 << index;
             }
         }
-        if player.missing_count() == 0 {
-            return unlocked;
-        }
-        let missing_mask = player.missing.map_or(0, Suit::mask);
-        let forced = unlocked & missing_mask;
-        if forced == 0 { unlocked } else { forced }
+        // The missing suit is a public marker, not a discard lock. Players
+        // may discard any unlocked tile; the engine still uses the marker
+        // for win and meld legality and for settlement checks.
+        unlocked
     }
 
     fn discard(&mut self, actor: Seat, tile: Tile, origin: TurnOrigin) -> Result<(), GameError> {
@@ -2215,13 +2362,14 @@ impl Game {
         let evaluation = self
             .evaluate_player(actor, required, flags)
             .ok_or(GameError::InvalidAction)?;
-        self.apply_win(actor, required, evaluation);
+        let event_flags = win_event_flags(flags, true);
+        let winning_tile = self.apply_win(actor, required, evaluation, event_flags);
         self.push_event(
             EventKind::Hu,
             Some(actor),
             None,
-            required,
-            win_event_flags(flags, true),
+            Some(winning_tile),
+            event_flags,
             evaluation.multiplier as i32,
             evaluation.patterns.bits() as i32,
             ALL_PLAYER_MASK,
@@ -2272,13 +2420,14 @@ impl Game {
             let evaluation = self
                 .evaluate_player(winner, Some(tile), flags)
                 .expect("response legality was checked");
-            self.apply_win(winner, Some(tile), evaluation);
+            let event_flags = win_event_flags(flags, false);
+            let winning_tile = self.apply_win(winner, Some(tile), evaluation, event_flags);
             self.push_event(
                 EventKind::Hu,
                 Some(winner),
                 Some(source),
-                Some(tile),
-                win_event_flags(flags, false),
+                Some(winning_tile),
+                event_flags,
                 evaluation.multiplier as i32,
                 evaluation.patterns.bits() as i32,
                 ALL_PLAYER_MASK,
@@ -2296,20 +2445,34 @@ impl Game {
         }
     }
 
-    fn apply_win(&mut self, actor: Seat, required: Option<Tile>, evaluation: WinEvaluation) {
+    fn apply_win(
+        &mut self,
+        actor: Seat,
+        required: Option<Tile>,
+        evaluation: WinEvaluation,
+        event_flags: u8,
+    ) -> Tile {
         let player = &mut self.players[actor.index()];
-        let applied = apply_bloodflow_win(
+        let winning_tile = apply_bloodflow_win(
             &player.concealed,
             &mut player.locked,
             &mut player.win_base,
             player.has_won,
             &evaluation.used,
             required,
-        );
-        debug_assert!(applied, "a legal win must match the player's physical hand");
+        )
+        .expect("a legal win must match the player's physical hand");
         player.has_won = true;
+        player.win_count = player.win_count.saturating_add(1);
+        player.last_win = Some(WinSummary {
+            shape_multiplier: evaluation.shape_multiplier,
+            multiplier: evaluation.multiplier,
+            patterns: evaluation.patterns.bits(),
+            flags: event_flags,
+        });
         player.max_win_multiplier = player.max_win_multiplier.max(evaluation.shape_multiplier);
         self.mark_public_hand_change(actor);
+        winning_tile
     }
 
     fn mark_public_hand_change(&mut self, actor: Seat) {
@@ -2531,15 +2694,35 @@ impl Game {
     fn finish_wall_game(&mut self) {
         let mut flower_pig = [false; PLAYER_COUNT];
         let mut ready = [false; PLAYER_COUNT];
-        let mut max_multiplier = [0_u32; PLAYER_COUNT];
+        let mut max_shape_multipliers = [0_u32; PLAYER_COUNT];
 
         for seat in Seat::ALL {
             flower_pig[seat.index()] = self.suit_count(seat) == 3;
             if !flower_pig[seat.index()] {
-                max_multiplier[seat.index()] = self.max_wait_multiplier(seat);
-                ready[seat.index()] = max_multiplier[seat.index()] > 0;
+                let wait_multiplier = self.max_wait_multiplier(seat);
+                ready[seat.index()] = wait_multiplier > 0;
+                max_shape_multipliers[seat.index()] =
+                    wait_multiplier.max(self.players[seat.index()].max_win_multiplier);
             }
         }
+
+        self.wall_settlement = Some(WallSettlementSummary {
+            flower_pig,
+            ready,
+            max_shape_multipliers,
+            revealed_hands: self.players.map(|player| player.concealed),
+        });
+        self.push_event(
+            EventKind::SettlementStage,
+            None,
+            None,
+            None,
+            SettlementStage::FlowerPig.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            0,
+        );
 
         for payer in Seat::ALL {
             if !flower_pig[payer.index()] {
@@ -2557,6 +2740,18 @@ impl Game {
             }
         }
 
+        self.push_event(
+            EventKind::SettlementStage,
+            None,
+            None,
+            None,
+            SettlementStage::Dajiao.code(),
+            0,
+            0,
+            ALL_PLAYER_MASK,
+            0,
+        );
+
         for payer in Seat::ALL {
             if flower_pig[payer.index()] || ready[payer.index()] {
                 continue;
@@ -2565,9 +2760,7 @@ impl Game {
                 if !flower_pig[payee.index()]
                     && (ready[payee.index()] || self.players[payee.index()].has_won)
                 {
-                    let multiplier = max_multiplier[payee.index()]
-                        .max(self.players[payee.index()].max_win_multiplier)
-                        .max(1);
+                    let multiplier = max_shape_multipliers[payee.index()].max(1);
                     self.transfer(payer, payee, SCORE_UNIT * i64::from(multiplier));
                 }
             }
@@ -4160,6 +4353,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_suit_does_not_restrict_discard_choices() {
+        let mut game = constructed_game();
+        let actor = Seat::EAST;
+        let missing_tile = tile(Suit::Characters, 1);
+        let other_tile = tile(Suit::Bamboo, 1);
+        add_tile(&mut game.players[actor.index()], missing_tile, 1);
+        add_tile(&mut game.players[actor.index()], other_tile, 1);
+        game.players[actor.index()].missing = Some(Suit::Characters);
+        set_wall(&mut game, &[tile(Suit::Dots, 9)]);
+        game.stage = Stage::Turn {
+            actor,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        let legal = game.legal_actions().expect("turn has legal actions");
+        assert_ne!(legal.discard_mask & (1 << missing_tile.index()), 0);
+        assert_ne!(legal.discard_mask & (1 << other_tile.index()), 0);
+        assert!(game.is_legal_action(Action::Discard(other_tile)));
+
+        game.step(Action::Discard(other_tile))
+            .expect("a non-missing tile remains a legal discard");
+        assert_eq!(game.concealed(actor)[other_tile.index()], 0);
+        assert_eq!(game.concealed(actor)[missing_tile.index()], 1);
+    }
+
+    #[test]
     fn pass_is_never_legal_on_a_normal_turn() {
         let mut game = Game::new(12);
         complete_setup(&mut game);
@@ -4360,6 +4580,16 @@ mod tests {
         assert_eq!(game.locked(Seat::EAST), game.concealed(Seat::EAST));
         assert!(game.has_won(Seat::EAST));
         assert_eq!(game.win_base(Seat::EAST).iter().sum::<u8>(), 13);
+        let mut events = [0_i32; EVENT_HISTORY_CAPACITY * EVENT_RECORD_WIDTH];
+        let event_count = game
+            .step_events_into(Seat::EAST, &mut events)
+            .expect("event buffer is valid");
+        let hu = events[..event_count * EVENT_RECORD_WIDTH]
+            .chunks_exact(EVENT_RECORD_WIDTH)
+            .find(|event| event[0] == i32::from(EventKind::Hu.code()))
+            .expect("the step includes the heavenly win");
+        let reference_tile = usize::try_from(hu[3]).expect("the win exposes a tile reference");
+        assert_eq!(game.public_win_tiles(Seat::EAST)[reference_tile], 1);
         assert_eq!(
             outcome.draw,
             Some(DrawEvent {
@@ -4770,8 +5000,61 @@ mod tests {
         }
         assert_eq!(game.locked(actor)[second_winning_tile.index()], 3);
         assert_eq!(game.locked(actor), game.concealed(actor));
+        assert_eq!(game.win_count(actor), 2);
+        let last_win = game.last_win(actor).expect("repeat win has a summary");
+        assert!(last_win.shape_multiplier > 0);
+        assert!(last_win.multiplier >= last_win.shape_multiplier);
+        assert_ne!(last_win.flags & EVENT_FLAG_SELF_DRAW, 0);
         assert_eq!(second_hu.draw.unwrap().tile, following_draw);
         assert_eq!(second_hu.next.unwrap().actor, actor.next());
+    }
+
+    #[test]
+    fn repeated_self_draw_hu_keeps_the_active_hand_empty() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let winning_tile = make_plain_wait(&mut game.players[actor.index()]);
+        add_tile(&mut game.players[actor.index()], winning_tile, 1);
+        game.stage = Stage::Turn {
+            actor,
+            origin: TurnOrigin::Draw {
+                tile: winning_tile,
+                after_kong: false,
+                last_wall_tile: false,
+            },
+            can_hu: true,
+        };
+
+        game.step(Action::Hu).unwrap();
+        assert_eq!(game.players[actor.index()].unlocked_len(), 0);
+        assert_eq!(
+            game.locked(actor)
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
+            14
+        );
+
+        set_wall(&mut game, &[winning_tile, tile(Suit::Characters, 9)]);
+        game.begin_normal_turn(actor);
+        assert!(game.legal_actions().unwrap().can_hu);
+        game.step(Action::Hu).unwrap();
+
+        assert_eq!(game.players[actor.index()].unlocked_len(), 0);
+        assert_eq!(
+            game.locked(actor)
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
+            15
+        );
+        assert_eq!(
+            game.concealed(actor)
+                .iter()
+                .map(|&count| count as usize)
+                .sum::<usize>(),
+            15
+        );
     }
 
     #[test]
@@ -4806,7 +5089,7 @@ mod tests {
                 .evaluate_player(winner, Some(winning_tile), WinFlags::NONE)
                 .expect("the stable base keeps the same repeat wait");
             shape_multipliers.push(evaluation.shape_multiplier);
-            game.apply_win(winner, Some(winning_tile), evaluation);
+            game.apply_win(winner, Some(winning_tile), evaluation, 0);
             assert_eq!(game.players[winner.index()].win_base, stable_base);
 
             game.players[winner.index()].concealed[historical_tile.index()] += 1;
@@ -4854,6 +5137,33 @@ mod tests {
 
         game.finish_wall_game();
 
+        let settlement = game.wall_settlement().expect("wall settlement is public");
+        assert!(settlement.is_flower_pig(Seat::EAST));
+        assert!(!settlement.is_ready(Seat::EAST));
+        assert!(!settlement.is_ready(Seat::ALL[1]));
+        assert_eq!(settlement.max_shape_multiplier(Seat::ALL[1]), 4);
+        assert_eq!(
+            settlement.revealed_hand(Seat::EAST),
+            game.concealed(Seat::EAST)
+        );
+
+        let mut settlement_events = [0_i32; EVENT_HISTORY_CAPACITY * EVENT_RECORD_WIDTH];
+        let event_count = game
+            .events_into(Seat::EAST, &mut settlement_events)
+            .expect("event buffer is valid");
+        let stages: Vec<_> = settlement_events[..event_count * EVENT_RECORD_WIDTH]
+            .chunks_exact(EVENT_RECORD_WIDTH)
+            .filter(|record| record[0] == i32::from(EventKind::SettlementStage.code()))
+            .map(|record| record[4])
+            .collect();
+        assert_eq!(
+            stages,
+            vec![
+                i32::from(SettlementStage::FlowerPig.code()),
+                i32::from(SettlementStage::Dajiao.code()),
+            ]
+        );
+
         // East first pays its only 1,000 points to the first eligible seat.
         // South then uses 200 of that receipt for its two dajiao payments.
         assert_eq!(
@@ -4865,6 +5175,48 @@ mod tests {
             Seat::ALL.iter().map(|&seat| game.score(seat)).sum::<i64>(),
             40_000
         );
+    }
+
+    #[test]
+    fn ui_buffers_filter_win_and_terminal_settlement_information() {
+        let mut game = Game::new(9);
+        let mut stats = [99_i32; PLAYER_UI_STATS_WIDTH];
+        game.player_ui_stats_into(Seat::ALL[2], &mut stats)
+            .expect("stats buffer is valid");
+        assert!(
+            stats
+                .chunks_exact(PLAYER_UI_STATS_FIELDS)
+                .all(|row| { row[0] == 0 && row[1..].iter().all(|&value| value == -1) })
+        );
+
+        let mut meta = [99_i32; WALL_SETTLEMENT_META_WIDTH];
+        let mut hands = [99_u8; WALL_SETTLEMENT_HANDS_WIDTH];
+        assert!(
+            !game
+                .wall_settlement_into(Seat::EAST, &mut meta, &mut hands)
+                .expect("settlement buffers are valid")
+        );
+        assert!(meta.iter().all(|&value| value == -1));
+        assert!(hands.iter().all(|&value| value == 0));
+
+        game.wall_head = game.wall_tail;
+        game.finish_wall_game();
+        assert!(
+            game.wall_settlement_into(Seat::ALL[2], &mut meta, &mut hands)
+                .expect("settlement buffers are valid")
+        );
+        for relative in 0..PLAYER_COUNT {
+            let seat = Seat::ALL[2].offset(relative as u8);
+            let base = relative * WALL_SETTLEMENT_FIELDS;
+            let summary = game.wall_settlement().expect("summary exists");
+            assert_eq!(meta[base], i32::from(u8::from(summary.is_flower_pig(seat))));
+            assert_eq!(meta[base + 1], i32::from(u8::from(summary.is_ready(seat))));
+            let hand_base = relative * TILE_KIND_COUNT;
+            assert_eq!(
+                &hands[hand_base..hand_base + TILE_KIND_COUNT],
+                summary.revealed_hand(seat),
+            );
+        }
     }
 
     #[test]

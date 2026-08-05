@@ -6,12 +6,17 @@ import {
   MELD_OBSERVATION_WIDTH,
   MELD_SLOTS,
   PHASE_FINISHED,
+  PLAYER_UI_STATS_FIELDS,
+  PLAYER_UI_STATS_WIDTH,
   PLAYER_COUNT,
   RIVER_FIELDS,
   RIVER_OBSERVATION_WIDTH,
   RIVER_TILE_CAPACITY,
   TILE_KIND_COUNT,
   TILE_OBSERVATION_WIDTH,
+  WALL_SETTLEMENT_FIELDS,
+  WALL_SETTLEMENT_HANDS_WIDTH,
+  WALL_SETTLEMENT_META_WIDTH,
 } from "../../pkg/bloodflow_mahjong_wasm.js";
 import { legalActionIdsFromMask, readMaskWords } from "./legal.ts";
 import type {
@@ -21,20 +26,26 @@ import type {
   ObservationBuffers,
   RiverEntry,
   UiSnapshot,
+  WallSettlementSummary,
+  WinSummary,
 } from "./types.ts";
 
 /** Client snapshot schema version. Engine rules version is separate. */
-export const UI_SNAPSHOT_SCHEMA_VERSION = 1;
+export const UI_SNAPSHOT_SCHEMA_VERSION = 6;
 
 /** Allocate reusable observation and event buffers for one viewer. */
 export function createObservationBuffers(): ObservationBuffers {
   return {
     tileObs: new Uint8Array(TILE_OBSERVATION_WIDTH()),
+    winBase: new Uint8Array(TILE_KIND_COUNT()),
     melds: new Uint8Array(MELD_OBSERVATION_WIDTH()),
     river: new Uint8Array(RIVER_OBSERVATION_WIDTH()),
     meta: new Int32Array(META_OBSERVATION_WIDTH()),
     events: new Int32Array(EVENT_HISTORY_CAPACITY() * EVENT_RECORD_WIDTH()),
     stepEvents: new Int32Array(EVENT_HISTORY_CAPACITY() * EVENT_RECORD_WIDTH()),
+    playerUiStats: new Int32Array(PLAYER_UI_STATS_WIDTH()),
+    settlementMeta: new Int32Array(WALL_SETTLEMENT_META_WIDTH()),
+    settlementHands: new Uint8Array(WALL_SETTLEMENT_HANDS_WIDTH()),
   };
 }
 
@@ -56,13 +67,15 @@ function copyPlane(tileObs: Uint8Array, plane: number): Uint8Array {
   return tileObs.slice(start, start + TILE_KIND_COUNT());
 }
 
-function parseMelds(melds: Uint8Array): [
-  MeldView[],
-  MeldView[],
-  MeldView[],
-  MeldView[],
-] {
-  const bySeat: [MeldView[], MeldView[], MeldView[], MeldView[]] = [[], [], [], []];
+function parseMelds(
+  melds: Uint8Array,
+): [MeldView[], MeldView[], MeldView[], MeldView[]] {
+  const bySeat: [MeldView[], MeldView[], MeldView[], MeldView[]] = [
+    [],
+    [],
+    [],
+    [],
+  ];
   for (let seat = 0; seat < PLAYER_COUNT(); seat += 1) {
     for (let slot = 0; slot < MELD_SLOTS(); slot += 1) {
       const base = (seat * MELD_SLOTS() + slot) * MELD_FIELDS();
@@ -115,6 +128,72 @@ function parseEvents(buffer: Int32Array, count: number): EventRecord[] {
   return out;
 }
 
+function parsePlayerUiStats(buffer: Int32Array): {
+  counts: [number, number, number, number];
+  lastWins: [
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+  ];
+} {
+  const counts = [0, 0, 0, 0] as [number, number, number, number];
+  const lastWins = [null, null, null, null] as [
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+    WinSummary | null,
+  ];
+  for (let relative = 0; relative < PLAYER_COUNT(); relative += 1) {
+    const base = relative * PLAYER_UI_STATS_FIELDS();
+    counts[relative] = buffer[base] ?? 0;
+    if ((buffer[base + 1] ?? -1) < 0) {
+      continue;
+    }
+    lastWins[relative] = {
+      shapeMultiplier: buffer[base + 1] ?? 0,
+      multiplier: buffer[base + 2] ?? 0,
+      patterns: buffer[base + 3] ?? 0,
+      flags: buffer[base + 4] ?? 0,
+    };
+  }
+  return { counts, lastWins };
+}
+
+function parseWallSettlement(
+  meta: Int32Array,
+  hands: Uint8Array,
+): WallSettlementSummary {
+  const flowerPig = [false, false, false, false] as [
+    boolean,
+    boolean,
+    boolean,
+    boolean,
+  ];
+  const ready = [false, false, false, false] as [
+    boolean,
+    boolean,
+    boolean,
+    boolean,
+  ];
+  const maxShapeMultipliers = [0, 0, 0, 0] as [number, number, number, number];
+  const revealedHands = [] as Uint8Array[];
+  for (let relative = 0; relative < PLAYER_COUNT(); relative += 1) {
+    const metaBase = relative * WALL_SETTLEMENT_FIELDS();
+    flowerPig[relative] = (meta[metaBase] ?? 0) !== 0;
+    ready[relative] = (meta[metaBase + 1] ?? 0) !== 0;
+    maxShapeMultipliers[relative] = meta[metaBase + 2] ?? 0;
+    const handBase = relative * TILE_KIND_COUNT();
+    revealedHands.push(hands.slice(handBase, handBase + TILE_KIND_COUNT()));
+  }
+  return {
+    flowerPig,
+    ready,
+    maxShapeMultipliers,
+    hands: revealedHands as [Uint8Array, Uint8Array, Uint8Array, Uint8Array],
+  };
+}
+
 function unlockedHand(ownHand: Uint8Array, locked: Uint8Array): Uint8Array {
   const out = new Uint8Array(TILE_KIND_COUNT());
   for (let i = 0; i < TILE_KIND_COUNT(); i += 1) {
@@ -149,13 +228,23 @@ export function buildUiSnapshot(
   const buffers = options.buffers ?? createObservationBuffers();
   const includeHistory = options.includeEventHistory !== false;
 
-  game.observeInto(viewer, buffers.tileObs, buffers.melds, buffers.river, buffers.meta);
+  game.observeInto(
+    viewer,
+    buffers.tileObs,
+    buffers.melds,
+    buffers.river,
+    buffers.meta,
+  );
 
-  const historyCount = includeHistory ? game.eventsInto(viewer, buffers.events) : 0;
+  const historyCount = includeHistory
+    ? game.eventsInto(viewer, buffers.events)
+    : 0;
   const stepCount = game.stepEventsInto(viewer, buffers.stepEvents);
 
   const meta = buffers.meta;
   const ownHand = copyPlane(buffers.tileObs, 0);
+  game.winBaseInto(viewer, buffers.winBase);
+  const winBase = buffers.winBase.slice();
   const exchangeSelection = copyPlane(buffers.tileObs, 1);
   const lockedTiles = [
     copyPlane(buffers.tileObs, 2),
@@ -184,9 +273,25 @@ export function buildUiSnapshot(
     Math.max(0, handCounts[3] - lockedTiles[3].reduce((a, b) => a + b, 0)),
   ] as const;
 
-  const [low, high] = readMaskWords(game.legalActionMask);
   const decision = game.decision;
+  const decisionActor =
+    decision == null || decision.length < 1
+      ? null
+      : relativeSeat(Number(decision[0] ?? 0), viewer);
+  const [low, high] =
+    decisionActor === 0
+      ? readMaskWords(game.legalActionMask)
+      : ([0n, 0n] as const);
   const finished = game.phase === PHASE_FINISHED();
+  game.playerUiStatsInto(viewer, buffers.playerUiStats);
+  const hasWallSettlement =
+    finished &&
+    game.wallSettlementInto(
+      viewer,
+      buffers.settlementMeta,
+      buffers.settlementHands,
+    );
+  const playerUiStats = parsePlayerUiStats(buffers.playerUiStats);
 
   const absoluteScores = Array.from(game.scores());
   const absoluteMissing = Array.from(game.missingSuits());
@@ -196,10 +301,7 @@ export function buildUiSnapshot(
     schemaVersion: UI_SNAPSHOT_SCHEMA_VERSION,
     engineRulesVersion: options.engineRulesVersion,
     phase: game.phase,
-    decisionActor:
-      decision == null || decision.length < 1
-        ? null
-        : relativeSeat(Number(decision[0] ?? 0), viewer),
+    decisionActor,
     dealer: relativeSeat(game.dealer, viewer),
     exchangeDirection: game.exchangeDirection,
     wallRemaining: game.wallRemaining,
@@ -207,7 +309,10 @@ export function buildUiSnapshot(
     missingSuits: relativeQuad(absoluteMissing, viewer),
     ownHand,
     unlockedHand: unlocked,
+    winBase,
     exchangeSelection,
+    exchangeSelectedCount: meta[10] ?? 0,
+    exchangeSelectionSuit: meta[11] ?? -1,
     lockedTiles,
     discardCounts,
     melds: parseMelds(buffers.melds),
@@ -226,7 +331,11 @@ export function buildUiSnapshot(
       (meta[23] ?? 0) !== 0,
     ],
     maxWinMultipliers: relativeQuad(absoluteMultipliers, viewer),
-    legalActionMask: [low, high],
+    winCounts: playerUiStats.counts,
+    lastWins: playerUiStats.lastWins,
+    // BigInt is valid inside WASM, but it is not safe at the React/JSON
+    // boundary. Decimal strings preserve all 115 action bits without loss.
+    legalActionMask: [low.toString(), high.toString()],
     legalActionIds: legalActionIdsFromMask(low, high),
     eventHistory: parseEvents(buffers.events, historyCount),
     stepEvents: parseEvents(buffers.stepEvents, stepCount),
@@ -235,6 +344,9 @@ export function buildUiSnapshot(
       ? (Array.from(game.rankings()).map((seat) =>
           relativeSeat(Number(seat), viewer),
         ) as [number, number, number, number])
+      : null,
+    wallSettlement: hasWallSettlement
+      ? parseWallSettlement(buffers.settlementMeta, buffers.settlementHands)
       : null,
   };
 }

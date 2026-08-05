@@ -58,7 +58,7 @@ npm test
 
 `npm test` 先 typecheck，再跑 `tests/` 下的完整 harness。
 
-`buildUiSnapshot(game, viewer)` 产出 `PLAN.md` 3.1 节描述的观察者相对快照。Worker 消息类型定义在 `protocol.ts`。
+`buildUiSnapshot(game, viewer)` 产出观察者相对快照。Worker 消息类型定义在 `protocol.ts`。
 
 ## 完整测试 harness
 

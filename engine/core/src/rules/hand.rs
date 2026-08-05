@@ -126,11 +126,9 @@ impl Holding {
     }
 
     pub(crate) fn discard_mask(&self) -> u32 {
-        let unlocked = all_tiles().fold(0_u32, |mask, tile| {
+        all_tiles().fold(0_u32, |mask, tile| {
             mask | (u32::from(self.unlocked_count(tile) != 0) << tile.index())
-        });
-        let forced = self.missing.map_or(0, Suit::mask) & unlocked;
-        if forced == 0 { unlocked } else { forced }
+        })
     }
 
     pub(crate) fn after_draw(mut self, tile: Tile) -> Option<Self> {
@@ -330,6 +328,27 @@ mod tests {
         assert_eq!(holding.discard_mask(), 1 << two.index());
         assert!(holding.after_discard(one).is_none());
         assert!(holding.after_discard(two).is_some());
+    }
+
+    #[test]
+    fn discard_mask_allows_every_unlocked_suit_when_missing_is_set() {
+        let characters = Tile::from_suit_rank(Suit::Characters, 0).expect("test tile is valid");
+        let bamboo = Tile::from_suit_rank(Suit::Bamboo, 0).expect("test tile is valid");
+        let mut holding = Holding {
+            concealed: [0; TILE_KIND_COUNT],
+            locked: [0; TILE_KIND_COUNT],
+            win_base: [0; TILE_KIND_COUNT],
+            melds: [DUMMY_MELD; 4],
+            meld_len: 0,
+            missing: Some(Suit::Characters),
+            has_won: false,
+        };
+        holding.concealed[characters.index()] = 1;
+        holding.concealed[bamboo.index()] = 1;
+
+        let mask = holding.discard_mask();
+        assert_ne!(mask & (1 << characters.index()), 0);
+        assert_ne!(mask & (1 << bamboo.index()), 0);
     }
 
     #[test]
