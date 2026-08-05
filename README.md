@@ -1,8 +1,8 @@
-# 血流麻将引擎
+# 血流麻将
 
 本仓库按 GNU Affero General Public License v3.0（AGPLv3）发布，完整文本见 [`LICENSE`](LICENSE)。
 
-四人血流麻将 Rust 引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具和 Python 绑定。
+四人血流麻将的完整实现：Rust 权威引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具、Python 与 WebAssembly 绑定、训练流程和纯静态 Web 客户端。
 
 ## 功能
 
@@ -12,7 +12,8 @@
 - 全部结构牌型、状态/事件番与即时计分；
 - 牌墙耗尽后查花猪、查大叫，分数下限为 0；
 - 115 维固定动作空间、观察者视角事件和批量环境；
-- 三种规则策略、ONNX 神经网络策略和任意两两平衡测评。
+- 三种规则策略、ONNX 神经网络策略和任意两两平衡测评；
+- Python 与 WebAssembly 绑定，以及基于 Three.js 的纯静态 Web 客户端。
 
 完整玩法与计分规范见 [`GAME_RULES.md`](GAME_RULES.md)。
 
@@ -28,6 +29,8 @@
 | [`engine/pybind/README.md`](engine/pybind/README.md) | 安装、数组规格、事件与 observation 格式 |
 | [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md) | 统计方法、全部 CLI 参数和输出解释 |
 | [`training/README.md`](training/README.md) | 训练、checkpoint 和 ONNX 导出流程 |
+| [`engine/wasm/README.md`](engine/wasm/README.md) | WebAssembly 绑定、TypeScript 封装与构建 |
+| [`web/README.md`](web/README.md) | Web 客户端运行、资产转换与依赖要求 |
 
 ## 仓库结构
 
@@ -35,15 +38,19 @@
 | --- | --- |
 | [`engine/core`](engine/core/) | 游戏状态、计分、分析、批量环境和策略接口 |
 | [`engine/pybind`](engine/pybind/) | PyO3 和 NumPy 兼容接口 |
+| [`engine/wasm`](engine/wasm/) | WebAssembly 绑定与 TypeScript 封装 |
 | [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种受支持策略的平衡测评工具 |
+| [`web`](web/) | 基于 Three.js 的纯静态 Web 客户端 |
+| [`training`](training/) | 自对弈训练与 ONNX 导出流程 |
 | [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 使用的 ONNX 模型 |
 
-Rust workspace 包含三个 package：
+Rust workspace 包含四个 package：
 
 | Package | Crate / 二进制 | 用途 |
 | --- | --- | --- |
 | `bloodflow-mahjong` | `bloodflow_mahjong` | Rust 库和诊断 benchmark |
 | `bloodflow-mahjong-pybind` | `bloodflow_mahjong` | Python 扩展模块 |
+| `bloodflow-mahjong-wasm` | `bloodflow_mahjong_wasm` | WebAssembly 绑定 |
 | `bloodflow-mahjong-rule-tournament` | `rule-tournament` | 策略锦标赛 CLI |
 
 ## Rust 示例
@@ -76,7 +83,7 @@ fn main() -> Result<(), GameError> {
 | `rule-fast` | 低成本、确定性的基准策略 | Rust/Python `Game` 和 `Batch` |
 | `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust/Python `Game` 和 `Batch` |
 | `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust/Python `Game` 和 `Batch` |
-| `rule-nn` | ONNX Actor；引擎负责 observation 编码和合法动作过滤 | Rust/Python `RuleNn` 和锦标赛 |
+| `rule-nn` | ONNX Actor；引擎负责 observation 编码和合法动作过滤 | Rust/Python/Wasm `RuleNn` 和锦标赛 |
 
 前三种策略不需要外部模型。`rule-nn` 需要 [`model/latest.onnx`](model/latest.onnx)，并且当前只提供单局推理，不提供 `Batch` 推理。四种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
@@ -86,4 +93,4 @@ fn main() -> Result<(), GameError> {
 
 ## 构建与验证
 
-完整的 fmt、test、clippy、doc 命令和诊断 benchmark 见 [`engine/README.md`](engine/README.md)。Python 扩展的构建与测试见 [`engine/pybind/README.md`](engine/pybind/README.md)。
+完整的 fmt、test、clippy、doc 命令和诊断 benchmark 见 [`engine/README.md`](engine/README.md)。Python 扩展的构建与测试见 [`engine/pybind/README.md`](engine/pybind/README.md)，Wasm 绑定与 Web 客户端分别见 [`engine/wasm/README.md`](engine/wasm/README.md) 和 [`web/README.md`](web/README.md)。
