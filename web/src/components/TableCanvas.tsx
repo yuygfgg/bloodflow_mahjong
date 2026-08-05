@@ -59,10 +59,6 @@ export function TableCanvas({
   }, [reducedMotion]);
 
   return (
-    <canvas
-      ref={canvasRef}
-      className="table-canvas"
-      aria-label="麻将桌"
-    />
+    <canvas ref={canvasRef} className="table-canvas" aria-label="麻将桌" />
   );
 }

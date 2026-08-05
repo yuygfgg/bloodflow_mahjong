@@ -121,6 +121,13 @@ button:disabled {
   transform: translateX(-50%);
 }
 
+.seat-2 .win-count {
+  right: auto;
+  bottom: 0;
+  left: 100%;
+  white-space: nowrap;
+}
+
 .seat-3 {
   top: 48%;
   left: 1%;
@@ -1039,6 +1046,10 @@ textarea:focus {
     padding: 5px 10px;
   }
 
+  .seat-2 {
+    top: 2%;
+  }
+
   .seat-wind {
     font-size: 30px;
   }
@@ -1091,6 +1102,30 @@ textarea:focus {
   .center-status {
     width: 104px;
     height: 96px;
+  }
+}
+
+@media (max-width: 760px), (max-height: 500px) {
+  .seat-2 {
+    min-height: 42px;
+    padding: 3px 8px;
+  }
+
+  .seat-2 .seat-wind {
+    margin-right: 6px;
+    font-size: 26px;
+  }
+
+  .seat-2 .seat-copy span {
+    font-size: 11px;
+  }
+
+  .seat-2 .dealer-mark,
+  .seat-2 .missing-mark {
+    flex-basis: 24px;
+    width: 24px;
+    height: 24px;
+    margin-left: 4px;
   }
 }
 

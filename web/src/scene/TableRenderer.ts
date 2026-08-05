@@ -39,7 +39,8 @@ import {
 } from "../game/domain";
 
 const TILE = { x: 0.525954, y: 0.373452, z: 0.678642 };
-const HORIZONTAL_FOV = 80;
+const HORIZONTAL_FOV = 84;
+const VERTICAL_FRAME_OFFSET = 0.055;
 const INTRO_SECONDS = 3;
 const TILE_ATLAS_STEP = { x: 0.125, y: 0.25 };
 const TILE_BACK_CELL = 28;
@@ -1267,6 +1268,16 @@ export class TableRenderer {
         : HORIZONTAL_FOV;
     this.camera.fov = verticalFov;
     this.camera.aspect = aspect;
+    // Reserve the top band for the centered opponent HUD without cropping the
+    // local hand at the bottom of the frame.
+    this.camera.setViewOffset(
+      width,
+      height,
+      0,
+      -height * VERTICAL_FRAME_OFFSET,
+      width,
+      height,
+    );
     this.camera.updateProjectionMatrix();
     this.renderer.setSize(width, height, false);
   };
