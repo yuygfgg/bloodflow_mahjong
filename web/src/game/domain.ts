@@ -1,4 +1,8 @@
-import type { UiSnapshot } from "../../../engine/wasm/js/src/types";
+import type {
+  EventRecord,
+  RiverEntry,
+  UiSnapshot,
+} from "../../../engine/wasm/js/src/types";
 
 export const TILE_KIND_COUNT = 27;
 
@@ -117,6 +121,65 @@ export function expandHistogram(histogram: ArrayLike<number>): number[] {
     }
   }
   return tiles;
+}
+
+/**
+ * Return the chronological river entries whose physical tiles were claimed.
+ *
+ * The engine retains every discard as public action history. A Pong, exposed
+ * Kong, or discard Hu moves the physical tile away from the table river, so
+ * the presentation layer must not draw that historical entry in both places.
+ */
+export function claimedRiverIndexes(
+  river: readonly RiverEntry[],
+  events: readonly EventRecord[],
+): Set<number> {
+  const claimed = new Set<number>();
+  const retainedDiscardCount = events.reduce(
+    (count, event) => count + Number(event[0] === EventKind.Discard),
+    0,
+  );
+  const firstRetainedDiscard = Math.max(0, river.length - retainedDiscardCount);
+  const seenDiscards = Array.from(
+    { length: firstRetainedDiscard },
+    (_, index) => index,
+  );
+  let nextDiscard = firstRetainedDiscard;
+
+  const claimLatest = (source: number, tile: number): void => {
+    for (let index = seenDiscards.length - 1; index >= 0; index -= 1) {
+      const riverIndex = seenDiscards[index]!;
+      const entry = river[riverIndex];
+      if (entry?.ownerRelative === source && entry.tile === tile) {
+        claimed.add(riverIndex);
+        return;
+      }
+    }
+  };
+
+  for (const event of events) {
+    const [kind, , target, tile, flags] = event;
+    if (kind === EventKind.Discard) {
+      if (nextDiscard < river.length) seenDiscards.push(nextDiscard);
+      nextDiscard += 1;
+      continue;
+    }
+    if (
+      kind === EventKind.Meld &&
+      (flags === MeldKind.Pong || flags === MeldKind.ExposedKong)
+    ) {
+      claimLatest(target, tile);
+      continue;
+    }
+    if (
+      kind === EventKind.Hu &&
+      (flags & (EVENT_FLAG_SELF_DRAW | EVENT_FLAG_ROB_KONG)) === 0
+    ) {
+      claimLatest(target, tile);
+    }
+  }
+
+  return claimed;
 }
 
 export function legalDiscardTiles(snapshot: UiSnapshot): Set<number> {

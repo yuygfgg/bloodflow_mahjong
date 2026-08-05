@@ -31,6 +31,7 @@ import {
   Phase,
   SEAT_NAMES,
   TILE_KIND_COUNT,
+  claimedRiverIndexes,
   exchangeDirectionLabel,
   expandHistogram,
   legalDiscardTiles,
@@ -248,6 +249,7 @@ export class TableRenderer {
       this.clearTransientTiles();
     }
     this.snapshot = snapshot;
+    this.updateHiddenRiverKeys();
     this.updateCenterStatus();
     this.hintAction = hintAction;
     this.pendingExchangeSelectionKeys = pendingExchangeSelectionKeys;
@@ -707,14 +709,36 @@ export class TableRenderer {
     let riverIndex = 0;
     snapshot.river.forEach((entry, globalIndex) => {
       if (entry.ownerRelative !== seat) return;
-      next.set(`river:${seat}:${riverIndex}`, {
-        seat,
-        tile: entry.tile,
-        zone: "river",
-        index: riverIndex,
-        state: globalIndex === snapshot.river.length - 1 ? "latest" : "normal",
-      });
+      const key = `river:${seat}:${riverIndex}`;
+      if (!this.hiddenRiverKeys.has(key)) {
+        next.set(key, {
+          seat,
+          tile: entry.tile,
+          zone: "river",
+          index: riverIndex,
+          state:
+            globalIndex === snapshot.river.length - 1 ? "latest" : "normal",
+        });
+      }
       riverIndex += 1;
+    });
+  }
+
+  private updateHiddenRiverKeys(): void {
+    this.hiddenRiverKeys.clear();
+    const snapshot = this.snapshot;
+    if (snapshot == null) return;
+
+    const claimed = claimedRiverIndexes(snapshot.river, snapshot.eventHistory);
+    const riverIndexesBySeat = [0, 0, 0, 0];
+    snapshot.river.forEach((entry, globalIndex) => {
+      const seat = entry.ownerRelative;
+      if (seat < 0 || seat >= riverIndexesBySeat.length) return;
+      const riverIndex = riverIndexesBySeat[seat]!;
+      if (claimed.has(globalIndex)) {
+        this.hiddenRiverKeys.add(`river:${seat}:${riverIndex}`);
+      }
+      riverIndexesBySeat[seat] = riverIndex + 1;
     });
   }
 

@@ -36,6 +36,19 @@ const PROFILE_LABEL: Record<BotProfile, string> = {
   "rule-nn": "神经网络",
 };
 
+function saveReplayFile(replay: ReplayRecord): void {
+  const contents = JSON.stringify(replay, null, 2);
+  const blob = new Blob([contents], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = `bloodflow-replay-${replay.seed}.json`;
+  document.body.append(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 interface StartScreenProps {
   status: "booting" | "ready" | "playing" | "error";
   busy: boolean;
@@ -408,12 +421,29 @@ export function WinNotice({ snapshot }: { snapshot: UiSnapshot }) {
 export function SettlementOverlay({
   snapshot,
   busy,
+  onExportReplay,
   onPlayAgain,
 }: {
   snapshot: UiSnapshot;
   busy: boolean;
+  onExportReplay: () => Promise<ReplayRecord>;
   onPlayAgain: () => void;
 }) {
+  const [downloading, setDownloading] = useState(false);
+  const [downloadError, setDownloadError] = useState("");
+
+  const downloadReplay = async () => {
+    setDownloading(true);
+    setDownloadError("");
+    try {
+      saveReplayFile(await onExportReplay());
+    } catch (error) {
+      setDownloadError(error instanceof Error ? error.message : "回放下载失败");
+    } finally {
+      setDownloading(false);
+    }
+  };
+
   if (snapshot.phase !== Phase.Finished) return null;
   const settlement = snapshot.wallSettlement;
   return (
@@ -423,7 +453,7 @@ export function SettlementOverlay({
       aria-live="polite"
       aria-modal="true"
       aria-labelledby="settlement-title"
-      aria-busy={busy}
+      aria-busy={busy || downloading}
     >
       <div className="settlement-panel">
         <span className="settlement-stage" id="settlement-title">
@@ -468,13 +498,30 @@ export function SettlementOverlay({
           <button
             className="menu-button"
             type="button"
-            disabled={busy}
-            onClick={onPlayAgain}
+            disabled={busy || downloading}
+            onClick={() => void downloadReplay()}
+          >
+            <Download aria-hidden="true" />
+            {downloading ? "正在下载" : "下载回放"}
+          </button>
+          <button
+            className="menu-button"
+            type="button"
+            disabled={busy || downloading}
+            onClick={() => {
+              setDownloadError("");
+              onPlayAgain();
+            }}
           >
             <RotateCcw aria-hidden="true" />
             {busy ? "正在开局" : "再来一局"}
           </button>
         </div>
+        {downloadError && (
+          <p className="settlement-download-error" role="alert">
+            {downloadError}
+          </p>
+        )}
       </div>
     </div>
   );

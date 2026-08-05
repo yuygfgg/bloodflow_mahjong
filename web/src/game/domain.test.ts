@@ -1,15 +1,34 @@
 import { describe, expect, it } from "vitest";
-import type { UiSnapshot } from "../../../engine/wasm/js/src/types";
+import type {
+  EventRecord,
+  RiverEntry,
+  UiSnapshot,
+} from "../../../engine/wasm/js/src/types";
 import {
   Action,
+  EVENT_FLAG_ROB_KONG,
+  EVENT_FLAG_SELF_DRAW,
+  EventKind,
+  MeldKind,
   Phase,
   actionButtons,
+  claimedRiverIndexes,
   expandHistogram,
   replayFromIdentifier,
   replayIdentifier,
   tileLabel,
   windForSeat,
 } from "./domain";
+
+function event(
+  kind: number,
+  actor: number,
+  target: number,
+  tile: number,
+  flags = 0,
+): EventRecord {
+  return [kind, actor, target, tile, flags, 0, 0, -1];
+}
 
 function snapshotWith(
   actions: number[],
@@ -83,5 +102,58 @@ describe("game presentation mappings", () => {
   it("round-trips replay identifiers", () => {
     const json = JSON.stringify({ seed: "42", actions: [0, 1, 2] });
     expect(replayFromIdentifier(replayIdentifier(json))).toBe(json);
+  });
+
+  it("marks discards claimed by pong and exposed kong", () => {
+    const river: RiverEntry[] = [
+      { ownerRelative: 1, tile: 4 },
+      { ownerRelative: 2, tile: 8 },
+    ];
+    const events = [
+      event(EventKind.Discard, 1, -1, 4),
+      event(EventKind.Meld, 0, 1, 4, MeldKind.Pong),
+      event(EventKind.Discard, 2, -1, 8),
+      event(EventKind.Meld, 3, 2, 8, MeldKind.ExposedKong),
+    ];
+
+    expect([...claimedRiverIndexes(river, events)]).toEqual([0, 1]);
+  });
+
+  it("marks one physical discard for multiple discard wins", () => {
+    const river: RiverEntry[] = [{ ownerRelative: 2, tile: 12 }];
+    const events = [
+      event(EventKind.Discard, 2, -1, 12),
+      event(EventKind.Hu, 3, 2, 12),
+      event(EventKind.Hu, 0, 2, 12),
+    ];
+
+    expect([...claimedRiverIndexes(river, events)]).toEqual([0]);
+  });
+
+  it("does not claim a river tile for self draw or robbed kong", () => {
+    const river: RiverEntry[] = [{ ownerRelative: 1, tile: 6 }];
+    const events = [
+      event(EventKind.Discard, 1, -1, 6),
+      event(EventKind.Hu, 0, -1, 6, EVENT_FLAG_SELF_DRAW),
+      event(EventKind.Hu, 2, 1, 6, EVENT_FLAG_ROB_KONG),
+      event(EventKind.Meld, 1, -1, 6, MeldKind.AddedKong),
+      event(EventKind.Meld, 3, -1, 6, MeldKind.ConcealedKong),
+    ];
+
+    expect([...claimedRiverIndexes(river, events)]).toEqual([]);
+  });
+
+  it("claims the correct repeated discard and aligns retained event history", () => {
+    const river: RiverEntry[] = [
+      { ownerRelative: 1, tile: 3 },
+      { ownerRelative: 2, tile: 9 },
+      { ownerRelative: 1, tile: 3 },
+    ];
+    const events = [
+      event(EventKind.Discard, 1, -1, 3),
+      event(EventKind.Hu, 0, 1, 3),
+    ];
+
+    expect([...claimedRiverIndexes(river, events)]).toEqual([2]);
   });
 });

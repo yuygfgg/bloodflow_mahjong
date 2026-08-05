@@ -996,8 +996,16 @@ textarea:focus {
 
 .settlement-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: center;
+  gap: 8px;
   margin-top: 18px;
+}
+
+.settlement-download-error {
+  margin: 10px 0 0;
+  color: #ff7c70;
+  font-size: 13px;
 }
 
 .high-contrast .seat-hud,

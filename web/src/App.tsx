@@ -338,6 +338,7 @@ export function App() {
           <SettlementOverlay
             snapshot={snapshot}
             busy={game.busy}
+            onExportReplay={game.exportReplay}
             onPlayAgain={() => void playAgain()}
           />
         </div>
