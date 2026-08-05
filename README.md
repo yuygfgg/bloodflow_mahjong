@@ -1,5 +1,9 @@
 # 血流麻将
 
+[![Deploy web to GitHub Pages](https://github.com/yuygfgg/bloodflow_mahjong/actions/workflows/pages.yml/badge.svg)](https://github.com/yuygfgg/bloodflow_mahjong/actions/workflows/pages.yml)
+
+[在线游玩](https://bm.yuygfgg.xyz/)
+
 本仓库按 GNU Affero General Public License v3.0（AGPLv3）发布，完整文本见 [`LICENSE`](LICENSE)。
 
 四人血流麻将的完整实现：Rust 权威引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具、Python 与 WebAssembly 绑定、训练流程和纯静态 Web 客户端。
