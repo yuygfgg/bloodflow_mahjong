@@ -11,7 +11,7 @@ use ::bloodflow_mahjong as core_engine;
 use core_engine::RuleNn as CoreRuleNn;
 use core_engine::{
     ActionId, ExchangeDirection, Game as CoreGame, GameError, MeldKind, RuleEvConfig,
-    RuleEvDefense, RulePlannerConfig, Seat, StepOutcome, TerminationReason,
+    RuleEvDefense, Seat, StepOutcome, TerminationReason,
 };
 use wasm_bindgen::prelude::*;
 
@@ -83,74 +83,6 @@ impl JsRuleEvConfig {
     #[wasm_bindgen(getter)]
     pub fn defense(&self) -> bool {
         self.inner.defense() == RuleEvDefense::Heuristic
-    }
-}
-
-/// Immutable search budget for the `rule-planner` policy.
-#[wasm_bindgen(js_name = RulePlannerConfig)]
-#[derive(Clone, Copy)]
-pub struct JsRulePlannerConfig {
-    inner: RulePlannerConfig,
-}
-
-#[wasm_bindgen(js_class = RulePlannerConfig)]
-impl JsRulePlannerConfig {
-    #[wasm_bindgen(constructor)]
-    pub fn new(
-        hand_changes: u8,
-        draw_horizon: u8,
-        candidate_states: u32,
-        belief_worlds: u16,
-        response_worlds: u16,
-        search_iterations: u16,
-    ) -> Result<JsRulePlannerConfig, JsValue> {
-        Ok(Self {
-            inner: build_planner_config(
-                hand_changes,
-                draw_horizon,
-                candidate_states,
-                belief_worlds,
-                response_worlds,
-                search_iterations,
-            )?,
-        })
-    }
-
-    #[wasm_bindgen(js_name = defaultConfig)]
-    pub fn default_config() -> JsRulePlannerConfig {
-        Self {
-            inner: RulePlannerConfig::DEFAULT,
-        }
-    }
-
-    #[wasm_bindgen(getter, js_name = handChanges)]
-    pub fn hand_changes(&self) -> u8 {
-        self.inner.hand_changes()
-    }
-
-    #[wasm_bindgen(getter, js_name = drawHorizon)]
-    pub fn draw_horizon(&self) -> u8 {
-        self.inner.draw_horizon()
-    }
-
-    #[wasm_bindgen(getter, js_name = candidateStates)]
-    pub fn candidate_states(&self) -> u32 {
-        self.inner.candidate_states()
-    }
-
-    #[wasm_bindgen(getter, js_name = beliefWorlds)]
-    pub fn belief_worlds(&self) -> u16 {
-        self.inner.belief_worlds()
-    }
-
-    #[wasm_bindgen(getter, js_name = responseWorlds)]
-    pub fn response_worlds(&self) -> u16 {
-        self.inner.response_worlds()
-    }
-
-    #[wasm_bindgen(getter, js_name = searchIterations)]
-    pub fn search_iterations(&self) -> u16 {
-        self.inner.search_iterations()
     }
 }
 
@@ -264,22 +196,6 @@ impl JsGame {
             .map(|action| action.index() as u8)
     }
 
-    /// `rule-planner` action with the default budget.
-    #[wasm_bindgen(js_name = rulePlannerAction)]
-    pub fn rule_planner_action(&self) -> Option<u8> {
-        self.inner
-            .rule_planner_action_with_config(RulePlannerConfig::DEFAULT)
-            .map(|action| action.index() as u8)
-    }
-
-    /// `rule-planner` action with an explicit borrowed config.
-    #[wasm_bindgen(js_name = rulePlannerActionWithConfig)]
-    pub fn rule_planner_action_with_config(&self, config: &JsRulePlannerConfig) -> Option<u8> {
-        self.inner
-            .rule_planner_action_with_config(config.inner)
-            .map(|action| action.index() as u8)
-    }
-
     /// Apply an action id and return the 12-field step record as `i32` values.
     ///
     /// Score components stay well inside `i32` for Blood Flow Mahjong scoring.
@@ -372,7 +288,7 @@ impl JsGame {
     /// Write the partial-information observation for one viewer.
     ///
     /// Buffer sizes must match the fixed training/observation contract:
-    /// - `tile_obs`: `10 * 27` (`TILE_OBSERVATION_WIDTH`)
+    /// - `tile_obs`: `11 * 27` (`TILE_OBSERVATION_WIDTH`)
     /// - `melds`: `4 * 4 * 3` (`MELD_OBSERVATION_WIDTH`)
     /// - `river`: `108 * 2` (`RIVER_OBSERVATION_WIDTH`)
     /// - `meta`: `META_OBSERVATION_WIDTH`
@@ -578,29 +494,6 @@ fn rule_nn_error(error: core_engine::RuleNnError) -> JsValue {
 
 fn config_range_error(name: &str, value: impl std::fmt::Display, range: &str) -> JsValue {
     JsValue::from_str(&format!("{name} must be in {range}, got {value}"))
-}
-
-fn build_planner_config(
-    hand_changes: u8,
-    draw_horizon: u8,
-    candidate_states: u32,
-    belief_worlds: u16,
-    response_worlds: u16,
-    search_iterations: u16,
-) -> Result<RulePlannerConfig, JsValue> {
-    RulePlannerConfig::DEFAULT
-        .with_hand_changes(hand_changes)
-        .ok_or_else(|| config_range_error("hand_changes", hand_changes, "0..=2"))?
-        .with_draw_horizon(draw_horizon)
-        .ok_or_else(|| config_range_error("draw_horizon", draw_horizon, "0..=32"))?
-        .with_candidate_states(candidate_states)
-        .ok_or_else(|| config_range_error("candidate_states", candidate_states, "1..=200000"))?
-        .with_belief_worlds(belief_worlds)
-        .ok_or_else(|| config_range_error("belief_worlds", belief_worlds, "0..=256"))?
-        .with_response_worlds(response_worlds)
-        .ok_or_else(|| config_range_error("response_worlds", response_worlds, "0..=256"))?
-        .with_search_iterations(search_iterations)
-        .ok_or_else(|| config_range_error("search_iterations", search_iterations, "0..=4096"))
 }
 
 fn require_len<T>(slice: &[T], expected: usize, name: &str) -> Result<(), JsValue> {

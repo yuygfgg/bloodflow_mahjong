@@ -8,8 +8,8 @@ use core_engine::{
     EVENT_RECORD_WIDTH, EventKind, ExchangeDirection, Game, GameError, LEGAL_ACTION_MASK_WORDS,
     MELD_FIELDS, MELD_SLOTS, META_OBSERVATION_WIDTH, MeldKind, ORACLE_TILE_COUNT_PLANES,
     PLAYER_COUNT, Phase, RIVER_FIELDS, RIVER_TILE_CAPACITY, RuleEvConfig, RuleEvDefense,
-    RulePlannerConfig, STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_KIND_COUNT,
-    TILE_OBSERVATION_PLANES, TerminationReason,
+    STEP_RECORD_WIDTH, Seat, StepOutcome, TILE_KIND_COUNT, TILE_OBSERVATION_PLANES,
+    TerminationReason,
 };
 use numpy::{
     PyArray, PyArray1, PyArray2, PyArray3, PyArray4, PyArrayMethods, PyReadonlyArray,
@@ -109,89 +109,6 @@ impl PyRuleEvConfig {
     }
 }
 
-#[pyclass(frozen, name = "RulePlannerConfig", module = "bloodflow_mahjong")]
-struct PyRulePlannerConfig {
-    inner: RulePlannerConfig,
-}
-
-#[pymethods]
-impl PyRulePlannerConfig {
-    #[new]
-    #[pyo3(signature = (
-        hand_changes=0,
-        draw_horizon=1,
-        candidate_states=1,
-        belief_worlds=64,
-        response_worlds=0,
-        search_iterations=64,
-    ))]
-    fn new(
-        hand_changes: u8,
-        draw_horizon: u8,
-        candidate_states: u32,
-        belief_worlds: u16,
-        response_worlds: u16,
-        search_iterations: u16,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            inner: build_planner_config(
-                hand_changes,
-                draw_horizon,
-                candidate_states,
-                belief_worlds,
-                response_worlds,
-                search_iterations,
-            )?,
-        })
-    }
-
-    #[getter]
-    fn hand_changes(&self) -> u8 {
-        self.inner.hand_changes()
-    }
-
-    #[getter]
-    fn draw_horizon(&self) -> u8 {
-        self.inner.draw_horizon()
-    }
-
-    #[getter]
-    fn candidate_states(&self) -> u32 {
-        self.inner.candidate_states()
-    }
-
-    #[getter]
-    fn belief_worlds(&self) -> u16 {
-        self.inner.belief_worlds()
-    }
-
-    #[getter]
-    fn response_worlds(&self) -> u16 {
-        self.inner.response_worlds()
-    }
-
-    #[getter]
-    fn search_iterations(&self) -> u16 {
-        self.inner.search_iterations()
-    }
-
-    fn __repr__(&self) -> String {
-        format!(
-            concat!(
-                "RulePlannerConfig(hand_changes={}, draw_horizon={}, ",
-                "candidate_states={}, belief_worlds={}, response_worlds={}, ",
-                "search_iterations={})"
-            ),
-            self.hand_changes(),
-            self.draw_horizon(),
-            self.candidate_states(),
-            self.belief_worlds(),
-            self.response_worlds(),
-            self.search_iterations(),
-        )
-    }
-}
-
 #[pyclass(name = "Game", module = "bloodflow_mahjong")]
 struct PyGame {
     inner: Game,
@@ -263,18 +180,6 @@ impl PyGame {
     ) -> Option<u8> {
         let config = config.map_or(RuleEvConfig::STANDARD, |value| value.inner);
         py.detach(|| self.inner.rule_ev_action_with_config(config))
-            .map(|action| action.index() as u8)
-    }
-
-    /// Returns a rule-planner action, or `None` after terminal.
-    #[pyo3(signature = (config=None))]
-    fn rule_planner_action(
-        &self,
-        py: Python<'_>,
-        config: Option<PyRef<'_, PyRulePlannerConfig>>,
-    ) -> Option<u8> {
-        let config = config.map_or(RulePlannerConfig::DEFAULT, |value| value.inner);
-        py.detach(|| self.inner.rule_planner_action_with_config(config))
             .map(|action| action.index() as u8)
     }
 
@@ -791,47 +696,44 @@ impl PyBatch {
         .map_err(game_error)
     }
 
-    #[pyo3(signature = (output, config=None))]
-    fn rule_planner_actions_into<'py>(
+    #[cfg(feature = "rule-nn")]
+    fn rule_nn_actions_into<'py>(
         &self,
         py: Python<'py>,
         output: &Bound<'py, PyArray1<u8>>,
-        config: Option<PyRef<'py, PyRulePlannerConfig>>,
+        policy: PyRef<'py, PyRuleNn>,
     ) -> PyResult<()> {
         require_shape(output, &[self.inner.len()], "output")?;
         require_c_contiguous(output, "output")?;
-        let config = config.map_or(RulePlannerConfig::DEFAULT, |value| value.inner);
+        let policy = policy.inner.clone();
         let mut output = try_readwrite(output, "output")?;
         let output = writable_slice(&mut output, "output")?;
-        py.detach(|| {
-            self.inner
-                .rule_planner_actions_with_config_into(config, output)
-        })
-        .map_err(game_error)
+        py.detach(move || self.inner.rule_nn_actions_into(&policy, output))
+            .map_err(rule_nn_inference_error)
     }
 
-    #[pyo3(signature = (enabled, output, config=None))]
-    fn rule_planner_actions_masked_into<'py>(
+    #[cfg(feature = "rule-nn")]
+    fn rule_nn_actions_masked_into<'py>(
         &self,
         py: Python<'py>,
         enabled: &Bound<'py, PyArray1<u8>>,
         output: &Bound<'py, PyArray1<u8>>,
-        config: Option<PyRef<'py, PyRulePlannerConfig>>,
+        policy: PyRef<'py, PyRuleNn>,
     ) -> PyResult<()> {
         require_shape(enabled, &[self.inner.len()], "enabled")?;
         require_c_contiguous(enabled, "enabled")?;
         require_shape(output, &[self.inner.len()], "output")?;
         require_c_contiguous(output, "output")?;
-        let config = config.map_or(RulePlannerConfig::DEFAULT, |value| value.inner);
+        let policy = policy.inner.clone();
         let enabled = try_readonly(enabled, "enabled")?;
         let mut output = try_readwrite(output, "output")?;
         let enabled = readonly_slice(&enabled, "enabled")?;
         let output = writable_slice(&mut output, "output")?;
-        py.detach(|| {
+        py.detach(move || {
             self.inner
-                .rule_planner_actions_masked_with_config_into(enabled, config, output)
+                .rule_nn_actions_masked_into(enabled, &policy, output)
         })
-        .map_err(game_error)
+        .map_err(rule_nn_inference_error)
     }
 
     fn hand_analysis_into<'py>(
@@ -1219,7 +1121,10 @@ fn rule_nn_model_error(error: core_engine::RuleNnError) -> PyErr {
 
 #[cfg(feature = "rule-nn")]
 fn rule_nn_inference_error(error: core_engine::RuleNnError) -> PyErr {
-    PyRuntimeError::new_err(error.to_string())
+    match error {
+        core_engine::RuleNnError::BatchInput(error) => game_error(error),
+        error => PyRuntimeError::new_err(error.to_string()),
+    }
 }
 
 fn require_shape<'py>(
@@ -1411,29 +1316,6 @@ fn config_range_error(name: &str, value: impl std::fmt::Display, range: &str) ->
     PyValueError::new_err(format!("{name} must be in {range}, got {value}"))
 }
 
-fn build_planner_config(
-    hand_changes: u8,
-    draw_horizon: u8,
-    candidate_states: u32,
-    belief_worlds: u16,
-    response_worlds: u16,
-    search_iterations: u16,
-) -> PyResult<RulePlannerConfig> {
-    RulePlannerConfig::DEFAULT
-        .with_hand_changes(hand_changes)
-        .ok_or_else(|| config_range_error("hand_changes", hand_changes, "0..=2"))?
-        .with_draw_horizon(draw_horizon)
-        .ok_or_else(|| config_range_error("draw_horizon", draw_horizon, "0..=32"))?
-        .with_candidate_states(candidate_states)
-        .ok_or_else(|| config_range_error("candidate_states", candidate_states, "1..=200000"))?
-        .with_belief_worlds(belief_worlds)
-        .ok_or_else(|| config_range_error("belief_worlds", belief_worlds, "0..=256"))?
-        .with_response_worlds(response_worlds)
-        .ok_or_else(|| config_range_error("response_worlds", response_worlds, "0..=256"))?
-        .with_search_iterations(search_iterations)
-        .ok_or_else(|| config_range_error("search_iterations", search_iterations, "0..=4096"))
-}
-
 fn python_bool(value: bool) -> &'static str {
     if value { "True" } else { "False" }
 }
@@ -1521,7 +1403,6 @@ fn bloodflow_mahjong(module: &Bound<'_, PyModule>) -> PyResult<()> {
     #[cfg(feature = "rule-nn")]
     module.add_class::<PyRuleNn>()?;
     module.add_class::<PyRuleEvConfig>()?;
-    module.add_class::<PyRulePlannerConfig>()?;
     module.add_class::<PyGame>()?;
     module.add_class::<PyBatch>()?;
     add_event_enums(module)?;

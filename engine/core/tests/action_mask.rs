@@ -395,10 +395,14 @@ fn masks_match_typed_legality_through_complete_seeded_games() {
                             .find(|&id| mask.contains(id))
                     })
                     .or_else(|| mask.iter().next()),
-                Phase::HuResponse => Some(ActionId::HU),
-                Phase::MeldResponse => [ActionId::EXPOSED_KONG, ActionId::PONG, ActionId::PASS]
-                    .into_iter()
-                    .find(|&id| mask.contains(id)),
+                Phase::HuResponse | Phase::MeldResponse => [
+                    ActionId::HU,
+                    ActionId::EXPOSED_KONG,
+                    ActionId::PONG,
+                    ActionId::PASS,
+                ]
+                .into_iter()
+                .find(|&id| mask.contains(id)),
                 Phase::Finished => None,
             }
             .expect("a live state has at least one policy action");

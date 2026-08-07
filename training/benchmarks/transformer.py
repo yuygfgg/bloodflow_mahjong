@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 
 from training import BloodFlowTransformer
+from training.model import TILE_KIND_COUNT, TILE_OBSERVATION_PLANES
 
 
 def synchronize(device: torch.device) -> None:
@@ -16,7 +17,13 @@ def synchronize(device: torch.device) -> None:
 
 
 def inputs(batch: int, history: int, device: torch.device) -> tuple[torch.Tensor, ...]:
-    tile_obs = torch.randint(0, 5, (batch, 10, 27), dtype=torch.uint8, device=device)
+    tile_obs = torch.randint(
+        0,
+        5,
+        (batch, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT),
+        dtype=torch.uint8,
+        device=device,
+    )
     melds = torch.full((batch, 4, 4, 3), 255, dtype=torch.uint8, device=device)
     meta = torch.zeros((batch, 34), dtype=torch.int32, device=device)
     meta[:, 4] = 30

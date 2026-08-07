@@ -127,6 +127,7 @@ interface ActionBarProps {
   pendingExchangeSelections: readonly ExchangeSelection[];
   pendingMissingSuit: number | null;
   hintPolicy: BotProfile;
+  nnAvailable: boolean;
   onExchangeTile: (tile: number, sourceKey: string) => void;
   onConfirmExchange: () => void;
   onPendingMissing: (suit: number | null) => void;
@@ -141,6 +142,7 @@ export function ActionBar({
   pendingExchangeSelections,
   pendingMissingSuit,
   hintPolicy,
+  nnAvailable,
   onExchangeTile,
   onConfirmExchange,
   onPendingMissing,
@@ -269,7 +271,9 @@ export function ActionBar({
             >
               <option value="rule-fast">极速规则</option>
               <option value="rule-ev">估值搜索</option>
-              <option value="rule-nn">神经网络</option>
+              <option value="rule-nn" disabled={!nnAvailable}>
+                神经网络
+              </option>
             </select>
             <button
               className="game-action icon-action"

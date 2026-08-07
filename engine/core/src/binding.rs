@@ -43,7 +43,6 @@ macro_rules! with_engine_constants {
             SHANTEN_TERMINAL = { $crate::SHANTEN_TERMINAL as i64 };
             SIMPLE_RULE_ACTION_TERMINAL = { $crate::SIMPLE_RULE_ACTION_TERMINAL as i64 };
             RULE_EV_ACTION_TERMINAL = { $crate::RULE_EV_ACTION_TERMINAL as i64 };
-            RULE_PLANNER_ACTION_TERMINAL = { $crate::RULE_PLANNER_ACTION_TERMINAL as i64 };
             TILE_OBSERVATION_WIDTH = { $crate::TILE_OBSERVATION_WIDTH as i64 };
             TILE_OBSERVATION_PLANES = { $crate::TILE_OBSERVATION_PLANES as i64 };
             MELD_OBSERVATION_WIDTH = { $crate::MELD_OBSERVATION_WIDTH as i64 };

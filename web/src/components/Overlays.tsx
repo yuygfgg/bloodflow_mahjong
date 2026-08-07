@@ -19,6 +19,11 @@ import type {
 import type { UiSnapshot } from "../../../engine/wasm/js/src/types";
 import type { GameConfig } from "../game/useGameEngine";
 import {
+  BOT_PROFILES,
+  areConfiguredBotsAvailable,
+  isBotProfileAvailable,
+} from "../game/config";
+import {
   Phase,
   SEAT_NAMES,
   WIND_LABELS,
@@ -29,7 +34,6 @@ import {
 } from "../game/domain";
 import { settlementStageLabel } from "../game/settlement";
 
-const PROFILES: BotProfile[] = ["rule-fast", "rule-ev", "rule-nn"];
 const PROFILE_LABEL: Record<BotProfile, string> = {
   "rule-fast": "极速规则",
   "rule-ev": "估值搜索",
@@ -53,6 +57,7 @@ interface StartScreenProps {
   status: "booting" | "ready" | "playing" | "error";
   busy: boolean;
   config: GameConfig;
+  nnAvailable: boolean;
   error: string | null;
   onConfig: (config: GameConfig) => void;
   onStart: () => void;
@@ -63,6 +68,7 @@ export function StartScreen({
   status,
   busy,
   config,
+  nnAvailable,
   error,
   onConfig,
   onStart,
@@ -88,6 +94,10 @@ export function StartScreen({
     botProfiles[seat] = "rule-fast";
     onConfig({ ...config, humanSeat: seat, botProfiles });
   };
+  const configuredBotsAvailable = areConfiguredBotsAvailable(
+    config,
+    nnAvailable,
+  );
   return (
     <div className="start-layer">
       <div className="start-panel" role="dialog" aria-labelledby="start-title">
@@ -144,8 +154,12 @@ export function StartScreen({
                     updateBot(seat, event.target.value as BotProfile)
                   }
                 >
-                  {PROFILES.map((profile) => (
-                    <option value={profile} key={profile}>
+                  {BOT_PROFILES.map((profile) => (
+                    <option
+                      value={profile}
+                      key={profile}
+                      disabled={!isBotProfileAvailable(profile, nnAvailable)}
+                    >
                       {PROFILE_LABEL[profile]}
                     </option>
                   ))}
@@ -157,7 +171,7 @@ export function StartScreen({
         <button
           className="menu-button start-button"
           type="button"
-          disabled={busy || status === "booting"}
+          disabled={busy || status === "booting" || !configuredBotsAvailable}
           onClick={onStart}
         >
           <Play aria-hidden="true" />

@@ -23,16 +23,7 @@ impl Game {
             Phase::Exchange => choose_exchange(self, actor, legal.exchange_mask),
             Phase::ChooseMissing => choose_missing(self, actor),
             Phase::Turn => choose_turn(self, actor, &legal),
-            Phase::HuResponse => ActionId::HU,
-            Phase::MeldResponse => {
-                if legal.can_exposed_kong {
-                    ActionId::EXPOSED_KONG
-                } else if legal.can_pong {
-                    ActionId::PONG
-                } else {
-                    ActionId::PASS
-                }
-            }
+            Phase::HuResponse | Phase::MeldResponse => choose_response(&legal),
             Phase::Finished => return None,
         };
         debug_assert!(
@@ -40,6 +31,18 @@ impl Game {
                 .is_some_and(|mask| mask.contains(action))
         );
         Some(action)
+    }
+}
+
+fn choose_response(legal: &LegalActions) -> ActionId {
+    if legal.can_hu {
+        ActionId::HU
+    } else if legal.can_exposed_kong {
+        ActionId::EXPOSED_KONG
+    } else if legal.can_pong {
+        ActionId::PONG
+    } else {
+        ActionId::PASS
     }
 }
 

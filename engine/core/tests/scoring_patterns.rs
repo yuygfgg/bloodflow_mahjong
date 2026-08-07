@@ -332,6 +332,47 @@ fn terminal_shape_family_has_exact_non_stacking_behavior() {
 }
 
 #[test]
+fn independent_structural_card_types_compete_instead_of_multiplying() {
+    let pure_all_simples = hand(&[
+        (Suit::Characters, 2, 1),
+        (Suit::Characters, 3, 2),
+        (Suit::Characters, 4, 3),
+        (Suit::Characters, 5, 4),
+        (Suit::Characters, 6, 2),
+        (Suit::Characters, 7, 1),
+        (Suit::Characters, 8, 1),
+    ]);
+    assert_score(
+        "pure all simples",
+        &pure_all_simples,
+        &[],
+        WinFlags::NONE,
+        4,
+        4,
+        &[Pattern::AllSimples, Pattern::PureOneSuit],
+    );
+
+    let all_simples_seven_pairs = hand(&[
+        (Suit::Characters, 2, 2),
+        (Suit::Characters, 3, 2),
+        (Suit::Characters, 4, 2),
+        (Suit::Bamboo, 3, 2),
+        (Suit::Bamboo, 4, 2),
+        (Suit::Dots, 6, 2),
+        (Suit::Dots, 7, 2),
+    ]);
+    assert_score(
+        "all simples seven pairs",
+        &all_simples_seven_pairs,
+        &[],
+        WinFlags::NONE,
+        4,
+        4,
+        &[Pattern::AllSimples, Pattern::SevenPairs],
+    );
+}
+
+#[test]
 fn four_exposed_groups_select_arhats_or_golden_hook_without_base_patterns() {
     let mixed_groups = [
         meld(Suit::Characters, 1, MeldKind::ExposedKong),
@@ -401,7 +442,7 @@ fn four_exposed_groups_select_arhats_or_golden_hook_without_base_patterns() {
 }
 
 #[test]
-fn each_win_event_flag_multiplies_a_plain_shape_independently() {
+fn win_event_card_types_compete_with_the_shape_multiplier() {
     let cases = [
         (
             "rob kong",
@@ -482,7 +523,7 @@ fn each_win_event_flag_multiplies_a_plain_shape_independently() {
             ..WinFlags::NONE
         },
         1,
-        4,
+        2,
         &[Pattern::Plain, Pattern::KongDraw, Pattern::LastWallTile],
     );
 }

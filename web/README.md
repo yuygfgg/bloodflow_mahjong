@@ -1,5 +1,11 @@
 # 血流麻将 Web 客户端
 
+动作栏直接使用引擎提供的 `legalActionIds`。弃牌响应处于 `HuResponse` 时，动作栏必须同时显示 legal mask 中的胡、碰、直杠和过；客户端不能自行按动作优先级过滤。引擎负责胡的全局优先级和一炮多响结算。
+
+## Bot 策略
+
+Worker 启动时会加载 `model/latest.onnx`，并使用 WASM `RuleNn` 校验 ONNX metadata 和张量契约。校验成功时，设置界面和提示策略会自动提供 `rule-nn`；校验失败时只提供 `rule-fast` 和 `rule-ev`。重新训练后只需替换 `model/latest.onnx` 并重新构建 Web 资源，不需要修改代码。
+
 ## 运行客户端
 
 ```bash

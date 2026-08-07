@@ -197,6 +197,32 @@ fn four_exposed_groups_are_scored_as_golden_hook() {
 }
 
 #[test]
+fn a_pong_and_its_fourth_copy_cannot_wait_for_a_fifth_copy() {
+    let blocked_tile = tile(Suit::Characters, 5);
+    let melds = [
+        meld(Suit::Characters, 5, MeldKind::Pong),
+        meld(Suit::Bamboo, 1, MeldKind::Pong),
+        meld(Suit::Dots, 3, MeldKind::ExposedKong),
+        meld(Suit::Dots, 7, MeldKind::ConcealedKong),
+    ];
+    let counts = hand(&[(Suit::Characters, 5, 1)]);
+
+    assert_eq!(evaluate_max_wait(&counts, &melds, None), None);
+
+    let mut impossible_completion = counts;
+    impossible_completion[blocked_tile.index()] += 1;
+    assert_eq!(
+        evaluate_win(
+            &impossible_completion,
+            &melds,
+            Some(blocked_tile),
+            WinFlags::NONE,
+        ),
+        None
+    );
+}
+
+#[test]
 fn exposed_melds_cannot_use_a_seven_pairs_substructure() {
     let melds = [meld(Suit::Characters, 1, MeldKind::Pong)];
     let counts = hand(&[

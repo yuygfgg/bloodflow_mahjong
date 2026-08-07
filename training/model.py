@@ -11,7 +11,7 @@ from torch import Tensor, nn
 
 ACTION_SPACE_SIZE = 115
 TILE_KIND_COUNT = 27
-TILE_OBSERVATION_PLANES = 10
+TILE_OBSERVATION_PLANES = 11
 PLAYER_COUNT = 4
 MELD_SLOTS = 4
 MELD_FIELDS = 3
@@ -594,7 +594,7 @@ def _validate_static_inputs(tile_obs: Tensor, melds: Tensor, meta: Tensor) -> No
         TILE_OBSERVATION_PLANES,
         TILE_KIND_COUNT,
     ):
-        raise ValueError("tile_obs must have shape [batch, 10, 27]")
+        raise ValueError("tile_obs must have shape [batch, 11, 27]")
     if melds.ndim != 4 or melds.shape[1:] != (
         PLAYER_COUNT,
         MELD_SLOTS,

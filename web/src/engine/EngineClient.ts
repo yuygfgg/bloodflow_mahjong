@@ -1,5 +1,6 @@
 import type {
   BotProfile,
+  EngineCapabilities,
   HintPolicy,
   ReplayRecord,
   WorkerRequest,
@@ -36,22 +37,26 @@ export interface ProgressResult {
 }
 
 export class EngineClient {
-  readonly ready: Promise<number>;
+  readonly ready: Promise<EngineCapabilities>;
 
   private readonly worker: Worker;
   private readonly pending = new Map<string, Pending>();
   private readonly progressListeners = new Set<
     (transition: ProgressResult) => void
   >();
+  private readonly capabilityListeners = new Set<
+    (capabilities: EngineCapabilities) => void
+  >();
+  private capabilities: EngineCapabilities | undefined;
   private nextRequest = 0;
-  private resolveReady!: (version: number) => void;
+  private resolveReady!: (capabilities: EngineCapabilities) => void;
   private rejectReady!: (error: Error) => void;
   private readyTimer: ReturnType<typeof setTimeout> | undefined;
   private disposeTimer: ReturnType<typeof setTimeout> | undefined;
   private readySettled = false;
 
   constructor() {
-    this.ready = new Promise<number>((resolve, reject) => {
+    this.ready = new Promise<EngineCapabilities>((resolve, reject) => {
       this.resolveReady = resolve;
       this.rejectReady = reject;
     });
@@ -100,6 +105,14 @@ export class EngineClient {
   ): () => void {
     this.progressListeners.add(listener);
     return () => this.progressListeners.delete(listener);
+  }
+
+  subscribeCapabilities(
+    listener: (capabilities: EngineCapabilities) => void,
+  ): () => void {
+    this.capabilityListeners.add(listener);
+    if (this.capabilities != null) listener(this.capabilities);
+    return () => this.capabilityListeners.delete(listener);
   }
 
   async newGame(
@@ -160,12 +173,24 @@ export class EngineClient {
 
   private readonly onMessage = (event: MessageEvent<WorkerResponse>): void => {
     const response = event.data;
+    if (response.type === "capabilities") {
+      this.publishCapabilities({
+        engineRulesVersion: response.engineRulesVersion,
+        nnAvailable: response.nnAvailable,
+      });
+      return;
+    }
     if (response.requestId === "boot") {
       if (response.type === "ready") {
         if (!this.readySettled) {
           this.readySettled = true;
           this.clearReadyTimer();
-          this.resolveReady(response.engineRulesVersion);
+          const capabilities = {
+            engineRulesVersion: response.engineRulesVersion,
+            nnAvailable: response.nnAvailable,
+          };
+          this.publishCapabilities(capabilities);
+          this.resolveReady(capabilities);
         }
       } else if (response.type === "error") {
         this.fail(new Error(response.message));
@@ -205,6 +230,11 @@ export class EngineClient {
       clearTimeout(this.readyTimer);
       this.readyTimer = undefined;
     }
+  }
+
+  private publishCapabilities(capabilities: EngineCapabilities): void {
+    this.capabilities = capabilities;
+    for (const listener of this.capabilityListeners) listener(capabilities);
   }
 
   private fail(error: Error): void {

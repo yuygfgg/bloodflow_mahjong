@@ -1,15 +1,36 @@
-# 训练
+# Training
 
-## 验证
+## Verify the pipeline
 
-运行 Python 测试前，先构建当前的 Python 绑定：
+Build the current Python engine binding before running the training tests:
 
 ```bash
 maturin develop --release --manifest-path engine/pybind/Cargo.toml
 python -m pytest training/tests
 ```
 
-用较小的 CPU 配置运行两个阶段：
+## Rules compatibility
+
+Engine rules version 10 uses training input schema
+`viewer-kong-forbidden-v3`. Version 7, 8, and 9 checkpoints and supervised
+Actors are not compatible with this rule set. In schema v3, tile plane 0 is the
+viewer's concealed tile count. Planes 2 through 5 expose each seat's locked
+winning tiles; the viewer's own plane also includes its stable winning base.
+Plane 10 exposes the viewer's persistent Kong-forbidden tile kinds. The engine
+keeps the stable winning base, historical winning references, and active tiles
+separate. Historical references cannot be consumed by later hand actions.
+Version 10 exposes the complete Hu/Pong/exposed-Kong/Pass choice set whenever a
+Hu candidate exists; Hu has global priority and one discard can produce
+multiple Hu results. Start a new supervised run and a new PPO run instead of
+resuming or forking an older checkpoint.
+
+Exported ONNX files must declare metadata
+`engine_rules_version=10`. The Rust loader rejects a missing, malformed, or
+different version before it accepts the model. After training, export the new
+policy and replace `model/latest.onnx` before using `rule-nn` for play or
+evaluation.
+
+Run both training stages with small CPU settings:
 
 ```bash
 python -m training.supervised \
@@ -24,21 +45,235 @@ python -m training.train \
   --output-dir /tmp/bloodflow-ppo-smoke
 ```
 
-## ONNX 导出
+`--smoke` is the only built-in finite run. A normal PPO run has no time or
+update limit.
 
-将完整的 PPO checkpoint 导出为固定的 `rule-nn` 契约：
+## Supervised warm start
+
+The supervised stage labels each current-player state with deterministic
+`RuleEvConfig.standard()` actions. Rule-EV controls all four seats. Uniform
+random legal behavior is used for 15% of actions to expand the visited state
+distribution, but Rule-EV still supplies every label. Forced decisions with
+one legal action are not stored.
+
+```bash
+python -m training.supervised \
+  --device cuda \
+  --seed 7 \
+  --labels 10000000 \
+  --output-dir runs/rule-ev-sl-seed7
+```
+
+`actor.pt` contains the shared observation encoder and policy head. It also
+records the model configuration, engine rules version, and training input
+schema. PPO initializes the value and auxiliary heads and starts with a new
+optimizer.
+
+## PPO objective
+
+PPO uses this reward by default:
+
+```text
+score_delta / 10,000 + terminal_rank_utility
+```
+
+Rank utilities for first through fourth place are `+1`, `+1/3`, `-1/3`, and
+`-1`. Configure the two terms with `--score-reward-weight` and
+`--rank-reward-weight`.
+
+`--kl-control monitor` measures the full legal-action distribution after each
+epoch and does not change optimization. `off` disables this measurement.
+`rollback` is an explicit experiment that restores the model and optimizer
+when an epoch exceeds `--target-kl`.
+
+Learning controls do not use wall-clock time. Rule-EV evaluation plateaus
+control the learning rate. Observed policy entropy controls the entropy
+coefficient. The self-play level controls the auxiliary loss scale. Elapsed
+time remains available only as throughput telemetry.
+
+## Run lifetime and persistence
+
+Training runs until the user presses `Ctrl+C`. The first `Ctrl+C` sets a stop
+request. The process completes the active rollout and PPO update, atomically
+saves `latest.pt`, appends an `interrupted` record to `metrics.jsonl`, and
+exits without a final evaluation. The checkpoint never contains a partial PPO
+update.
+
+The following intervals count completed PPO updates:
+
+- `--eval-every N` runs the internal Rule-EV gate every `N` updates. The
+  default is 10.
+- `--checkpoint-every N` replaces `latest.pt` every `N` updates. The default
+  is 10.
+- `--snapshot-every N` writes `snapshot_u<update>.pt` every `N` updates. This
+  archival snapshot interval is disabled by default.
+
+These intervals trigger work only. They do not change learning rates,
+entropy, curriculum decisions, or the stopping condition.
+
+## Rule-EV gate
+
+The internal gate always evaluates the learner against three standard Rule-EV
+players. No analysis opponent can replace this gate.
+
+Each independent seed panel contains four games. The learner occupies each
+seat once. Statistics first average the four seats in a panel, then calculate
+standard errors across panels. Periodic gate evaluations use non-overlapping
+seed panels. The controller stores the next seed and the complete rolling
+window in `latest.pt`.
+
+With the default 95% confidence multiplier, one evaluation passes only when
+both conditions are true:
+
+```text
+score lower confidence bound > +75
+rank  upper confidence bound < 2.45
+```
+
+The default rolling window contains three independent evaluations. Promotion
+also requires all of these conditions:
+
+- The latest evaluation passes its individual confidence bounds.
+- At least two of the three evaluations pass individually.
+- The pooled panel statistics from all three evaluations pass the same
+  confidence bounds.
+
+The controller therefore does not promote from one high-variance result. A
+promotion clears the evidence window before evidence for the next level is
+collected.
+
+Demotion uses separate hysteresis thresholds. The latest and pooled results
+must show `score upper confidence bound < -75` or
+`rank lower confidence bound > 2.55`, and at least two window entries must
+fail individually.
+
+## Opponent curriculum
+
+Self-play is enabled by default, but a fresh run starts with no frozen-policy
+opponents. Each non-learner seat is sampled independently with these default
+probabilities:
+
+| Level | Rule-Fast | Rule-EV | Frozen policy |
+| ---: | ---: | ---: | ---: |
+| 0 | 33.33% | 66.67% | 0% |
+| 1 | 28.33% | 56.67% | 15% |
+| 2 | 23.33% | 46.67% | 30% |
+| 3 | 18.33% | 36.67% | 45% |
+
+The frozen fraction increases by 15 percentage points after each stable gate
+promotion and is capped at 45%. The remaining rule-policy fraction always
+keeps the Rule-Fast to Rule-EV ratio at 1:2. Use `--no-self-play` to keep the
+run at level 0.
+
+A promotion creates a frozen opponent snapshot from the current learner. At
+level 3, a new stable champion refreshes the opponent snapshot without
+increasing the frozen fraction. Demotion reduces exposure but retains league
+history. Opponent snapshots are metric-driven; `--snapshot-every` does not
+control them.
+
+## Human analysis
+
+`--analysis-opponent` selects an additional deterministic report against
+`rule-fast`, `rule-ev`, or `rule-nn`. Rule-Fast and Rule-NN results are
+human-facing diagnostics only. They never control the
+gate, learning rate, entropy coefficient, self-play level, or snapshots.
+
+Rule-EV is the default analysis opponent and reuses the gate result when both
+evaluations use the same game count. A fresh run therefore does not require an
+ONNX model. Rule-NN requires `--analysis-nn-model`. The process loads the ONNX
+model once and records its path and SHA-256 digest with analysis metrics.
+
+Use `--analysis-games` to reduce the cost of a human-facing evaluation. Use
+`--analysis-every` to run it after every `N` gate evaluations. Both gate and
+analysis game counts must be positive multiples of four. Rule-NN can be
+substantially slower than Rule-EV.
+
+## Start a fresh PPO run
+
+Start from a supervised Actor. The command runs until `Ctrl+C`:
+
+```bash
+python -m training.train \
+  --device cuda \
+  --seed 7 \
+  --init-actor runs/rule-ev-sl-seed7/actor.pt \
+  --output-dir runs/ppo-metric-seed7 \
+  --eval-every 10 \
+  --checkpoint-every 10 \
+  --snapshot-every 100
+```
+
+Omit `--init-actor` to start from a random model. The default opponent mix is
+still Rule-Fast and Rule-EV, so cold-start training does not depend on
+Rule-NN.
+
+## Resume a run
+
+Resume the complete model, optimizer, RNG, rollout collector, opponent pool,
+training controller, gate evidence, and next gate seed:
+
+```bash
+python -m training.train \
+  --device cuda \
+  --resume runs/ppo-metric-seed7/latest.pt
+```
+
+The output directory is inferred from the checkpoint. Static PPO settings
+must match the checkpoint. Reporting options, including the analysis
+opponent, can change between sessions.
+
+Use `--fork CHECKPOINT --output-dir NEW_DIRECTORY` to copy complete PPO state
+into a new run. A fork can change the opponent curriculum and learning-rate
+schedule. An explicit `--learning-rate` starts a new plateau schedule: it sets
+the current optimizer rate and clears the old best-metric and plateau evidence.
+Changing the minimum rate, decay, or patience in a fork also requires an
+explicit `--learning-rate`. The fork preserves model, optimizer moments, RNG,
+entropy control, opponent state, and self-play gate evidence.
+
+Use `--stop-after-updates N` for a finite experiment. The count starts at zero
+for the current process. The run saves its final checkpoint and evaluation
+after it completes exactly `N` updates.
+
+## Add Rule-NN analysis
+
+This example runs the independent Rule-EV gate every 10 updates and reports
+256 games against the fixed ONNX policy every second gate evaluation:
+
+```bash
+python -m training.train \
+  --device cuda \
+  --resume runs/ppo-metric-seed7/latest.pt \
+  --eval-every 10 \
+  --analysis-opponent rule-nn \
+  --analysis-nn-model model/latest.onnx \
+  --analysis-games 256 \
+  --analysis-every 2
+```
+
+Replace `rule-nn` with `rule-fast` to select another human-only anchor. Do not
+provide `--analysis-nn-model` unless the selected
+opponent is `rule-nn`.
+
+## Export ONNX
+
+Export a complete PPO checkpoint to the fixed `rule-nn` contract:
 
 ```bash
 python -m training.export_onnx \
-  runs/ppo-self-play-25-from16h-seed7/latest.pt \
+  runs/ppo-metric-seed7/latest.pt \
   model/latest.onnx
 ```
 
-导出器将策略移至 CPU，并写出形状为 `[1, 115]` 的原始 Actor logits。计算图接受 `tile_obs`、`melds`、`meta`、192 条观察者视角事件和事件长度。引擎在推理后应用合法动作 mask。
+The graph accepts `tile_obs`, `melds`, `meta`, 192 observer-view event records,
+and the event length. It emits raw Actor logits with shape `[1, 115]`. The
+engine applies the current legal-action mask after inference.
 
-默认情况下，该命令检查 ONNX 计算图，并将一个确定性输入与 PyTorch 对比：报告最大和平均绝对误差，并要求 argmax 一致。checkpoint 模型必须支持至少 192 条历史事件。仅在隔离排查导出器问题时使用 `--no-check` 或 `--no-parity`。
+By default, the exporter validates the graph and compares one deterministic
+input with PyTorch. It reports maximum and mean absolute error and requires an
+identical argmax. Use `--no-check` or `--no-parity` only for isolated exporter
+diagnosis.
 
-从仓库根目录通过 Rust 加载器运行一局：
+Run one game through the Rust loader:
 
 ```bash
 cargo run --release --manifest-path engine/Cargo.toml \
@@ -48,137 +283,38 @@ cargo run --release --manifest-path engine/Cargo.toml \
   model/latest.onnx 7
 ```
 
-`rule-nn` 的平衡测评见 [`../engine/tools/rule-tournament/README.md`](../engine/tools/rule-tournament/README.md)。
+See [`../engine/tools/rule-tournament/README.md`](../engine/tools/rule-tournament/README.md)
+for balanced rule-policy tournaments.
 
-## Rule-EV 监督学习起点
+## Cross-play checkpoints
 
-监督阶段用确定性 `RuleEvConfig.standard()` 为每个当前玩家状态打标签。Rule-EV 控制全部四个座位。15% 的均匀随机合法行为动作用于扩展访问到的状态分布，但标签仍为 Rule-EV 动作。只有一个合法动作的强制决策不存储为标签。
-
-```bash
-python -m training.supervised \
-  --device cuda \
-  --labels 10000000 \
-  --output-dir runs/rule-ev-sl-pilot
-```
-
-输出 `actor.pt` 只包含共享的 observation 编码器和策略头。它记录模型配置、引擎规则版本和训练输入 schema，加载时任何不匹配都会被拒绝。PPO 的价值头和辅助头从零开始，且 PPO 不继承监督学习的优化器状态。
-
-## PPO
-
-PPO 默认使用混合奖励：
-
-```text
-score_delta / 10,000 + terminal_rank_utility
-```
-
-终局名次效用为第 1 至第 4 名分别取 `+1`、`+1/3`、`-1/3`、`-1`。平分玩家与测评使用相同的严格分数比较。分数和名次权重记录在 checkpoint 中，可用 `--score-reward-weight` 和 `--rank-reward-weight` 设置。
-
-每个 PPO epoch 将所有 rollout 状态随机分配到 minibatch。
-
-默认的 `--kl-control monitor` 在每个 epoch 后对固定的随机监控样本测量完整合法动作分布，不改变优化过程。`--kl-control off` 移除该测量。`--kl-control rollback` 是可选的分开实验：当某个 epoch 超过 `--target-kl` 时恢复模型和优化器。
-
-从监督学习 Actor 开始两小时试点：
-
-```bash
-python -m training.train \
-  --device cuda \
-  --hours 2 \
-  --init-actor runs/rule-ev-sl-pilot/actor.pt \
-  --output-dir runs/ppo-rule-ev-pilot
-```
-
-PPO 只有一个停止预算：`--hours` 决定的累计运行墙钟时间。transition 和 update 只是吞吐指标。学习率、熵和辅助调度始终使用固定的 24 小时视界，因此在两小时处停止试点再恢复，不会重启或重新缩放退火。恢复的 run 会还原累计时间和收集器种子，然后继续朝新的小时目标运行：
-
-```bash
-python -m training.train \
-  --device cuda \
-  --hours 24 \
-  --resume runs/ppo-rule-ev-pilot/latest.pt
-```
-
-每次恢复都会向 `metrics.jsonl` 追加一条显式的 `resume` 记录，标识 checkpoint 状态和新的 run 目标。进程中断后，先前 checkpoint 之后的指标可能仍留在文件中；请把 resume 记录视为新一个指标世代的开头。
-
-第一个基线保持关闭 self-play。每个非学习座位独立地以 `1/3` 概率使用 Rule-Fast、`2/3` 概率使用标准 Rule-EV。
-
-用 `--fork` 从完整 PPO checkpoint 开启 self-play，而不修改源 run。fork 会还原模型、价值头、优化器、RNG 状态、收集器状态和累计的 24 小时调度，只允许修改对手课程。以下命令将 16 小时策略继续到累计 24 小时目标：
-
-```bash
-python -m training.train \
-  --device cuda \
-  --hours 24 \
-  --fork runs/ppo-rule-ev-2h-seed7/snapshot_16h.pt \
-  --output-dir runs/ppo-self-play-25-from16h-seed7 \
-  --self-play \
-  --self-play-fraction 0.25 \
-  --historical-snapshot-probability 0.5 \
-  --opponent-refresh-updates 200 \
-  --checkpoint-every 50
-```
-
-Rule-EV 门槛通过后，每个非学习座位以 `25%` 概率使用冻结策略、`50%` 概率使用 Rule-EV、`25%` 概率使用 Rule-Fast。对手池每 200 次 PPO 更新创建一个快照，并保留四个，包括 fork 锚点。每次 rollout 以相等概率使用最新快照或保留的历史快照。定期测评仍使用三名 Rule-EV 玩家作为固定的外部锚点。
-
-从已完成的 Rule-EV 监督 Actor 启动修正后的混合试点。不要恢复失败的纯分数 PPO run：
-
-```bash
-python -m training.train \
-  --device cuda \
-  --seed 114514 \
-  --hours 0.25 \
-  --score-reward-weight 1 \
-  --rank-reward-weight 1 \
-  --kl-control monitor \
-  --init-actor runs/rule-ev-sl-10m-seed114514/actor.pt \
-  --output-dir runs/ppo-hybrid-rule-ev-pilot-seed114514
-```
-
-试点确认监督基线没有立即丢失后，从同一个监督 Actor 运行可比的十小时任务：
-
-```bash
-python -m training.train \
-  --device cuda \
-  --seed 114514 \
-  --hours 10 \
-  --score-reward-weight 1 \
-  --rank-reward-weight 1 \
-  --kl-control monitor \
-  --init-actor runs/rule-ev-sl-10m-seed114514/actor.pt \
-  --output-dir runs/ppo-hybrid-rule-ev-10h-seed114514
-```
-
-从新的输出目录运行完整基线：
-
-```bash
-python -m training.supervised \
-  --device cuda \
-  --seed 7 \
-  --labels 10000000 \
-  --output-dir runs/rule-ev-sl-10m-seed7
-
-python -m training.train \
-  --device cuda \
-  --seed 7 \
-  --hours 24 \
-  --init-actor runs/rule-ev-sl-10m-seed7/actor.pt \
-  --output-dir runs/ppo-rule-ev-24h-seed7
-```
-
-每次测评使用固定的精确 `(seed, focal seat)` 组合面板。每个种子在四个座位各出现一次，其余三名玩家使用标准 Rule-EV。已完成的排位不会被重新填充，因此短局不会被重复计数。定期测评复用同一个固定面板以测量趋势；最终测评使用新面板。
-
-要检验 PPO 快照之间是否互相变强，运行确定性交叉对战竞技场。矩阵每个单元格用行快照对阵列快照的三份拷贝，每个焦点座位均等出现：
+Use the deterministic arena to compare PPO checkpoints. Each matrix cell runs
+the row policy against three copies of the column policy with balanced focal
+seats:
 
 ```bash
 python -m training.arena \
   --device cuda \
   --games 1024 \
-  --output runs/ppo-rule-ev-2h-seed7/crossplay.json \
-  2h=runs/ppo-rule-ev-2h-seed7/snapshot_2h.pt \
-  6h=runs/ppo-rule-ev-2h-seed7/snapshot_6h.pt \
-  12h=runs/ppo-rule-ev-2h-seed7/snapshot_12h.pt \
-  16h=runs/ppo-rule-ev-2h-seed7/snapshot_16h.pt
+  --output runs/ppo-metric-seed7/crossplay.json \
+  u100=runs/ppo-metric-seed7/snapshot_u100.pt \
+  u200=runs/ppo-metric-seed7/snapshot_u200.pt
 ```
 
-竞技场把并列名次分摊到其占用的排位。它对每个四座位面板取平均后，根据独立种子计算标准误。对角线为第 2.5 名、分数为 0。若某个快照学到了总体上更强的策略，较晚的快照相对较早快照应名次更低、分数为正。下结论前请将矩阵与独立的 Rule-EV 测评对比，不要只看单个对阵。
+The arena averages tied placements and estimates standard errors from the
+four-seat seed panels. Compare cross-play with the independent Rule-EV gate;
+do not infer general strength from one matchup alone.
 
-`latest.pt` 存储完整的 PPO 模型和优化器、RNG 状态、对手状态、收集器种子、累计 PPO 时间、引擎规则版本、输入 schema 和精确的 PPO 配置。在累计 PPO 时间的 2、6、12 和 24 小时处还会写入快照。
+## Outputs
 
-终端在每个监督批次或 PPO update 后打印一行紧凑的进度摘要。`metrics.jsonl` 保留每条完整的结构化指标记录。
+- `config.json` records the static PPO and model configuration, input schema,
+  engine rules version, and command arguments.
+- `metrics.jsonl` records complete structured updates, gate evidence,
+  curriculum decisions, and optional analysis results.
+- `latest.pt` stores the complete resumable state and is replaced atomically.
+- `snapshot_u<update>.pt` is an optional archival checkpoint created by
+  `--snapshot-every`.
+
+The terminal prints one compact line after each supervised batch or PPO
+update. `ppo_elapsed_seconds` is reporting data only and never controls the
+training algorithm.

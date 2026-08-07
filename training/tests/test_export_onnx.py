@@ -7,6 +7,7 @@ import torch
 
 from training.export_onnx import (
     INPUT_NAMES,
+    MODEL_RULES_VERSION_METADATA,
     ExportResult,
     RawPolicy,
     build_parser,
@@ -38,7 +39,7 @@ def test_sample_inputs_match_fixed_rule_nn_contract() -> None:
         "events",
         "event_lengths",
     )
-    assert tile_obs.shape == (1, 10, 27) and tile_obs.dtype == torch.uint8
+    assert tile_obs.shape == (1, 11, 27) and tile_obs.dtype == torch.uint8
     assert melds.shape == (1, 4, 4, 3) and melds.dtype == torch.uint8
     assert meta.shape == (1, 34) and meta.dtype == torch.int32
     assert events.shape == (1, 192, 8) and events.dtype == torch.int32
@@ -70,6 +71,13 @@ def test_export_model_checks_graph_and_reference_parity(tmp_path: Path) -> None:
     assert result.max_absolute_error < 1e-4
     assert result.mean_absolute_error is not None
     assert result.argmax_matches
+
+    import onnx
+
+    exported = onnx.load(output, load_external_data=False)
+    assert {
+        item.key: item.value for item in exported.metadata_props
+    }[MODEL_RULES_VERSION_METADATA] == "10"
 
 
 def test_export_rejects_model_with_insufficient_history(tmp_path: Path) -> None:

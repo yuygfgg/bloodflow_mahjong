@@ -30,35 +30,56 @@ function offlineBundle(): Plugin {
       const staticFiles = await publicFiles(
         resolve(import.meta.dirname, "public"),
       );
-      const paths = [
+      const bundlePaths = Object.keys(bundle);
+      const versionPaths = [
         "",
         "index.html",
-        ...Object.keys(bundle),
+        ...bundlePaths,
         ...staticFiles,
       ].map((path) => `./${path}`);
+      const precachePaths = versionPaths.filter(
+        (path) => !path.endsWith(".onnx"),
+      );
       const version = createHash("sha256")
-        .update(paths.join("\n"))
+        .update(versionPaths.join("\n"))
         .digest("hex")
         .slice(0, 12);
       this.emitFile({
         type: "asset",
         fileName: "sw.js",
-        source: `const CACHE = "bloodflow-${version}";
-const PRECACHE = ${JSON.stringify(paths)};
+        source: `const CACHE_PREFIX = "bloodflow-";
+const CACHE = CACHE_PREFIX + "${version}";
+const PRECACHE = ${JSON.stringify(precachePaths)};
 self.addEventListener("install", (event) => {
-  event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(PRECACHE)));
-  self.skipWaiting();
+  event.waitUntil((async () => {
+    const cache = await caches.open(CACHE);
+    await cache.addAll(PRECACHE);
+    await self.skipWaiting();
+  })());
 });
 self.addEventListener("activate", (event) => {
-  event.waitUntil(caches.keys().then((keys) => Promise.all(keys.filter((key) => key !== CACHE).map((key) => caches.delete(key)))));
-  self.clients.claim();
+  event.waitUntil((async () => {
+    const keys = await caches.keys();
+    await Promise.all(keys.filter((key) => key.startsWith(CACHE_PREFIX) && key !== CACHE).map((key) => caches.delete(key)));
+    await self.clients.claim();
+  })());
 });
 self.addEventListener("fetch", (event) => {
   if (event.request.method !== "GET" || new URL(event.request.url).origin !== self.location.origin) return;
-  event.respondWith(caches.match(event.request).then((cached) => cached ?? fetch(event.request).then((response) => {
-    if (response.ok) caches.open(CACHE).then((cache) => cache.put(event.request, response.clone()));
+  event.respondWith((async () => {
+    const cache = await caches.open(CACHE);
+    const cached = await cache.match(event.request);
+    if (cached != null) return cached;
+    const response = await fetch(event.request);
+    if (response.ok) {
+      try {
+        await cache.put(event.request, response.clone());
+      } catch {
+        // A cache quota failure must not make the online request fail.
+      }
+    }
     return response;
-  })));
+  })());
 });
 `,
       });

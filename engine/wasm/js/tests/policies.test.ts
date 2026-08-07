@@ -16,7 +16,7 @@ before(async () => {
   wasm = await loadWasm();
 });
 
-test("RuleEvConfig and RulePlannerConfig validate budgets", async () => {
+test("RuleEvConfig validates its search budget", async () => {
   const standard = wasm.RuleEvConfig.standard();
   assert.equal(standard.searchDepth, 1);
   assert.equal(standard.defense, true);
@@ -25,47 +25,15 @@ test("RuleEvConfig and RulePlannerConfig validate budgets", async () => {
   assert.equal(fast.defense, true);
   await assertRejects(() => new wasm.RuleEvConfig(4, true), "search_depth");
 
-  const planner = wasm.RulePlannerConfig.defaultConfig();
-  assert.deepEqual(
-    [
-      planner.handChanges,
-      planner.drawHorizon,
-      planner.candidateStates,
-      planner.beliefWorlds,
-      planner.responseWorlds,
-      planner.searchIterations,
-    ],
-    [0, 1, 1, 64, 0, 64],
-  );
-
-  const invalid: Array<[string, () => unknown]> = [
-    ["hand_changes", () => new wasm.RulePlannerConfig(3, 1, 1, 64, 0, 64)],
-    ["draw_horizon", () => new wasm.RulePlannerConfig(0, 33, 1, 64, 0, 64)],
-    ["candidate_states", () => new wasm.RulePlannerConfig(0, 1, 0, 64, 0, 64)],
-    ["belief_worlds", () => new wasm.RulePlannerConfig(0, 1, 1, 257, 0, 64)],
-    ["response_worlds", () => new wasm.RulePlannerConfig(0, 1, 1, 64, 257, 64)],
-    ["search_iterations", () => new wasm.RulePlannerConfig(0, 1, 1, 64, 0, 4097)],
-  ];
-  for (const [name, build] of invalid) {
-    await assertRejects(build, name);
-  }
-
   standard.free();
   fast.free();
-  planner.free();
 });
 
-test("rule-ev and minimal planner actions stay legal", () => {
+test("rule-ev actions stay legal", () => {
   const game = new wasm.Game(43n);
-  const minimalPlanner = new wasm.RulePlannerConfig(0, 0, 1, 64, 0, 0);
-
-  for (const action of [
-    game.ruleEvAction(),
-    game.rulePlannerActionWithConfig(minimalPlanner),
-  ]) {
-    assert.notEqual(action, undefined);
-    assertActionLegal(game, action!);
-  }
+  const initialAction = game.ruleEvAction();
+  assert.notEqual(initialAction, undefined);
+  assertActionLegal(game, initialAction!);
 
   playUntil(game, simpleRulePolicy, {
     maxSteps: 256,
@@ -73,17 +41,11 @@ test("rule-ev and minimal planner actions stay legal", () => {
   });
 
   const fast = wasm.RuleEvConfig.fast();
-  const actions = [
-    game.ruleEvActionWithConfig(fast),
-    game.rulePlannerActionWithConfig(minimalPlanner),
-  ];
-  for (const action of actions) {
-    assert.notEqual(action, undefined);
-    assertActionLegal(game, action!);
-  }
+  const action = game.ruleEvActionWithConfig(fast);
+  assert.notEqual(action, undefined);
+  assertActionLegal(game, action!);
 
   fast.free();
-  minimalPlanner.free();
   game.free();
 });
 

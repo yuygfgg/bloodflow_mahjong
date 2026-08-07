@@ -3,10 +3,10 @@ use crate::action::{
     concealed_kong_offset, discard_offset, exchange_offset,
 };
 use crate::hand::{
-    SHANTEN_TERMINAL, ShantenAnalysis, WinEvaluation, WinFlags, analyze_shanten,
-    apply_bloodflow_win, bloodflow_evaluation_counts, evaluate_bloodflow_max_wait,
+    SHANTEN_TERMINAL, ShantenAnalysis, StableWinBaseSearchOrder, WinEvaluation, WinFlags,
+    analyze_shanten, apply_bloodflow_win, bloodflow_evaluation_counts, evaluate_bloodflow_max_wait,
     evaluate_bloodflow_win, evaluate_max_wait, evaluate_win, is_bloodflow_winning, is_winning,
-    remove_tiles_for_meld, stabilize_win_base,
+    remove_tiles_for_meld, stabilize_win_base, visit_stable_win_bases,
 };
 use crate::rng::Rng;
 use crate::types::{
@@ -20,7 +20,7 @@ const STARTING_SCORE: i64 = 10_000;
 pub(crate) const SCORE_UNIT: i64 = 100;
 /// Increment whenever engine rule semantics or deterministic initialization
 /// change in a way that can invalidate a stored action-sequence replay.
-pub const ENGINE_RULES_VERSION: u32 = 7;
+pub const ENGINE_RULES_VERSION: u32 = 10;
 pub(crate) const PARALLEL_BATCH_THRESHOLD: usize = 64;
 pub const STEP_RECORD_WIDTH: usize = 12;
 /// Number of `i32` fields in one event-stream record.
@@ -37,9 +37,9 @@ pub const WALL_SETTLEMENT_FIELDS: usize = 3;
 pub const WALL_SETTLEMENT_META_WIDTH: usize = PLAYER_COUNT * WALL_SETTLEMENT_FIELDS;
 /// Four revealed terminal concealed hands of 27 tile kinds each.
 pub const WALL_SETTLEMENT_HANDS_WIDTH: usize = PLAYER_COUNT * TILE_KIND_COUNT;
-/// Viewer-scoped tile-count planes in the ordinary observation tensor.
-pub const TILE_OBSERVATION_PLANES: usize = 10;
-/// Ten viewer-scoped tile-count channels of 27 tile kinds each.
+/// Viewer-scoped tile-count and private tile-state planes.
+pub const TILE_OBSERVATION_PLANES: usize = 11;
+/// Eleven viewer-scoped channels of 27 tile kinds each.
 pub const TILE_OBSERVATION_WIDTH: usize = TILE_OBSERVATION_PLANES * TILE_KIND_COUNT;
 /// Meld slots stored per relative seat in the ordinary observation tensor.
 pub const MELD_SLOTS: usize = 4;
@@ -56,7 +56,7 @@ pub const RIVER_OBSERVATION_WIDTH: usize = RIVER_TILE_CAPACITY * RIVER_FIELDS;
 /// Scalar state plus four relative-player feature groups.
 pub const META_OBSERVATION_WIDTH: usize = 34;
 /// Training-only perfect-information tile-count planes: four concealed hands,
-/// four locked subsets, and one unordered remaining-wall histogram.
+/// four complete locked subsets, and one unordered remaining-wall histogram.
 pub const ORACLE_TILE_COUNT_PLANES: usize = PLAYER_COUNT * 2 + 1;
 pub const ORACLE_TILE_COUNT_WIDTH: usize = ORACLE_TILE_COUNT_PLANES * TILE_KIND_COUNT;
 
@@ -102,11 +102,11 @@ impl SettlementStage {
     }
 }
 
+/// Event flags shared by the fixed-width stream schema.
+///
 /// For [`EventKind::SettlementStage`] records, the `flags` field contains one
 /// of the [`SettlementStage`] codes. Other event kinds keep their existing
 /// flag meanings.
-
-/// Event flags shared by the fixed-width stream schema.
 pub const EVENT_FLAG_REPLACEMENT_DRAW: u8 = 1 << 0;
 pub const EVENT_FLAG_LAST_WALL_TILE: u8 = 1 << 1;
 pub const EVENT_FLAG_AFTER_KONG: u8 = 1 << 2;
@@ -232,17 +232,6 @@ impl WallSettlementSummary {
     pub const fn revealed_hand(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
         &self.revealed_hands[seat.index()]
     }
-}
-
-/// Public information retained for one chronological river entry.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct PublicDiscard {
-    pub(crate) player: Seat,
-    pub(crate) tile: Tile,
-    pub(crate) after_kong: bool,
-    pub(crate) after_pong: bool,
-    pub(crate) tsumogiri: bool,
-    pub(crate) hand_revision: u8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -396,10 +385,12 @@ struct Player {
     missing: Option<Suit>,
     score: i64,
     has_drawn: bool,
+    has_discarded: bool,
     has_won: bool,
     win_count: u32,
     last_win: Option<WinSummary>,
     max_win_multiplier: u32,
+    kong_forbidden_mask: u32,
 }
 
 impl Player {
@@ -413,10 +404,12 @@ impl Player {
             missing: None,
             score: STARTING_SCORE,
             has_drawn: false,
+            has_discarded: false,
             has_won: false,
             win_count: 0,
             last_win: None,
             max_win_multiplier: 0,
+            kong_forbidden_mask: 0,
         }
     }
 
@@ -444,7 +437,10 @@ impl Player {
             return 0;
         };
         let start = suit as usize * 9;
-        self.concealed[start..start + 9].iter().copied().sum()
+        self.evaluation_counts().unwrap_or(self.concealed)[start..start + 9]
+            .iter()
+            .copied()
+            .sum()
     }
 
     fn unlocked_count(&self, tile: Tile) -> u8 {
@@ -464,7 +460,7 @@ impl Player {
     }
 
     fn win_base_target_len(&self) -> usize {
-        13 - 3 * self.meld_count as usize
+        13_usize.saturating_sub(3 * self.meld_count as usize)
     }
 
     fn stabilize_win_base(&mut self) -> bool {
@@ -477,8 +473,20 @@ impl Player {
         )
     }
 
+    fn kong_count(&self, tile: Tile) -> u8 {
+        self.unlocked_count(tile)
+            .saturating_add(self.win_base[tile.index()])
+    }
+
+    const fn is_solvent(&self) -> bool {
+        self.score > 0
+    }
+
     fn can_claim_meld(&self, tile: Tile) -> bool {
-        !self.has_won && self.meld_count < 4 && self.missing != Some(tile.suit())
+        self.is_solvent()
+            && !self.has_won
+            && self.meld_count < 4
+            && self.missing != Some(tile.suit())
     }
 
     fn can_pong(&self, tile: Tile) -> bool {
@@ -497,6 +505,7 @@ pub(crate) enum TurnOrigin {
         tile: Tile,
         after_kong: bool,
         last_wall_tile: bool,
+        deferred_kong_forbidden_tile: Option<Tile>,
     },
     AfterPong,
 }
@@ -506,8 +515,56 @@ pub(crate) enum ReactionKind {
     Discard {
         after_kong: bool,
         opening_discard: bool,
+        last_wall_tile: bool,
     },
     AddedKong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingMeldKind {
+    Pong,
+    ExposedKong,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMeld {
+    actor: Seat,
+    kind: PendingMeldKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PendingMelds {
+    pong: Option<Seat>,
+    exposed_kong: Option<Seat>,
+}
+
+impl PendingMelds {
+    const NONE: Self = Self {
+        pong: None,
+        exposed_kong: None,
+    };
+
+    fn record(&mut self, actor: Seat, kind: PendingMeldKind) {
+        let slot = match kind {
+            PendingMeldKind::Pong => &mut self.pong,
+            PendingMeldKind::ExposedKong => &mut self.exposed_kong,
+        };
+        slot.get_or_insert(actor);
+    }
+
+    fn selected(self) -> Option<PendingMeld> {
+        self.exposed_kong
+            .map(|actor| PendingMeld {
+                actor,
+                kind: PendingMeldKind::ExposedKong,
+            })
+            .or_else(|| {
+                self.pong.map(|actor| PendingMeld {
+                    actor,
+                    kind: PendingMeldKind::Pong,
+                })
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -530,21 +587,16 @@ enum Stage {
         tile: Tile,
         remaining: u8,
         winners: u8,
+        pending_melds: PendingMelds,
         kind: ReactionKind,
     },
     MeldResponse {
         source: Seat,
         tile: Tile,
         remaining: u8,
+        pending_melds: PendingMelds,
     },
     Finished,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct HiddenHandConstraint {
-    seat: Seat,
-    tile_count: usize,
-    forbidden_suit: Suit,
 }
 
 /// Authoritative environment state.
@@ -566,12 +618,11 @@ pub struct Game {
     discards: [u8; WALL_TILE_COUNT],
     discard_owners: [u8; WALL_TILE_COUNT],
     discard_flags: [u8; WALL_TILE_COUNT],
-    discard_hand_revisions: [u8; WALL_TILE_COUNT],
     discard_len: u8,
-    hand_revisions: [u8; PLAYER_COUNT],
-    // A discard remains in the river after a discard win, while the winner's
-    // recorded hand also contains that same physical tile. One entry is kept
-    // for every such hand reference so public tile counts can remove it.
+    final_wall_tile_drawn: bool,
+    earthly_hu_open: bool,
+    // Multiple winners can reference one physical discard or robbed-Kong tile.
+    // Every reference after the first is logical and must not consume inventory.
     duplicate_win_references: [u8; TILE_KIND_COUNT],
     wall_settlement: Option<WallSettlementSummary>,
     transition_draw: Option<DrawEvent>,
@@ -625,9 +676,9 @@ impl Game {
             discards: [0; WALL_TILE_COUNT],
             discard_owners: [0; WALL_TILE_COUNT],
             discard_flags: [0; WALL_TILE_COUNT],
-            discard_hand_revisions: [0; WALL_TILE_COUNT],
             discard_len: 0,
-            hand_revisions: [0; PLAYER_COUNT],
+            final_wall_tile_drawn: false,
+            earthly_hu_open: true,
             duplicate_win_references: [0; TILE_KIND_COUNT],
             wall_settlement: None,
             transition_draw: None,
@@ -681,9 +732,9 @@ impl Game {
     /// Samples a determinization from the current actor's information set.
     ///
     /// The current actor's complete visible observation is held fixed. Other
-    /// players' hidden concealed tiles, including stable winning bases, and the
-    /// live wall are sampled from one unknown pool while preserving concealed
-    /// sizes and facts implied by public missing-suit discards. During exchange,
+    /// players' hidden active concealed tiles and the live wall are sampled from
+    /// one unknown pool while preserving hand sizes and facts implied by public
+    /// missing-suit discards. During exchange,
     /// players with already selected tiles are fixed so their pending exchange
     /// remains valid.
     /// During response windows all hands are fixed because the pending
@@ -713,123 +764,10 @@ impl Game {
             Stage::Finished => return Err(GameError::InformationSetUnavailable),
         }
 
-        self.resample_hidden_information(seed, fixed_players, &[[0; TILE_KIND_COUNT]; PLAYER_COUNT])
+        self.resample_hidden_information(seed, fixed_players)
     }
 
-    /// Samples a response state conditioned only on the current actor's
-    /// observation.
-    ///
-    /// Unlike [`Game::resample_information_set`], this operation does not
-    /// preserve hidden response masks or accepted winners from the
-    /// authoritative state. It samples every other non-public tile and then
-    /// rebuilds the response window from the sampled hands. The current actor
-    /// and that actor's legal actions remain fixed.
-    pub(crate) fn resample_current_actor_response_information_set(
-        &self,
-        seed: u64,
-    ) -> Result<Self, GameError> {
-        let actor = self
-            .decision()
-            .ok_or(GameError::InformationSetUnavailable)?
-            .actor;
-        let mut minimum_concealed = [[0; TILE_KIND_COUNT]; PLAYER_COUNT];
-        if let Stage::HuResponse {
-            source,
-            tile,
-            kind: ReactionKind::AddedKong,
-            ..
-        } = self.stage
-        {
-            // The proposed fourth tile is hidden, but its existence is public
-            // and is required for `complete_added_kong` after all players pass.
-            minimum_concealed[source.index()][tile.index()] = 1;
-        }
-
-        const REJECTION_ATTEMPTS: u64 = 256;
-        const REJECTION_SEED_STRIDE: u64 = 0x9e37_79b9_7f4a_7c15;
-        for attempt in 0..REJECTION_ATTEMPTS {
-            let candidate_seed = seed.wrapping_add(attempt.wrapping_mul(REJECTION_SEED_STRIDE));
-            let mut sampled = self.resample_hidden_information(
-                candidate_seed,
-                seat_bit(actor),
-                &minimum_concealed,
-            )?;
-            if let Stage::MeldResponse { source, tile, .. } = self.stage
-                && seats_after(source)
-                    .into_iter()
-                    .any(|seat| sampled.can_player_win_with_added_tile(seat, tile))
-            {
-                // Reaching MeldResponse publicly establishes that no hand can
-                // claim Hu on the pending discard. Reject worlds which would
-                // have entered HuResponse instead.
-                continue;
-            }
-            sampled.stage = match self.stage {
-                Stage::HuResponse {
-                    source, tile, kind, ..
-                } => {
-                    let actor_offset = relative_seat(source, actor);
-                    let mut remaining = seat_bit(actor);
-                    let mut winners = 0;
-                    for seat in seats_after(source) {
-                        if seat == actor || !sampled.can_player_win_with_added_tile(seat, tile) {
-                            continue;
-                        }
-                        if relative_seat(source, seat) < actor_offset {
-                            // Earlier eligible responders have already acted. Hu
-                            // is the neutral completion model for a legal win.
-                            winners |= seat_bit(seat);
-                        } else {
-                            remaining |= seat_bit(seat);
-                        }
-                    }
-                    Stage::HuResponse {
-                        source,
-                        tile,
-                        remaining,
-                        winners,
-                        kind,
-                    }
-                }
-                Stage::MeldResponse { source, tile, .. } => {
-                    let actor_offset = relative_seat(source, actor);
-                    let mut remaining = seat_bit(actor);
-                    for seat in seats_after(source) {
-                        if seat == actor || relative_seat(source, seat) < actor_offset {
-                            continue;
-                        }
-                        let player = &sampled.players[seat.index()];
-                        if player.can_pong(tile) || player.can_exposed_kong(tile) {
-                            remaining |= seat_bit(seat);
-                        }
-                    }
-                    Stage::MeldResponse {
-                        source,
-                        tile,
-                        remaining,
-                    }
-                }
-                Stage::Exchange { .. }
-                | Stage::ChooseMissing { .. }
-                | Stage::Turn { .. }
-                | Stage::Finished => return Err(GameError::InformationSetUnavailable),
-            };
-            debug_assert_eq!(
-                sampled.decision().map(|decision| decision.actor),
-                Some(actor)
-            );
-            debug_assert_eq!(sampled.legal_action_mask(), self.legal_action_mask());
-            return Ok(sampled);
-        }
-        Err(GameError::InformationSetUnavailable)
-    }
-
-    fn resample_hidden_information(
-        &self,
-        seed: u64,
-        fixed_players: u8,
-        minimum_concealed: &[[u8; TILE_KIND_COUNT]; PLAYER_COUNT],
-    ) -> Result<Self, GameError> {
+    fn resample_hidden_information(&self, seed: u64, fixed_players: u8) -> Result<Self, GameError> {
         let mut sampled = self.clone();
 
         let mut unknown = Vec::with_capacity(self.wall_remaining() + 42);
@@ -839,17 +777,16 @@ impl Game {
                 continue;
             }
             let source = &self.players[seat.index()];
-            // A winning hand keeps historical winning-tile references in
-            // `locked`, but its stable winning base is hidden. Only the
-            // references belong to the public fixed pool.
+            // Historical winning tiles are public. The stable winning base
+            // remains hidden and is sampled with the rest of the concealed
+            // hand.
             let public_locked = if source.has_won {
                 self.public_win_tiles(seat)
             } else {
                 source.locked
             };
             let player = &mut sampled.players[seat.index()];
-            for (tile_index, &minimum) in minimum_concealed[seat.index()].iter().enumerate() {
-                let fixed = public_locked[tile_index].max(minimum);
+            for (tile_index, &fixed) in public_locked.iter().enumerate() {
                 if fixed > player.concealed[tile_index] {
                     return Err(GameError::InformationSetUnavailable);
                 }
@@ -872,128 +809,126 @@ impl Game {
         unknown.sort_unstable();
         let mut rng = Rng::new(seed);
 
-        let constraints: Vec<_> = Seat::ALL
-            .into_iter()
-            .filter(|&seat| fixed_players & seat_bit(seat) == 0)
-            .filter_map(|seat| {
-                self.known_empty_missing_suit(seat)
-                    .map(|forbidden_suit| HiddenHandConstraint {
-                        seat,
-                        tile_count: movable_counts[seat.index()],
-                        forbidden_suit,
-                    })
-            })
-            .collect();
-        let constrained_allocations =
-            sample_constrained_suit_allocations(&unknown, &constraints, &mut rng)
+        let mut remaining = [0_u8; TILE_KIND_COUNT];
+        for &tile in &unknown {
+            remaining[tile as usize] = remaining[tile as usize]
+                .checked_add(1)
                 .ok_or(GameError::InformationSetUnavailable)?;
-        let mut suit_pools: [Vec<u8>; 3] = core::array::from_fn(|_| Vec::new());
-        for tile in unknown {
-            suit_pools[usize::from(tile / 9)].push(tile);
         }
-        for pool in &mut suit_pools {
-            rng.shuffle(pool);
+        let hidden_winners = Seat::ALL
+            .into_iter()
+            .filter(|&seat| {
+                fixed_players & seat_bit(seat) == 0 && self.players[seat.index()].has_won
+            })
+            .collect::<Vec<_>>();
+        let mut sampled_bases = [[0_u8; TILE_KIND_COUNT]; PLAYER_COUNT];
+        if !self.assign_hidden_win_bases(
+            &hidden_winners,
+            0,
+            &mut remaining,
+            &mut sampled_bases,
+            &mut rng,
+        ) {
+            return Err(GameError::InformationSetUnavailable);
         }
 
-        let mut constrained_players = 0_u8;
-        for (constraint, allocation) in constraints.iter().zip(constrained_allocations) {
-            constrained_players |= seat_bit(constraint.seat);
-            let player = &mut sampled.players[constraint.seat.index()];
-            for (suit, count) in allocation.into_iter().enumerate() {
-                for _ in 0..count {
-                    let tile = suit_pools[suit]
-                        .pop()
-                        .expect("a sampled suit allocation fits the unknown pool");
-                    player.concealed[tile as usize] += 1;
-                }
+        for &seat in &hidden_winners {
+            let base = sampled_bases[seat.index()];
+            let player = &mut sampled.players[seat.index()];
+            player.win_base = base;
+            for (index, &count) in base.iter().enumerate() {
+                player.concealed[index] = player.concealed[index]
+                    .checked_add(count)
+                    .ok_or(GameError::InformationSetUnavailable)?;
+                player.locked[index] = player.locked[index]
+                    .checked_add(count)
+                    .ok_or(GameError::InformationSetUnavailable)?;
             }
         }
 
-        let mut remaining: Vec<_> = suit_pools.into_iter().flatten().collect();
-        rng.shuffle(&mut remaining);
+        unknown.clear();
+        for (index, &count) in remaining.iter().enumerate() {
+            unknown.extend(core::iter::repeat_n(index as u8, count as usize));
+        }
+        rng.shuffle(&mut unknown);
         let mut cursor = 0;
         for seat in Seat::ALL {
-            if constrained_players & seat_bit(seat) != 0 {
+            if fixed_players & seat_bit(seat) != 0 {
                 continue;
             }
-            for _ in 0..movable_counts[seat.index()] {
-                let tile = remaining[cursor] as usize;
-                sampled.players[seat.index()].concealed[tile] += 1;
+            let reserved = if self.players[seat.index()].has_won {
+                self.players[seat.index()].win_base_target_len()
+            } else {
+                0
+            };
+            let remaining_movable = movable_counts[seat.index()]
+                .checked_sub(reserved)
+                .ok_or(GameError::InformationSetUnavailable)?;
+            for _ in 0..remaining_movable {
+                let Some(&tile) = unknown.get(cursor) else {
+                    return Err(GameError::InformationSetUnavailable);
+                };
+                sampled.players[seat.index()].concealed[tile as usize] += 1;
                 cursor += 1;
             }
         }
         let wall_len = self.wall_remaining();
-        sampled.wall[self.wall_head as usize..self.wall_tail as usize]
-            .copy_from_slice(&remaining[cursor..cursor + wall_len]);
-        debug_assert_eq!(cursor + wall_len, remaining.len());
-
-        // `win_base` is an opaque hidden subset, not necessarily a ready hand:
-        // a post-win Kong can consume a base tile and stabilization can replace
-        // it with any active tile. Sample the subset only after the full hand
-        // has been allocated, so multiple winners cannot compete for tiles a
-        // second time and the source world's hidden base cannot affect output.
-        for seat in Seat::ALL {
-            if fixed_players & seat_bit(seat) != 0 || !self.players[seat.index()].has_won {
-                continue;
-            }
-            let public_locked = self.public_win_tiles(seat);
-            let base_len = self.players[seat.index()].win_base_target_len();
-            let player = &mut sampled.players[seat.index()];
-            let mut hidden = Vec::with_capacity(movable_counts[seat.index()]);
-            for (index, (&concealed, &public)) in player
-                .concealed
-                .iter()
-                .zip(public_locked.iter())
-                .enumerate()
-            {
-                let count = concealed
-                    .checked_sub(public)
-                    .ok_or(GameError::InformationSetUnavailable)?;
-                hidden.extend(core::iter::repeat_n(index as u8, count as usize));
-            }
-            if hidden.len() < base_len {
-                return Err(GameError::InformationSetUnavailable);
-            }
-            rng.shuffle(&mut hidden);
-            player.win_base = [0; TILE_KIND_COUNT];
-            for tile in hidden.into_iter().take(base_len) {
-                player.win_base[tile as usize] += 1;
-            }
-            for ((locked, public), base) in player
-                .locked
-                .iter_mut()
-                .zip(public_locked)
-                .zip(player.win_base)
-            {
-                *locked = public
-                    .checked_add(base)
-                    .ok_or(GameError::InformationSetUnavailable)?;
-            }
+        let Some(wall_end) = cursor.checked_add(wall_len) else {
+            return Err(GameError::InformationSetUnavailable);
+        };
+        if wall_end != unknown.len() {
+            return Err(GameError::InformationSetUnavailable);
         }
+        sampled.wall[self.wall_head as usize..self.wall_tail as usize]
+            .copy_from_slice(&unknown[cursor..wall_end]);
+
         Ok(sampled)
     }
 
-    fn known_empty_missing_suit(&self, seat: Seat) -> Option<Suit> {
+    fn assign_hidden_win_bases(
+        &self,
+        seats: &[Seat],
+        position: usize,
+        remaining: &mut [u8; TILE_KIND_COUNT],
+        sampled_bases: &mut [[u8; TILE_KIND_COUNT]; PLAYER_COUNT],
+        rng: &mut Rng,
+    ) -> bool {
+        let Some(&seat) = seats.get(position) else {
+            return true;
+        };
         let player = &self.players[seat.index()];
-        let missing = player.missing?;
-        let pending_added_kong_source = matches!(
-            self.stage,
-            Stage::HuResponse {
-                source,
-                kind: ReactionKind::AddedKong,
-                ..
-            } if source == seat
-        );
-        if pending_added_kong_source {
-            return None;
+        if player.win_base_target_len() > remaining.iter().map(|&count| count as usize).sum() {
+            return false;
         }
-        (0..self.discard_len as usize)
-            .rev()
-            .find(|&index| self.discard_owners[index] == seat.as_u8())
-            .and_then(|index| {
-                let tile = Tile::new(self.discards[index]).expect("stored tile is valid");
-                (tile.suit() != missing).then_some(missing)
-            })
+        let (melds, meld_count) = player.meld_buffer();
+        let public_wins = self.public_win_tiles(seat);
+        let order = StableWinBaseSearchOrder::shuffled(rng);
+        let available = *remaining;
+
+        visit_stable_win_bases(
+            &available,
+            &melds[..meld_count],
+            player.missing,
+            &public_wins,
+            &order,
+            &mut |base| {
+                for index in 0..TILE_KIND_COUNT {
+                    remaining[index] -= base[index];
+                }
+                sampled_bases[seat.index()] = base;
+
+                if self.assign_hidden_win_bases(seats, position + 1, remaining, sampled_bases, rng)
+                {
+                    return true;
+                }
+
+                for index in 0..TILE_KIND_COUNT {
+                    remaining[index] += base[index];
+                }
+                sampled_bases[seat.index()] = [0; TILE_KIND_COUNT];
+                false
+            },
+        )
     }
 
     /// Clones the state and independently shuffles only the unseen live wall.
@@ -1039,41 +974,19 @@ impl Game {
                 suit,
             } => legal.exchange_mask = self.legal_exchange_mask(actor, selected, suit),
             Stage::ChooseMissing { .. } => legal.can_choose_missing = true,
-            Stage::Turn {
-                actor,
-                origin,
-                can_hu,
-            } => {
-                let player = &self.players[actor.index()];
+            Stage::Turn { actor, can_hu, .. } => {
                 legal.can_hu = can_hu;
                 legal.discard_mask = self.legal_discard_mask(actor);
-                // After a player has won, concealed kongs are no longer legal.
-                // An existing pong can still use any matching tile in the hand;
-                // that tile need not be the current turn's draw.
-                if !player.has_won && player.meld_count < 4 && origin != TurnOrigin::AfterPong {
-                    for index in 0..TILE_KIND_COUNT {
-                        let tile = Tile::from_index_unchecked(index as u8);
-                        if player.missing == Some(tile.suit()) {
-                            continue;
-                        }
-                        if player.concealed[index] >= 4 {
-                            legal.concealed_kong_mask |= 1 << index;
-                        }
-                    }
-                }
-                if origin != TurnOrigin::AfterPong {
-                    for meld in player.melds.iter().flatten() {
-                        if meld.kind == MeldKind::Pong
-                            && player.concealed[meld.tile.index()] > 0
-                            && player.missing != Some(meld.tile.suit())
-                        {
-                            legal.added_kong_mask |= 1 << meld.tile.index();
-                        }
-                    }
-                }
+                (legal.concealed_kong_mask, legal.added_kong_mask) =
+                    self.self_declared_kong_masks(actor);
             }
-            Stage::HuResponse { .. } => {
-                legal.can_hu = true;
+            Stage::HuResponse { tile, kind, .. } => {
+                let player = &self.players[decision.actor.index()];
+                legal.can_hu = self.can_player_win_with_added_tile(decision.actor, tile);
+                if matches!(kind, ReactionKind::Discard { .. }) {
+                    legal.can_pong = player.can_pong(tile);
+                    legal.can_exposed_kong = player.can_exposed_kong(tile);
+                }
                 legal.can_pass = true;
             }
             Stage::MeldResponse { tile, .. } => {
@@ -1166,18 +1079,13 @@ impl Game {
                 origin,
                 can_hu,
             } => self.step_turn(actor, origin, can_hu, action),
-            Stage::HuResponse {
-                source,
-                tile,
-                remaining,
-                winners,
-                kind,
-            } => self.step_hu_response(source, tile, remaining, winners, kind, action),
+            Stage::HuResponse { .. } => self.step_hu_response(action),
             Stage::MeldResponse {
                 source,
                 tile,
                 remaining,
-            } => self.step_meld_response(source, tile, remaining, action),
+                pending_melds,
+            } => self.step_meld_response(source, tile, remaining, pending_melds, action),
             Stage::Finished => Err(GameError::Finished),
         }?;
         if self.phase() == Phase::Finished {
@@ -1238,17 +1146,6 @@ impl Game {
 
     pub fn wall_remaining(&self) -> usize {
         self.wall_tail.saturating_sub(self.wall_head) as usize
-    }
-
-    /// Returns one head-wall tile from an authoritative sampled world.
-    ///
-    /// This crate-private accessor is for information-set projections. Public
-    /// policies must not inspect it on the authoritative game.
-    pub(crate) fn live_wall_tile(&self, offset: usize) -> Option<Tile> {
-        let index = self.wall_head as usize + offset;
-        (index < self.wall_tail as usize)
-            .then(|| Tile::new(self.wall[index]))
-            .flatten()
     }
 
     pub fn current_draw(&self) -> Option<DrawEvent> {
@@ -1443,12 +1340,10 @@ impl Game {
         &self.players[seat.index()].locked
     }
 
-    /// Returns the tiles publicly associated with this player's completed wins.
+    /// Returns the winning tiles accumulated by this player.
     ///
-    /// The stable winning base remains concealed. Only the winning-tile
-    /// references accumulated by completed wins are public. Meld transformations
-    /// preserve this relationship because they consume active tiles, historical
-    /// references, and base tiles in that order.
+    /// The stable continuation base remains concealed. Only the separated
+    /// winning-tile references are public.
     pub fn public_win_tiles(&self, seat: Seat) -> [u8; TILE_KIND_COUNT] {
         let player = &self.players[seat.index()];
         core::array::from_fn(|index| {
@@ -1458,11 +1353,10 @@ impl Game {
         })
     }
 
-    /// Returns the stable winning base for a seat.
+    /// Returns the hidden stable continuation base from authoritative state.
     ///
-    /// The browser uses this only for the viewer's own seat. Opponent bases
-    /// remain hidden; their public winning references are exposed through
-    /// `public_win_tiles` and the ordinary observation.
+    /// This is perfect information. Policy code must use viewer-scoped
+    /// observations instead of reading this value.
     pub fn win_base(&self, seat: Seat) -> &[u8; TILE_KIND_COUNT] {
         &self.players[seat.index()].win_base
     }
@@ -1576,17 +1470,13 @@ impl Game {
     pub fn hand_analysis(&self, seat: Seat) -> ShantenAnalysis {
         let player = &self.players[seat.index()];
         let (melds, len) = player.meld_buffer();
-        if player.has_won {
-            player.evaluation_counts().map_or(
-                ShantenAnalysis {
-                    shanten: SHANTEN_TERMINAL,
-                    improving_tiles: 0,
-                },
-                |counts| analyze_shanten(&counts, &melds[..len], player.missing),
-            )
-        } else {
-            analyze_shanten(&player.concealed, &melds[..len], player.missing)
-        }
+        player.evaluation_counts().map_or(
+            ShantenAnalysis {
+                shanten: SHANTEN_TERMINAL,
+                improving_tiles: 0,
+            },
+            |counts| analyze_shanten(&counts, &melds[..len], player.missing),
+        )
     }
 
     pub fn discards(&self) -> impl Iterator<Item = (Seat, Tile)> + '_ {
@@ -1596,24 +1486,6 @@ impl Game {
                 Tile::new(self.discards[index]).expect("stored tile is valid"),
             )
         })
-    }
-
-    pub(crate) fn public_discards(&self) -> impl Iterator<Item = PublicDiscard> + '_ {
-        (0..self.discard_len as usize).map(|index| {
-            let flags = self.discard_flags[index];
-            PublicDiscard {
-                player: Seat::new(self.discard_owners[index]).expect("stored seat is valid"),
-                tile: Tile::new(self.discards[index]).expect("stored tile is valid"),
-                after_kong: flags & EVENT_FLAG_AFTER_KONG != 0,
-                after_pong: flags & EVENT_FLAG_AFTER_PONG != 0,
-                tsumogiri: flags & EVENT_FLAG_TSUMOGIRI != 0,
-                hand_revision: self.discard_hand_revisions[index],
-            }
-        })
-    }
-
-    pub(crate) const fn public_hand_revision(&self, player: Seat) -> u8 {
-        self.hand_revisions[player.index()]
     }
 
     /// Counts tiles known to `viewer` from private and public information.
@@ -1735,6 +1607,26 @@ impl Game {
             let offset = (6 + relative) * TILE_KIND_COUNT + tile;
             tile_obs[offset] = tile_obs[offset].saturating_add(1);
         }
+        let mut kong_forbidden_mask = self.players[viewer.index()].kong_forbidden_mask;
+        if let Stage::Turn {
+            actor,
+            origin:
+                TurnOrigin::Draw {
+                    deferred_kong_forbidden_tile: Some(tile),
+                    ..
+                },
+            ..
+        } = self.stage
+            && actor == viewer
+        {
+            kong_forbidden_mask |= 1 << tile.index();
+        }
+        let kong_forbidden_start = 10 * TILE_KIND_COUNT;
+        for index in 0..TILE_KIND_COUNT {
+            if kong_forbidden_mask & (1 << index) != 0 {
+                tile_obs[kong_forbidden_start + index] = 1;
+            }
+        }
 
         melds.fill(u8::MAX);
         for relative in 0..PLAYER_COUNT {
@@ -1781,9 +1673,14 @@ impl Game {
                     ReactionKind::Discard {
                         after_kong,
                         opening_discard,
+                        last_wall_tile,
                     },
                 ..
-            } => i32::from(u8::from(after_kong)) << 1 | i32::from(u8::from(opening_discard)) << 2,
+            } => {
+                i32::from(u8::from(after_kong)) << 1
+                    | i32::from(u8::from(opening_discard)) << 2
+                    | i32::from(u8::from(last_wall_tile)) << 3
+            }
             _ => 0,
         };
         meta[0] = i32::from(self.phase().code());
@@ -1838,8 +1735,9 @@ impl Game {
 
     /// Writes perfect-information tile counts for Critic training only.
     ///
-    /// Planes `0..4` are concealed hands, `4..8` are their locked subsets,
-    /// and plane `8` is an unordered histogram of the live wall.
+    /// Planes `0..4` are concealed hands. Planes `4..8` are their complete
+    /// locked subsets, including the stable winning base and historical
+    /// winning-tile references. Plane `8` is an unordered live-wall histogram.
     pub fn oracle_tile_counts_into(&self, output: &mut [u8]) -> Result<(), GameError> {
         if output.len() != ORACLE_TILE_COUNT_WIDTH {
             return Err(GameError::BatchLength);
@@ -1996,41 +1894,51 @@ impl Game {
         can_hu: bool,
         action: Action,
     ) -> Result<(), GameError> {
+        if let TurnOrigin::Draw {
+            deferred_kong_forbidden_tile: Some(tile),
+            ..
+        } = origin
+        {
+            self.players[actor.index()].kong_forbidden_mask |= 1 << tile.index();
+        }
         match action {
             Action::Hu if can_hu => self.resolve_self_draw(actor, origin),
-            Action::Discard(tile) if self.legal_discard_mask(actor) & (1 << tile.index()) != 0 => {
-                self.discard(actor, tile, origin)
-            }
-            Action::ConcealedKong(tile)
-                if self
-                    .legal_actions()
-                    .is_some_and(|legal| legal.concealed_kong_mask & (1 << tile.index()) != 0) =>
-            {
-                self.concealed_kong(actor, tile)
-            }
-            Action::AddedKong(tile)
-                if self
-                    .legal_actions()
-                    .is_some_and(|legal| legal.added_kong_mask & (1 << tile.index()) != 0) =>
-            {
-                self.propose_added_kong(actor, tile)
-            }
+            Action::Discard(tile) => self.discard(actor, tile, origin),
+            Action::ConcealedKong(tile) => self.concealed_kong(actor, tile),
+            Action::AddedKong(tile) => self.propose_added_kong(actor, tile),
             _ => Err(GameError::InvalidAction),
         }
     }
 
-    fn step_hu_response(
-        &mut self,
-        source: Seat,
-        tile: Tile,
-        mut remaining: u8,
-        mut winners: u8,
-        kind: ReactionKind,
-        action: Action,
-    ) -> Result<(), GameError> {
+    fn step_hu_response(&mut self, action: Action) -> Result<(), GameError> {
+        let Stage::HuResponse {
+            source,
+            tile,
+            mut remaining,
+            mut winners,
+            mut pending_melds,
+            kind,
+        } = self.stage
+        else {
+            unreachable!("Hu response dispatch requires a HuResponse stage");
+        };
         let actor = first_seat_in_mask(source, remaining).ok_or(GameError::InvalidAction)?;
         match action {
-            Action::Hu => winners |= seat_bit(actor),
+            Action::Hu if self.can_player_win_with_added_tile(actor, tile) => {
+                winners |= seat_bit(actor);
+            }
+            Action::Pong
+                if matches!(kind, ReactionKind::Discard { .. })
+                    && self.players[actor.index()].can_pong(tile) =>
+            {
+                pending_melds.record(actor, PendingMeldKind::Pong);
+            }
+            Action::ExposedKong
+                if matches!(kind, ReactionKind::Discard { .. })
+                    && self.players[actor.index()].can_exposed_kong(tile) =>
+            {
+                pending_melds.record(actor, PendingMeldKind::ExposedKong);
+            }
             Action::Pass => {}
             _ => return Err(GameError::InvalidAction),
         }
@@ -2041,6 +1949,7 @@ impl Game {
                 tile,
                 remaining,
                 winners,
+                pending_melds,
                 kind,
             };
             return Ok(());
@@ -2048,9 +1957,15 @@ impl Game {
 
         if winners != 0 {
             self.resolve_discard_wins(source, tile, winners, kind);
+        } else if let Some(claim) = pending_melds.selected() {
+            debug_assert!(matches!(kind, ReactionKind::Discard { .. }));
+            return match claim.kind {
+                PendingMeldKind::Pong => self.pong(claim.actor, source, tile),
+                PendingMeldKind::ExposedKong => self.exposed_kong(claim.actor, source, tile),
+            };
         } else {
             match kind {
-                ReactionKind::Discard { .. } => self.begin_meld_responses(source, tile),
+                ReactionKind::Discard { .. } => self.begin_next_normal_turn(source.next()),
                 ReactionKind::AddedKong => self.complete_added_kong(source, tile),
             }
         }
@@ -2062,6 +1977,7 @@ impl Game {
         source: Seat,
         tile: Tile,
         mut remaining: u8,
+        mut pending_melds: PendingMelds,
         action: Action,
     ) -> Result<(), GameError> {
         let actor = first_seat_in_mask(source, remaining).ok_or(GameError::InvalidAction)?;
@@ -2069,47 +1985,98 @@ impl Game {
         let can_pong = player.can_pong(tile);
         let can_kong = player.can_exposed_kong(tile);
         match action {
-            Action::Pong if can_pong => return self.pong(actor, source, tile),
-            Action::ExposedKong if can_kong => return self.exposed_kong(actor, source, tile),
+            Action::Pong if can_pong => pending_melds.record(actor, PendingMeldKind::Pong),
+            Action::ExposedKong if can_kong => {
+                pending_melds.record(actor, PendingMeldKind::ExposedKong);
+            }
             Action::Pass => {}
             _ => return Err(GameError::InvalidAction),
         }
         remaining &= !seat_bit(actor);
         if remaining == 0 {
-            self.begin_normal_turn(source.next());
+            if let Some(claim) = pending_melds.selected() {
+                return match claim.kind {
+                    PendingMeldKind::Pong => self.pong(claim.actor, source, tile),
+                    PendingMeldKind::ExposedKong => self.exposed_kong(claim.actor, source, tile),
+                };
+            }
+            self.begin_next_normal_turn(source.next());
         } else {
             self.stage = Stage::MeldResponse {
                 source,
                 tile,
                 remaining,
+                pending_melds,
             };
         }
         Ok(())
     }
 
+    fn self_declared_kong_masks(&self, actor: Seat) -> (u32, u32) {
+        let player = &self.players[actor.index()];
+        let mut concealed = 0_u32;
+        let mut added = 0_u32;
+
+        // Self-declared Kongs use active tiles plus the stable base. Historical
+        // winning-tile references never participate in a later Kong.
+        if player.meld_count < 4 {
+            for index in 0..TILE_KIND_COUNT {
+                let tile = Tile::from_index_unchecked(index as u8);
+                if player.missing == Some(tile.suit())
+                    || player.kong_forbidden_mask & (1 << index) != 0
+                {
+                    continue;
+                }
+                if player.kong_count(tile) >= 4 {
+                    concealed |= 1 << index;
+                }
+            }
+        }
+        for meld in player.melds.iter().flatten() {
+            if meld.kind == MeldKind::Pong
+                && player.kong_count(meld.tile) > 0
+                && player.missing != Some(meld.tile.suit())
+                && player.kong_forbidden_mask & (1 << meld.tile.index()) == 0
+            {
+                added |= 1 << meld.tile.index();
+            }
+        }
+        (concealed, added)
+    }
+
     fn legal_discard_mask(&self, actor: Seat) -> u32 {
         let player = &self.players[actor.index()];
+        if player.has_won {
+            let Stage::Turn {
+                actor: turn_actor,
+                origin: TurnOrigin::Draw { tile, .. },
+                ..
+            } = self.stage
+            else {
+                return 0;
+            };
+            return if turn_actor == actor && player.unlocked_count(tile) != 0 {
+                1 << tile.index()
+            } else {
+                0
+            };
+        }
+
         let mut unlocked = 0_u32;
         for index in 0..TILE_KIND_COUNT {
             if player.concealed[index] > player.locked[index] {
                 unlocked |= 1 << index;
             }
         }
-        // The missing suit is a public marker, not a discard lock. Players
-        // may discard any unlocked tile; the engine still uses the marker
-        // for win and meld legality and for settlement checks.
         unlocked
     }
 
     fn discard(&mut self, actor: Seat, tile: Tile, origin: TurnOrigin) -> Result<(), GameError> {
         self.players[actor.index()].concealed[tile.index()] -= 1;
+        self.players[actor.index()].has_discarded = true;
         if self.players[actor.index()].has_won {
-            let previous_base = self.players[actor.index()].win_base;
             let stabilized = self.players[actor.index()].stabilize_win_base();
             debug_assert!(stabilized, "a post-Kong discard must restore the win base");
-            if self.players[actor.index()].win_base != previous_base {
-                self.mark_public_hand_change(actor);
-            }
         }
         let after_kong = matches!(
             origin,
@@ -2118,14 +2085,19 @@ impl Game {
                 ..
             }
         );
+        let last_wall_tile = self.final_wall_tile_drawn;
         let tsumogiri = matches!(origin, TurnOrigin::Draw { tile: drawn, .. } if drawn == tile);
-        let opening_discard = actor == self.dealer && self.discard_len == 0;
+        let opening_discard =
+            actor == self.dealer && origin == TurnOrigin::Initial && self.discard_len == 0;
         let mut discard_flags = 0;
         if after_kong {
             discard_flags |= EVENT_FLAG_AFTER_KONG;
         }
         if opening_discard {
             discard_flags |= EVENT_FLAG_OPENING_DISCARD;
+        }
+        if last_wall_tile {
+            discard_flags |= EVENT_FLAG_LAST_WALL_TILE;
         }
         if tsumogiri {
             discard_flags |= EVENT_FLAG_TSUMOGIRI;
@@ -2138,7 +2110,6 @@ impl Game {
         self.discards[discard_index] = tile.as_u8();
         self.discard_owners[discard_index] = actor.as_u8();
         self.discard_flags[discard_index] = discard_flags;
-        self.discard_hand_revisions[discard_index] = self.hand_revisions[actor.index()];
         self.discard_len += 1;
         self.transition_discard = Some(DiscardEvent {
             player: actor,
@@ -2155,21 +2126,41 @@ impl Game {
             ALL_PLAYER_MASK,
             ALL_PLAYER_MASK,
         );
-        let mut candidates = 0_u8;
+        let mut hu_candidates = 0_u8;
+        let mut response_candidates = 0_u8;
         for seat in Seat::ALL {
-            if seat != actor && self.can_player_win_with_added_tile(seat, tile) {
-                candidates |= seat_bit(seat);
+            if seat == actor {
+                continue;
+            }
+            if self.players[seat.index()].can_exposed_kong(tile) {
+                self.players[seat.index()].kong_forbidden_mask |= 1 << tile.index();
+            }
+            if self.can_player_win_with_added_tile(seat, tile) {
+                hu_candidates |= seat_bit(seat);
+            }
+            if self.can_respond_to_reaction(
+                seat,
+                tile,
+                ReactionKind::Discard {
+                    after_kong,
+                    opening_discard,
+                    last_wall_tile,
+                },
+            ) {
+                response_candidates |= seat_bit(seat);
             }
         }
-        if candidates != 0 {
+        if hu_candidates != 0 {
             self.stage = Stage::HuResponse {
                 source: actor,
                 tile,
-                remaining: candidates,
+                remaining: response_candidates,
                 winners: 0,
+                pending_melds: PendingMelds::NONE,
                 kind: ReactionKind::Discard {
                     after_kong,
                     opening_discard,
+                    last_wall_tile,
                 },
             };
         } else {
@@ -2190,17 +2181,19 @@ impl Game {
             }
         }
         if candidates == 0 {
-            self.begin_normal_turn(source.next());
+            self.begin_next_normal_turn(source.next());
         } else {
             self.stage = Stage::MeldResponse {
                 source,
                 tile,
                 remaining: candidates,
+                pending_melds: PendingMelds::NONE,
             };
         }
     }
 
     fn pong(&mut self, actor: Seat, source: Seat, tile: Tile) -> Result<(), GameError> {
+        self.earthly_hu_open = false;
         self.remove_for_meld(actor, tile, 2, false);
         let added = self.players[actor.index()].add_meld(Meld {
             tile,
@@ -2208,7 +2201,6 @@ impl Game {
             source,
         });
         debug_assert!(added);
-        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -2229,6 +2221,7 @@ impl Game {
     }
 
     fn exposed_kong(&mut self, actor: Seat, source: Seat, tile: Tile) -> Result<(), GameError> {
+        self.earthly_hu_open = false;
         self.remove_for_meld(actor, tile, 3, false);
         let added = self.players[actor.index()].add_meld(Meld {
             tile,
@@ -2236,7 +2229,6 @@ impl Game {
             source,
         });
         debug_assert!(added);
-        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -2248,8 +2240,8 @@ impl Game {
             ALL_PLAYER_MASK,
             ALL_PLAYER_MASK,
         );
-        self.transfer(source, actor, SCORE_UNIT);
-        if self.finish_if_three_zero() {
+        self.transfer(source, actor, SCORE_UNIT * 3);
+        if self.finish_if_one_solvent() {
             return Ok(());
         }
         self.begin_supplement_turn(actor);
@@ -2257,6 +2249,7 @@ impl Game {
     }
 
     fn concealed_kong(&mut self, actor: Seat, tile: Tile) -> Result<(), GameError> {
+        self.earthly_hu_open = false;
         self.remove_for_meld(actor, tile, 4, true);
         let added = self.players[actor.index()].add_meld(Meld {
             tile,
@@ -2264,7 +2257,6 @@ impl Game {
             source: actor,
         });
         debug_assert!(added);
-        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -2279,7 +2271,7 @@ impl Game {
         for payer in seats_after(actor) {
             self.transfer(payer, actor, SCORE_UNIT * 2);
         }
-        if self.finish_if_three_zero() {
+        if self.finish_if_one_solvent() {
             return Ok(());
         }
         self.begin_supplement_turn(actor);
@@ -2287,6 +2279,7 @@ impl Game {
     }
 
     fn propose_added_kong(&mut self, actor: Seat, tile: Tile) -> Result<(), GameError> {
+        self.earthly_hu_open = false;
         let mut candidates = 0_u8;
         for seat in Seat::ALL {
             if seat != actor && self.can_player_win_with_added_tile(seat, tile) {
@@ -2301,6 +2294,7 @@ impl Game {
                 tile,
                 remaining: candidates,
                 winners: 0,
+                pending_melds: PendingMelds::NONE,
                 kind: ReactionKind::AddedKong,
             };
         }
@@ -2316,7 +2310,6 @@ impl Game {
             .find(|meld| meld.kind == MeldKind::Pong && meld.tile == tile)
             .expect("legal added kong has matching pong");
         meld.kind = MeldKind::AddedKong;
-        self.mark_public_hand_change(actor);
         self.push_event(
             EventKind::Meld,
             Some(actor),
@@ -2331,24 +2324,23 @@ impl Game {
         for payer in seats_after(actor) {
             self.transfer(payer, actor, SCORE_UNIT);
         }
-        if !self.finish_if_three_zero() {
+        if !self.finish_if_one_solvent() {
             self.begin_supplement_turn(actor);
         }
     }
 
     fn resolve_self_draw(&mut self, actor: Seat, origin: TurnOrigin) -> Result<(), GameError> {
-        let (required, flags) = match origin {
-            TurnOrigin::Initial => (
-                None,
-                WinFlags {
-                    heavenly: true,
-                    ..WinFlags::NONE
-                },
-            ),
+        let opening_self_draw = {
+            let player = &self.players[actor.index()];
+            !player.has_discarded && !player.has_won
+        };
+        let (required, mut flags) = match origin {
+            TurnOrigin::Initial => (None, WinFlags::NONE),
             TurnOrigin::Draw {
                 tile,
                 after_kong,
                 last_wall_tile,
+                ..
             } => (
                 Some(tile),
                 WinFlags {
@@ -2359,9 +2351,12 @@ impl Game {
             ),
             TurnOrigin::AfterPong => return Err(GameError::InvalidAction),
         };
-        let evaluation = self
+        flags.heavenly = actor == self.dealer && opening_self_draw;
+        flags.earthly = actor != self.dealer && opening_self_draw && self.earthly_hu_open;
+        let mut evaluation = self
             .evaluate_player(actor, required, flags)
             .ok_or(GameError::InvalidAction)?;
+        evaluation.multiplier = evaluation.multiplier.max(2);
         let event_flags = win_event_flags(flags, true);
         let winning_tile = self.apply_win(actor, required, evaluation, event_flags);
         self.push_event(
@@ -2375,27 +2370,31 @@ impl Game {
             ALL_PLAYER_MASK,
             ALL_PLAYER_MASK,
         );
-        let payment = SCORE_UNIT * i64::from(evaluation.multiplier) * 2;
+        let payment = SCORE_UNIT * i64::from(evaluation.multiplier);
         for payer in seats_after(actor) {
             self.transfer(payer, actor, payment);
         }
-        if !self.finish_if_three_zero() {
-            self.begin_normal_turn(actor.next());
+        if !self.finish_if_one_solvent() {
+            self.begin_next_normal_turn(actor.next());
         }
         Ok(())
     }
 
     fn resolve_discard_wins(&mut self, source: Seat, tile: Tile, winners: u8, kind: ReactionKind) {
-        if kind == ReactionKind::AddedKong {
-            self.remove_lost_tile_preserving_locks(source, tile);
-            self.mark_public_hand_change(source);
+        match kind {
+            ReactionKind::Discard { .. } => self.consume_latest_discard(source, tile),
+            ReactionKind::AddedKong => self.remove_robbed_added_kong_tile(source, tile),
         }
 
-        let mut last_winner = source;
+        let next_actor = if winners.count_ones() > 1 {
+            source.next()
+        } else {
+            first_seat_in_mask(source, winners)
+                .expect("at least one discard winner")
+                .next()
+        };
         for (resolved_winners, winner) in seats_in_mask_after(source, winners).enumerate() {
-            let duplicates_existing_reference = matches!(kind, ReactionKind::Discard { .. })
-                || (kind == ReactionKind::AddedKong && resolved_winners > 0);
-            if duplicates_existing_reference {
+            if resolved_winners > 0 {
                 self.duplicate_win_references[tile.index()] =
                     self.duplicate_win_references[tile.index()].saturating_add(1);
             }
@@ -2404,12 +2403,12 @@ impl Game {
             let flags = match kind {
                 ReactionKind::Discard {
                     after_kong,
-                    opening_discard,
+                    opening_discard: _,
+                    last_wall_tile,
                 } => WinFlags {
                     after_kong_discard: after_kong,
-                    earthly: opening_discard
-                        && winner != self.dealer
-                        && !self.players[winner.index()].has_drawn,
+                    last_wall_tile,
+                    earthly: false,
                     ..WinFlags::NONE
                 },
                 ReactionKind::AddedKong => WinFlags {
@@ -2438,11 +2437,20 @@ impl Game {
                 winner,
                 SCORE_UNIT * i64::from(evaluation.multiplier),
             );
-            last_winner = winner;
         }
-        if !self.finish_if_three_zero() {
-            self.begin_normal_turn(last_winner.next());
+        if !self.finish_if_one_solvent() {
+            self.begin_next_normal_turn(next_actor);
         }
+    }
+
+    fn consume_latest_discard(&mut self, source: Seat, tile: Tile) {
+        let index = self
+            .discard_len
+            .checked_sub(1)
+            .expect("a discard win must claim the latest river tile") as usize;
+        debug_assert_eq!(self.discards[index], tile.as_u8());
+        debug_assert_eq!(self.discard_owners[index], source.as_u8());
+        self.discard_len -= 1;
     }
 
     fn apply_win(
@@ -2452,6 +2460,7 @@ impl Game {
         evaluation: WinEvaluation,
         event_flags: u8,
     ) -> Tile {
+        self.earthly_hu_open = false;
         let player = &mut self.players[actor.index()];
         let winning_tile = apply_bloodflow_win(
             &player.concealed,
@@ -2471,17 +2480,12 @@ impl Game {
             flags: event_flags,
         });
         player.max_win_multiplier = player.max_win_multiplier.max(evaluation.shape_multiplier);
-        self.mark_public_hand_change(actor);
         winning_tile
-    }
-
-    fn mark_public_hand_change(&mut self, actor: Seat) {
-        self.hand_revisions[actor.index()] = self.hand_revisions[actor.index()].saturating_add(1);
     }
 
     fn can_player_win(&self, actor: Seat, required: Option<Tile>) -> bool {
         let player = &self.players[actor.index()];
-        if player.missing_count() != 0 {
+        if !player.is_solvent() || player.missing_count() != 0 {
             return false;
         }
         let (melds, len) = player.meld_buffer();
@@ -2496,7 +2500,10 @@ impl Game {
 
     pub(crate) fn can_player_win_with_added_tile(&self, actor: Seat, tile: Tile) -> bool {
         let player = &self.players[actor.index()];
-        if player.missing_count() != 0 || player.missing == Some(tile.suit()) {
+        if !player.is_solvent()
+            || player.missing_count() != 0
+            || player.missing == Some(tile.suit())
+        {
             return false;
         }
         let (melds, len) = player.meld_buffer();
@@ -2514,6 +2521,17 @@ impl Game {
             counts[tile.index()] = counts[tile.index()].saturating_add(1);
             is_winning(&counts, &melds[..len], Some(tile))
         }
+    }
+
+    fn can_respond_to_reaction(&self, actor: Seat, tile: Tile, kind: ReactionKind) -> bool {
+        if self.can_player_win_with_added_tile(actor, tile) {
+            return true;
+        }
+        if kind == ReactionKind::AddedKong {
+            return false;
+        }
+        let player = &self.players[actor.index()];
+        player.can_pong(tile) || player.can_exposed_kong(tile)
     }
 
     fn evaluate_player(
@@ -2535,7 +2553,32 @@ impl Game {
         }
     }
 
+    fn begin_next_normal_turn(&mut self, start: Seat) {
+        if self
+            .players
+            .iter()
+            .filter(|player| player.is_solvent())
+            .count()
+            <= 1
+        {
+            self.stage = Stage::Finished;
+            return;
+        }
+        let Some(actor) = self.next_solvent_from(start) else {
+            self.stage = Stage::Finished;
+            return;
+        };
+        self.begin_normal_turn(actor);
+    }
+
+    fn next_solvent_from(&self, start: Seat) -> Option<Seat> {
+        (0..PLAYER_COUNT)
+            .map(|offset| start.offset(offset as u8))
+            .find(|seat| self.players[seat.index()].is_solvent())
+    }
+
     fn begin_normal_turn(&mut self, actor: Seat) {
+        debug_assert!(self.players[actor.index()].is_solvent());
         let Some(tile) = self.draw_head_raw() else {
             self.finish_wall_game();
             return;
@@ -2549,6 +2592,7 @@ impl Game {
             replacement: false,
         });
         let last_wall_tile = self.wall_remaining() == 0;
+        self.final_wall_tile_drawn |= last_wall_tile;
         self.push_event(
             EventKind::Draw,
             Some(actor),
@@ -2561,12 +2605,15 @@ impl Game {
             seat_bit(actor),
         );
         let can_hu = self.can_player_win(actor, Some(tile));
+        let deferred_kong_forbidden_tile =
+            (self.self_declared_kong_masks(actor).1 != 0).then_some(tile);
         self.stage = Stage::Turn {
             actor,
             origin: TurnOrigin::Draw {
                 tile,
                 after_kong: false,
                 last_wall_tile,
+                deferred_kong_forbidden_tile,
             },
             can_hu,
         };
@@ -2586,6 +2633,7 @@ impl Game {
             replacement: true,
         });
         let last_wall_tile = self.wall_remaining() == 0;
+        self.final_wall_tile_drawn |= last_wall_tile;
         self.push_event(
             EventKind::Draw,
             Some(actor),
@@ -2598,12 +2646,15 @@ impl Game {
             seat_bit(actor),
         );
         let can_hu = self.can_player_win(actor, Some(tile));
+        let deferred_kong_forbidden_tile =
+            (self.self_declared_kong_masks(actor).1 != 0).then_some(tile);
         self.stage = Stage::Turn {
             actor,
             origin: TurnOrigin::Draw {
                 tile,
                 after_kong: true,
                 last_wall_tile,
+                deferred_kong_forbidden_tile,
             },
             can_hu,
         };
@@ -2626,7 +2677,7 @@ impl Game {
         Tile::new(self.wall[self.wall_tail as usize])
     }
 
-    fn remove_for_meld(&mut self, actor: Seat, tile: Tile, amount: u8, allow_locked: bool) {
+    fn remove_for_meld(&mut self, actor: Seat, tile: Tile, amount: u8, allow_win_base: bool) {
         let player = &mut self.players[actor.index()];
         let removed = remove_tiles_for_meld(
             &mut player.concealed,
@@ -2634,12 +2685,12 @@ impl Game {
             &mut player.win_base,
             tile,
             amount,
-            allow_locked,
+            allow_win_base,
         );
         debug_assert!(removed, "a legal meld must have enough matching tiles");
     }
 
-    fn remove_lost_tile_preserving_locks(&mut self, actor: Seat, tile: Tile) {
+    fn remove_robbed_added_kong_tile(&mut self, actor: Seat, tile: Tile) {
         let player = &mut self.players[actor.index()];
         let removed = remove_tiles_for_meld(
             &mut player.concealed,
@@ -2657,6 +2708,9 @@ impl Game {
     }
 
     fn transfer(&mut self, payer: Seat, payee: Seat, requested: i64) -> i64 {
+        if !self.players[payer.index()].is_solvent() || !self.players[payee.index()].is_solvent() {
+            return 0;
+        }
         let amount = requested.min(self.players[payer.index()].score).max(0);
         self.players[payer.index()].score -= amount;
         self.players[payee.index()].score += amount;
@@ -2676,13 +2730,13 @@ impl Game {
         amount
     }
 
-    fn finish_if_three_zero(&mut self) -> bool {
+    fn finish_if_one_solvent(&mut self) -> bool {
         if self
             .players
             .iter()
-            .filter(|player| player.score == 0)
+            .filter(|player| player.is_solvent())
             .count()
-            >= 3
+            <= 1
         {
             self.stage = Stage::Finished;
             true
@@ -2693,24 +2747,19 @@ impl Game {
 
     fn finish_wall_game(&mut self) {
         let mut flower_pig = [false; PLAYER_COUNT];
-        let mut ready = [false; PLAYER_COUNT];
-        let mut max_shape_multipliers = [0_u32; PLAYER_COUNT];
 
         for seat in Seat::ALL {
-            flower_pig[seat.index()] = self.suit_count(seat) == 3;
-            if !flower_pig[seat.index()] {
-                let wait_multiplier = self.max_wait_multiplier(seat);
-                ready[seat.index()] = wait_multiplier > 0;
-                max_shape_multipliers[seat.index()] =
-                    wait_multiplier.max(self.players[seat.index()].max_win_multiplier);
-            }
+            let player = &self.players[seat.index()];
+            flower_pig[seat.index()] = player.is_solvent() && player.missing_count() != 0;
         }
 
         self.wall_settlement = Some(WallSettlementSummary {
             flower_pig,
-            ready,
-            max_shape_multipliers,
-            revealed_hands: self.players.map(|player| player.concealed),
+            ready: [false; PLAYER_COUNT],
+            max_shape_multipliers: [0; PLAYER_COUNT],
+            revealed_hands: self
+                .players
+                .map(|player| player.evaluation_counts().unwrap_or([0; TILE_KIND_COUNT])),
         });
         self.push_event(
             EventKind::SettlementStage,
@@ -2729,16 +2778,28 @@ impl Game {
                 continue;
             }
             for payee in seats_after(payer) {
-                if !flower_pig[payee.index()]
-                    && (ready[payee.index()] || self.players[payee.index()].has_won)
-                {
+                if !flower_pig[payee.index()] {
                     self.transfer(payer, payee, SCORE_UNIT * 10);
                 }
             }
-            if self.finish_if_three_zero() {
+            if self.finish_if_one_solvent() {
                 return;
             }
         }
+
+        let mut ready = [false; PLAYER_COUNT];
+        let mut max_shape_multipliers = [0_u32; PLAYER_COUNT];
+        for seat in Seat::ALL {
+            let wait_multiplier = self.max_wait_multiplier(seat);
+            ready[seat.index()] = wait_multiplier > 0;
+            max_shape_multipliers[seat.index()] = wait_multiplier;
+        }
+        let summary = self
+            .wall_settlement
+            .as_mut()
+            .expect("wall settlement was initialized before scoring");
+        summary.ready = ready;
+        summary.max_shape_multipliers = max_shape_multipliers;
 
         self.push_event(
             EventKind::SettlementStage,
@@ -2753,18 +2814,16 @@ impl Game {
         );
 
         for payer in Seat::ALL {
-            if flower_pig[payer.index()] || ready[payer.index()] {
+            if ready[payer.index()] {
                 continue;
             }
             for payee in seats_after(payer) {
-                if !flower_pig[payee.index()]
-                    && (ready[payee.index()] || self.players[payee.index()].has_won)
-                {
+                if ready[payee.index()] {
                     let multiplier = max_shape_multipliers[payee.index()].max(1);
                     self.transfer(payer, payee, SCORE_UNIT * i64::from(multiplier));
                 }
             }
-            if self.finish_if_three_zero() {
+            if self.finish_if_one_solvent() {
                 return;
             }
         }
@@ -2773,6 +2832,9 @@ impl Game {
 
     fn max_wait_multiplier(&self, actor: Seat) -> u32 {
         let player = &self.players[actor.index()];
+        if !player.is_solvent() {
+            return 0;
+        }
         let (melds, len) = player.meld_buffer();
         if player.has_won {
             player
@@ -2790,24 +2852,6 @@ impl Game {
             evaluate_max_wait(&player.concealed, &melds[..len], player.missing)
                 .map_or(0, |wait| wait.evaluation.multiplier)
         }
-    }
-
-    fn suit_count(&self, actor: Seat) -> usize {
-        let player = &self.players[actor.index()];
-        Suit::ALL
-            .iter()
-            .filter(|&&suit| {
-                let start = suit as usize * 9;
-                player.concealed[start..start + 9]
-                    .iter()
-                    .any(|&count| count > 0)
-                    || player
-                        .melds
-                        .iter()
-                        .flatten()
-                        .any(|meld| meld.tile.suit() == suit)
-            })
-            .count()
     }
 }
 
@@ -3156,8 +3200,10 @@ impl Batch {
     ///
     /// Seat-indexed channels and metadata are rotated so relative seat zero is
     /// the current actor. A terminal game uses the dealer as relative seat zero.
-    /// Tile channels are actor concealed, actor exchange selection, four locked
-    /// hands, and four per-owner discard counts. Meld records are
+    /// Tile channels are actor concealed, actor exchange selection, the
+    /// actor's complete locked subset, three opponents' public historical
+    /// winning-tile histograms, and four per-owner discard counts.
+    /// Meld records are
     /// `[tile, kind, source_relative]`; unused records contain `255`. River
     /// records are chronological `[tile, owner_relative]` discards and retain
     /// claimed tiles; unused records contain `255`.
@@ -3169,7 +3215,8 @@ impl Batch {
     /// has_won[4], concealed_sizes[4], terminal, reaction_flags,
     /// max_win_multipliers[4]]`. Missing optional values use `-1`.
     /// `reaction_flags` uses bit 0 for rob-kong, bit 1 for an after-kong
-    /// discard, and bit 2 for the dealer's opening discard.
+    /// discard, bit 2 for the dealer's opening discard, and bit 3 for a discard
+    /// of the final live-wall tile.
     pub fn observations_into(
         &self,
         tile_obs: &mut [u8],
@@ -3986,134 +4033,6 @@ fn add_tile_counts(target: &mut [u16; TILE_KIND_COUNT], source: &[u8; TILE_KIND_
     }
 }
 
-fn sample_constrained_suit_allocations(
-    unknown: &[u8],
-    constraints: &[HiddenHandConstraint],
-    rng: &mut Rng,
-) -> Option<Vec<[usize; 3]>> {
-    let mut remaining = [0_usize; 3];
-    for &tile in unknown {
-        remaining[usize::from(tile / 9)] += 1;
-    }
-
-    let mut sampled = Vec::with_capacity(constraints.len());
-    for (index, constraint) in constraints.iter().enumerate() {
-        let options =
-            allowed_suit_allocations(remaining, constraint.tile_count, constraint.forbidden_suit);
-        let weights: Vec<_> = options
-            .iter()
-            .map(|&allocation| {
-                allocation_weight(remaining, allocation)
-                    * constrained_completion_weight(
-                        constraints,
-                        index + 1,
-                        subtract_allocation(remaining, allocation),
-                    )
-            })
-            .collect();
-        let total: f64 = weights.iter().sum();
-        if !total.is_finite()
-            || total <= 0.0
-            || weights
-                .iter()
-                .any(|weight| !weight.is_finite() || *weight < 0.0)
-        {
-            return None;
-        }
-
-        let selected = choose_weighted_index(&weights, rng.unit_f64() * total);
-        let allocation = options[selected];
-        remaining = subtract_allocation(remaining, allocation);
-        sampled.push(allocation);
-    }
-    Some(sampled)
-}
-
-/// Selects one non-zero weighted option. The final positive option is a
-/// deliberate rounding guard: subtractive accumulation can leave a tiny
-/// residual after the mathematical total has been consumed.
-fn choose_weighted_index(weights: &[f64], mut draw: f64) -> usize {
-    let mut last_positive = None;
-    for (index, &weight) in weights.iter().enumerate() {
-        if weight <= 0.0 {
-            continue;
-        }
-        last_positive = Some(index);
-        if draw < weight {
-            return index;
-        }
-        draw -= weight;
-    }
-    last_positive.expect("weighted choices have positive mass")
-}
-
-fn constrained_completion_weight(
-    constraints: &[HiddenHandConstraint],
-    index: usize,
-    remaining: [usize; 3],
-) -> f64 {
-    let Some(constraint) = constraints.get(index) else {
-        return 1.0;
-    };
-    allowed_suit_allocations(remaining, constraint.tile_count, constraint.forbidden_suit)
-        .into_iter()
-        .map(|allocation| {
-            allocation_weight(remaining, allocation)
-                * constrained_completion_weight(
-                    constraints,
-                    index + 1,
-                    subtract_allocation(remaining, allocation),
-                )
-        })
-        .sum()
-}
-
-fn allowed_suit_allocations(
-    remaining: [usize; 3],
-    tile_count: usize,
-    forbidden_suit: Suit,
-) -> Vec<[usize; 3]> {
-    let allowed = match forbidden_suit {
-        Suit::Characters => [Suit::Bamboo as usize, Suit::Dots as usize],
-        Suit::Bamboo => [Suit::Characters as usize, Suit::Dots as usize],
-        Suit::Dots => [Suit::Characters as usize, Suit::Bamboo as usize],
-    };
-    let first = allowed[0];
-    let second = allowed[1];
-    let minimum_first = tile_count.saturating_sub(remaining[second]);
-    let maximum_first = tile_count.min(remaining[first]);
-    (minimum_first..=maximum_first)
-        .map(|first_count| {
-            let mut allocation = [0_usize; 3];
-            allocation[first] = first_count;
-            allocation[second] = tile_count - first_count;
-            allocation
-        })
-        .collect()
-}
-
-fn allocation_weight(remaining: [usize; 3], allocation: [usize; 3]) -> f64 {
-    remaining
-        .into_iter()
-        .zip(allocation)
-        .map(|(available, selected)| combination(available, selected))
-        .product()
-}
-
-fn subtract_allocation(remaining: [usize; 3], allocation: [usize; 3]) -> [usize; 3] {
-    core::array::from_fn(|suit| remaining[suit] - allocation[suit])
-}
-
-fn combination(total: usize, selected: usize) -> f64 {
-    if selected > total {
-        return 0.0;
-    }
-    let selected = selected.min(total - selected);
-    (0..selected).fold(1.0, |value, index| {
-        value * (total - index) as f64 / (index + 1) as f64
-    })
-}
-
 fn first_seat_in_mask(source: Seat, mask: u8) -> Option<Seat> {
     (1..=PLAYER_COUNT as u8)
         .map(|offset| source.offset(offset))
@@ -4225,6 +4144,16 @@ mod tests {
         tile(Suit::Characters, 9)
     }
 
+    fn make_quad_seven_pairs_wait(player: &mut Player) -> Tile {
+        let winning_tile = tile(Suit::Characters, 1);
+        add_tile(player, winning_tile, 3);
+        for rank in 2..=6 {
+            add_tile(player, tile(Suit::Characters, rank), 2);
+        }
+        player.missing = Some(Suit::Dots);
+        winning_tile
+    }
+
     fn make_flower_pig(player: &mut Player) {
         add_tile(player, tile(Suit::Characters, 1), 1);
         add_tile(player, tile(Suit::Bamboo, 1), 1);
@@ -4247,6 +4176,7 @@ mod tests {
     fn set_wall(game: &mut Game, tiles: &[Tile]) {
         game.wall_head = 0;
         game.wall_tail = tiles.len() as u8;
+        game.final_wall_tile_drawn = false;
         for (slot, tile) in game.wall.iter_mut().zip(tiles) {
             *slot = tile.as_u8();
         }
@@ -4276,6 +4206,43 @@ mod tests {
         )
         .unwrap();
         observation
+    }
+
+    fn assert_stable_base_supports_public_wins(game: &Game, seat: Seat) {
+        let player = &game.players[seat.index()];
+        let base = *game.win_base(seat);
+        let public_wins = game.public_win_tiles(seat);
+        let (melds, meld_count) = player.meld_buffer();
+        assert_eq!(
+            base.iter().map(|&count| usize::from(count)).sum::<usize>(),
+            player.win_base_target_len()
+        );
+        if let Some(missing) = player.missing {
+            let start = missing as usize * 9;
+            assert!(base[start..start + 9].iter().all(|&count| count == 0));
+            assert!(
+                melds[..meld_count]
+                    .iter()
+                    .all(|meld| meld.tile.suit() != missing)
+            );
+        }
+
+        for (index, &win_count) in public_wins.iter().enumerate() {
+            for _ in 0..win_count {
+                let mut completed = base;
+                completed[index] += 1;
+                let winning_tile = Tile::from_index_unchecked(index as u8);
+                assert!(
+                    is_bloodflow_winning(
+                        &completed,
+                        &base,
+                        &melds[..meld_count],
+                        Some(winning_tile),
+                    ),
+                    "seat {seat:?} has an invalid sampled base for tile {winning_tile:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -4407,6 +4374,7 @@ mod tests {
             source: Seat::EAST,
             tile: called,
             remaining: seat_bit(actor),
+            pending_melds: PendingMelds::NONE,
         };
 
         let legal = game.legal_actions().expect("meld response has a decision");
@@ -4439,6 +4407,31 @@ mod tests {
     }
 
     #[test]
+    fn bankrupt_player_cannot_respond_and_is_skipped_for_the_next_draw() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let bankrupt = Seat::ALL[1];
+        let next = Seat::ALL[2];
+        let called = tile(Suit::Characters, 1);
+        let next_draw = tile(Suit::Bamboo, 1);
+        add_tile(&mut game.players[source.index()], called, 1);
+        add_tile(&mut game.players[bankrupt.index()], called, 3);
+        game.players[bankrupt.index()].score = 0;
+        set_wall(&mut game, &[next_draw]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        let outcome = game.step(Action::Discard(called)).unwrap();
+
+        assert_eq!(game.players[bankrupt.index()].concealed[called.index()], 3);
+        assert_eq!(outcome.draw.map(|draw| draw.player), Some(next));
+        assert_eq!(game.decision().map(|decision| decision.actor), Some(next));
+    }
+
+    #[test]
     fn locked_triplet_cannot_form_an_exposed_kong() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
@@ -4455,6 +4448,7 @@ mod tests {
             source: Seat::EAST,
             tile: called,
             remaining: seat_bit(actor),
+            pending_melds: PendingMelds::NONE,
         };
         let before = response.clone();
         let legal = response.legal_actions().expect("response has a decision");
@@ -4480,42 +4474,60 @@ mod tests {
     }
 
     #[test]
-    fn concealed_kong_is_rejected_after_hu() {
+    fn concealed_kong_after_hu_uses_the_stable_base_but_not_historical_wins() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
-        let locked_quad = tile(Suit::Characters, 1);
-        let fresh_quad = tile(Suit::Characters, 2);
+        let historical_quad = tile(Suit::Characters, 1);
+        let base_and_draw_quad = tile(Suit::Characters, 2);
+        let replacement = tile(Suit::Bamboo, 1);
 
-        // Both shapes can appear in a post-win holding: the first is an
-        // all-locked seven-pairs quad, while the second is three locked tiles
-        // plus one newly drawn tile. Neither may be declared as a concealed
-        // kong after the player has already won; only an added kong remains.
         let player = &mut game.players[actor.index()];
         player.missing = None;
-        player.concealed[locked_quad.index()] = 4;
-        player.locked[locked_quad.index()] = 4;
-        player.concealed[fresh_quad.index()] = 4;
-        player.locked[fresh_quad.index()] = 3;
+        player.concealed[historical_quad.index()] = 4;
+        player.locked[historical_quad.index()] = 4;
+        player.concealed[base_and_draw_quad.index()] = 4;
+        player.locked[base_and_draw_quad.index()] = 3;
+        player.win_base[base_and_draw_quad.index()] = 3;
         player.has_won = true;
+        set_wall(&mut game, &[replacement]);
         game.stage = Stage::Turn {
             actor,
             origin: TurnOrigin::Draw {
-                tile: fresh_quad,
+                tile: base_and_draw_quad,
                 after_kong: false,
                 last_wall_tile: false,
+                deferred_kong_forbidden_tile: None,
             },
             can_hu: false,
         };
 
         let legal = game.legal_actions().unwrap();
-        assert_eq!(legal.concealed_kong_mask, 0);
+        assert_eq!(legal.concealed_kong_mask, 1 << base_and_draw_quad.index());
         assert_eq!(
-            game.step(Action::ConcealedKong(locked_quad)),
+            game.step(Action::ConcealedKong(historical_quad)),
             Err(GameError::InvalidAction)
         );
+        let outcome = game
+            .step(Action::ConcealedKong(base_and_draw_quad))
+            .unwrap();
         assert_eq!(
-            game.step(Action::ConcealedKong(fresh_quad)),
-            Err(GameError::InvalidAction)
+            game.meld(actor, 0).map(|meld| (meld.tile, meld.kind)),
+            Some((base_and_draw_quad, MeldKind::ConcealedKong))
+        );
+        assert_eq!(game.locked(actor)[base_and_draw_quad.index()], 0);
+        assert_eq!(game.public_win_tiles(actor)[historical_quad.index()], 4);
+        assert_eq!(
+            outcome.draw,
+            Some(DrawEvent {
+                player: actor,
+                tile: replacement,
+                replacement: true,
+            })
+        );
+        assert!(!outcome.terminal);
+        assert_ne!(
+            game.legal_actions().unwrap().discard_mask & (1 << replacement.index()),
+            0
         );
     }
 
@@ -4561,7 +4573,7 @@ mod tests {
     }
 
     #[test]
-    fn heavenly_hu_pays_locks_and_advances_to_the_dealers_next_seat() {
+    fn heavenly_hu_uses_the_post_exchange_hand_without_a_required_tile() {
         let mut game = constructed_game();
         let winning_tile = make_plain_wait(&mut game.players[Seat::EAST.index()]);
         add_tile(&mut game.players[Seat::EAST.index()], winning_tile, 1);
@@ -4575,11 +4587,12 @@ mod tests {
 
         let outcome = game.step(Action::Hu).unwrap();
 
-        assert_eq!(outcome.score_delta, [19_200, -6_400, -6_400, -6_400]);
-        assert_eq!(game.score(Seat::EAST), 29_200);
-        assert_eq!(game.locked(Seat::EAST), game.concealed(Seat::EAST));
+        assert_eq!(outcome.score_delta, [9_600, -3_200, -3_200, -3_200]);
+        assert_eq!(game.score(Seat::EAST), 19_600);
         assert!(game.has_won(Seat::EAST));
+        assert_eq!(game.locked(Seat::EAST).iter().sum::<u8>(), 14);
         assert_eq!(game.win_base(Seat::EAST).iter().sum::<u8>(), 13);
+        assert_eq!(game.players[Seat::EAST.index()].unlocked_len(), 0);
         let mut events = [0_i32; EVENT_HISTORY_CAPACITY * EVENT_RECORD_WIDTH];
         let event_count = game
             .step_events_into(Seat::EAST, &mut events)
@@ -4608,7 +4621,7 @@ mod tests {
     }
 
     #[test]
-    fn dealers_opening_discard_gives_an_undrawn_non_dealer_earthly_hu() {
+    fn dealers_opening_discard_does_not_create_earthly_hu() {
         let mut game = constructed_game();
         let winner = Seat::ALL[1];
         let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
@@ -4632,8 +4645,10 @@ mod tests {
         assert_eq!(game.decision().unwrap().actor, winner);
 
         let hu = game.step(Action::Hu).unwrap();
-        assert_eq!(hu.score_delta, [-3_200, 3_200, 0, 0]);
-        assert_eq!(game.locked(winner), game.concealed(winner));
+        assert_eq!(hu.score_delta, [-100, 100, 0, 0]);
+        assert_eq!(game.locked(winner).iter().sum::<u8>(), 14);
+        assert_eq!(game.win_base(winner).iter().sum::<u8>(), 13);
+        assert_eq!(game.players[winner.index()].unlocked_len(), 0);
         assert_eq!(
             hu.next,
             Some(Decision {
@@ -4642,6 +4657,525 @@ mod tests {
             })
         );
         assert_eq!(hu.draw.unwrap().tile, next_draw);
+    }
+
+    #[test]
+    fn a_non_dealers_first_self_draw_can_be_earthly_hu() {
+        let mut game = constructed_game();
+        let winner = Seat::ALL[1];
+        let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
+        let next_draw = tile(Suit::Characters, 9);
+        set_wall(&mut game, &[winning_tile, next_draw]);
+
+        game.begin_normal_turn(winner);
+        let hu = game.step(Action::Hu).unwrap();
+
+        assert_eq!(hu.score_delta, [-3_200, 9_600, -3_200, -3_200]);
+        let summary = game.players[winner.index()]
+            .last_win
+            .expect("the first self draw completed a win");
+        assert_eq!(summary.multiplier, 32);
+        assert_ne!(summary.flags & EVENT_FLAG_EARTHLY, 0);
+    }
+
+    #[test]
+    fn self_draw_does_not_double_a_higher_shape_multiplier() {
+        let mut game = constructed_game();
+        let winner = Seat::ALL[1];
+        let winning_tile = make_quad_seven_pairs_wait(&mut game.players[winner.index()]);
+        let next_draw = tile(Suit::Dots, 9);
+        game.players[winner.index()].has_discarded = true;
+        set_wall(&mut game, &[winning_tile, next_draw]);
+
+        game.begin_normal_turn(winner);
+        let hu = game.step(Action::Hu).unwrap();
+
+        assert_eq!(hu.score_delta, [-3_200, 9_600, -3_200, -3_200]);
+        let summary = game.players[winner.index()]
+            .last_win
+            .expect("the self draw completed a win");
+        assert_eq!(summary.shape_multiplier, 32);
+        assert_eq!(summary.multiplier, 32);
+    }
+
+    #[test]
+    fn a_pong_can_be_followed_by_other_self_declared_kongs() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let actor = Seat::ALL[1];
+        let called = tile(Suit::Characters, 5);
+        let existing_pong = tile(Suit::Characters, 7);
+        let concealed_quad = tile(Suit::Bamboo, 5);
+        let replacement = tile(Suit::Bamboo, 9);
+        add_tile(&mut game.players[source.index()], called, 1);
+        add_tile(&mut game.players[actor.index()], called, 3);
+        add_tile(&mut game.players[actor.index()], existing_pong, 1);
+        add_tile(&mut game.players[actor.index()], concealed_quad, 4);
+        assert!(game.players[actor.index()].add_meld(Meld {
+            tile: existing_pong,
+            kind: MeldKind::Pong,
+            source: Seat::ALL[3],
+        }));
+        game.players[actor.index()].missing = Some(Suit::Dots);
+        game.discard_len = 1;
+        set_wall(&mut game, &[replacement]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(called)).unwrap();
+        assert_ne!(
+            game.players[actor.index()].kong_forbidden_mask & (1 << called.index()),
+            0,
+            "offering an exposed Kong permanently forbids self-declared Kongs of that tile"
+        );
+        game.step(Action::Pong).unwrap();
+
+        let legal = game
+            .legal_actions()
+            .expect("the Pong winner must discard or Kong");
+        assert_eq!(legal.added_kong_mask & (1 << called.index()), 0);
+        assert_ne!(legal.added_kong_mask & (1 << existing_pong.index()), 0);
+        assert_ne!(legal.concealed_kong_mask & (1 << concealed_quad.index()), 0);
+
+        let mut added = game.clone();
+        let added_outcome = added.step(Action::AddedKong(existing_pong)).unwrap();
+        assert_eq!(
+            added_outcome.draw,
+            Some(DrawEvent {
+                player: actor,
+                tile: replacement,
+                replacement: true,
+            })
+        );
+
+        let concealed_outcome = game.step(Action::ConcealedKong(concealed_quad)).unwrap();
+        assert_eq!(
+            concealed_outcome.draw,
+            Some(DrawEvent {
+                player: actor,
+                tile: replacement,
+                replacement: true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_dealer_kong_closes_earthly_hu_before_the_first_discard() {
+        let mut game = constructed_game();
+        let dealer = Seat::EAST;
+        let winner = Seat::ALL[1];
+        let kong_tile = tile(Suit::Characters, 9);
+        let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
+        let next_draw = tile(Suit::Dots, 9);
+        let replacement = tile(Suit::Characters, 8);
+        add_tile(&mut game.players[dealer.index()], kong_tile, 4);
+        add_tile(&mut game.players[dealer.index()], winning_tile, 1);
+        game.players[dealer.index()].missing = Some(Suit::Dots);
+        set_wall(&mut game, &[next_draw, replacement]);
+        game.stage = Stage::Turn {
+            actor: dealer,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::ConcealedKong(kong_tile)).unwrap();
+        assert!(!game.earthly_hu_open);
+        game.step(Action::Discard(winning_tile)).unwrap();
+
+        assert_eq!(
+            game.discard_flags[0] & EVENT_FLAG_OPENING_DISCARD,
+            0,
+            "a Kong ends the dealer's uninterrupted opening turn"
+        );
+        let hu = game.step(Action::Hu).unwrap();
+        assert_eq!(hu.score_delta, [-200, 200, 0, 0]);
+        let flags = game.players[winner.index()]
+            .last_win
+            .expect("the discard completed a win")
+            .flags;
+        assert_ne!(flags & EVENT_FLAG_AFTER_KONG, 0);
+        assert_eq!(flags & EVENT_FLAG_EARTHLY, 0);
+    }
+
+    #[test]
+    fn a_dealer_supplement_draw_before_the_first_discard_can_be_heavenly_hu() {
+        let mut game = constructed_game();
+        let dealer = Seat::EAST;
+        let winning_tile = make_plain_wait(&mut game.players[dealer.index()]);
+        let kong_tile = tile(Suit::Characters, 9);
+        let next_draw = tile(Suit::Dots, 9);
+        add_tile(&mut game.players[dealer.index()], kong_tile, 4);
+        set_wall(&mut game, &[next_draw, winning_tile]);
+        game.stage = Stage::Turn {
+            actor: dealer,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::ConcealedKong(kong_tile)).unwrap();
+        let hu = game.step(Action::Hu).unwrap();
+
+        assert_eq!(hu.score_delta, [9_600, -3_200, -3_200, -3_200]);
+        let summary = game.players[dealer.index()]
+            .last_win
+            .expect("the supplement draw completed a win");
+        assert_eq!(summary.multiplier, 32);
+        assert_ne!(summary.flags & EVENT_FLAG_HEAVENLY, 0);
+        assert_ne!(summary.flags & EVENT_FLAG_AFTER_KONG, 0);
+    }
+
+    #[test]
+    fn a_win_on_the_discarded_final_wall_tile_keeps_the_last_wall_multiplier() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let winner = Seat::ALL[1];
+        let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
+        set_wall(&mut game, &[winning_tile]);
+
+        game.begin_normal_turn(source);
+        game.step(Action::Discard(winning_tile)).unwrap();
+
+        assert_ne!(game.discard_flags[0] & EVENT_FLAG_LAST_WALL_TILE, 0);
+        let hu = game.step(Action::Hu).unwrap();
+        let summary = game.players[winner.index()]
+            .last_win
+            .expect("the final discard completed a win");
+        assert_eq!(summary.multiplier, 2);
+        assert_ne!(summary.flags & EVENT_FLAG_LAST_WALL_TILE, 0);
+        assert!(hu.terminal);
+    }
+
+    #[test]
+    fn the_last_wall_multiplier_survives_a_pong_before_the_winning_discard() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let ponger = Seat::ALL[1];
+        let winner = Seat::ALL[2];
+        let called = tile(Suit::Characters, 5);
+        let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
+        add_tile(&mut game.players[ponger.index()], called, 2);
+        add_tile(&mut game.players[ponger.index()], winning_tile, 1);
+        game.players[ponger.index()].missing = Some(Suit::Dots);
+        set_wall(&mut game, &[called]);
+
+        game.begin_normal_turn(source);
+        game.step(Action::Discard(called)).unwrap();
+        game.step(Action::Pong).unwrap();
+        game.step(Action::Discard(winning_tile)).unwrap();
+
+        assert_ne!(game.discard_flags[0] & EVENT_FLAG_LAST_WALL_TILE, 0);
+        assert_ne!(game.discard_flags[1] & EVENT_FLAG_LAST_WALL_TILE, 0);
+        game.step(Action::Hu).unwrap();
+        let summary = game.players[winner.index()]
+            .last_win
+            .expect("the post-Pong discard completed a win");
+        assert_eq!(summary.multiplier, 2);
+        assert_ne!(summary.flags & EVENT_FLAG_LAST_WALL_TILE, 0);
+    }
+
+    #[test]
+    fn one_discard_response_exposes_hu_kong_pong_and_pass() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let responder = Seat::ALL[1];
+        let response_tile = make_quad_seven_pairs_wait(&mut game.players[responder.index()]);
+        let next_draw = tile(Suit::Bamboo, 9);
+        add_tile(&mut game.players[source.index()], response_tile, 1);
+        set_wall(&mut game, &[next_draw]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(response_tile)).unwrap();
+
+        let legal = game
+            .legal_actions()
+            .expect("the responder has one combined choice");
+        assert_eq!(legal.decision.actor, responder);
+        assert_eq!(legal.decision.phase, Phase::HuResponse);
+        assert!(legal.can_hu);
+        assert!(legal.can_pong);
+        assert!(legal.can_exposed_kong);
+        assert!(legal.can_pass);
+        assert_eq!(
+            game.legal_action_mask().unwrap().iter().collect::<Vec<_>>(),
+            vec![
+                ActionId::HU,
+                ActionId::PONG,
+                ActionId::EXPOSED_KONG,
+                ActionId::PASS,
+            ]
+        );
+
+        let mut hu = game.clone();
+        hu.step(Action::Hu).unwrap();
+        assert!(hu.has_won(responder));
+        assert_eq!(hu.players[responder.index()].meld_count, 0);
+
+        let mut pong = game.clone();
+        pong.step(Action::Pong).unwrap();
+        assert_eq!(pong.phase(), Phase::Turn);
+        assert_eq!(
+            pong.decision().map(|decision| decision.actor),
+            Some(responder)
+        );
+        assert_eq!(
+            pong.meld(responder, 0).map(|meld| meld.kind),
+            Some(MeldKind::Pong)
+        );
+
+        let mut kong = game.clone();
+        let outcome = kong.step(Action::ExposedKong).unwrap();
+        assert_eq!(kong.phase(), Phase::Turn);
+        assert_eq!(
+            kong.decision().map(|decision| decision.actor),
+            Some(responder)
+        );
+        assert_eq!(
+            kong.meld(responder, 0).map(|meld| meld.kind),
+            Some(MeldKind::ExposedKong)
+        );
+        assert_eq!(
+            outcome.draw,
+            Some(DrawEvent {
+                player: responder,
+                tile: next_draw,
+                replacement: true,
+            })
+        );
+
+        let mut pass = game;
+        let outcome = pass.step(Action::Pass).unwrap();
+        assert_eq!(pass.phase(), Phase::Turn);
+        assert_eq!(
+            pass.decision().map(|decision| decision.actor),
+            Some(responder)
+        );
+        assert_eq!(pass.players[responder.index()].meld_count, 0);
+        assert_eq!(
+            outcome.draw,
+            Some(DrawEvent {
+                player: responder,
+                tile: next_draw,
+                replacement: false,
+            })
+        );
+    }
+
+    #[test]
+    fn pending_pong_waits_for_later_hu_and_is_overridden_only_by_hu() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let meld_responder = Seat::ALL[1];
+        let hu_responder = Seat::ALL[2];
+        let response_tile = make_zero_copy_wait(&mut game.players[hu_responder.index()]);
+        add_tile(&mut game.players[meld_responder.index()], response_tile, 2);
+        add_tile(
+            &mut game.players[meld_responder.index()],
+            tile(Suit::Bamboo, 9),
+            1,
+        );
+        add_tile(&mut game.players[source.index()], response_tile, 1);
+        set_wall(&mut game, &[tile(Suit::Dots, 9)]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(response_tile)).unwrap();
+        let legal = game.legal_actions().unwrap();
+        assert_eq!(legal.decision.actor, meld_responder);
+        assert!(!legal.can_hu);
+        assert!(legal.can_pong);
+        game.step(Action::Pong).unwrap();
+
+        assert_eq!(game.phase(), Phase::HuResponse);
+        assert_eq!(
+            game.decision().map(|decision| decision.actor),
+            Some(hu_responder)
+        );
+        assert_eq!(game.players[meld_responder.index()].meld_count, 0);
+        assert!(game.legal_actions().unwrap().can_hu);
+
+        let mut hu = game.clone();
+        hu.step(Action::Hu).unwrap();
+        assert!(hu.has_won(hu_responder));
+        assert_eq!(hu.players[meld_responder.index()].meld_count, 0);
+
+        let mut pass = game;
+        pass.step(Action::Pass).unwrap();
+        assert!(!pass.has_won(hu_responder));
+        assert_eq!(
+            pass.meld(meld_responder, 0).map(|meld| meld.kind),
+            Some(MeldKind::Pong)
+        );
+        assert_eq!(pass.phase(), Phase::Turn);
+        assert_eq!(
+            pass.decision().map(|decision| decision.actor),
+            Some(meld_responder)
+        );
+    }
+
+    #[test]
+    fn multiple_hu_results_override_an_earlier_pending_meld() {
+        let mut base = constructed_game();
+        let source = Seat::EAST;
+        let meld_responder = Seat::ALL[1];
+        let first_winner = Seat::ALL[2];
+        let second_winner = Seat::ALL[3];
+        let response_tile = make_zero_copy_wait(&mut base.players[first_winner.index()]);
+        assert_eq!(
+            make_zero_copy_wait(&mut base.players[second_winner.index()]),
+            response_tile
+        );
+        add_tile(&mut base.players[meld_responder.index()], response_tile, 3);
+        add_tile(&mut base.players[source.index()], response_tile, 1);
+        let next_draw = tile(Suit::Dots, 9);
+        set_wall(&mut base, &[next_draw]);
+        base.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        for pending_action in [Action::Pong, Action::ExposedKong] {
+            let mut game = base.clone();
+            game.step(Action::Discard(response_tile)).unwrap();
+            assert!(game.is_legal_action(pending_action));
+            game.step(pending_action).unwrap();
+            game.step(Action::Hu).unwrap();
+            let outcome = game.step(Action::Hu).unwrap();
+
+            assert!(game.has_won(first_winner));
+            assert!(game.has_won(second_winner));
+            assert_eq!(game.players[meld_responder.index()].meld_count, 0);
+            assert_eq!(
+                game.players[meld_responder.index()].unlocked_count(response_tile),
+                3
+            );
+            let winner_payment = outcome.score_delta[first_winner.index()];
+            assert!(winner_payment > 0);
+            assert_eq!(outcome.score_delta[second_winner.index()], winner_payment);
+            assert_eq!(outcome.score_delta[meld_responder.index()], 0);
+            assert_eq!(outcome.score_delta[source.index()], -2 * winner_payment);
+            assert_eq!(game.phase(), Phase::Turn);
+            assert_eq!(
+                game.decision().map(|decision| decision.actor),
+                Some(meld_responder)
+            );
+            assert_eq!(
+                outcome.draw,
+                Some(DrawEvent {
+                    player: meld_responder,
+                    tile: next_draw,
+                    replacement: false,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn exposed_kong_outranks_nearer_pong_after_all_hu_candidates_pass() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let pong_responder = Seat::ALL[1];
+        let kong_responder = Seat::ALL[2];
+        let hu_responder = Seat::ALL[3];
+        let response_tile = make_zero_copy_wait(&mut game.players[hu_responder.index()]);
+        add_tile(&mut game.players[kong_responder.index()], response_tile, 3);
+        add_tile(&mut game.players[pong_responder.index()], response_tile, 2);
+        add_tile(
+            &mut game.players[pong_responder.index()],
+            tile(Suit::Bamboo, 9),
+            1,
+        );
+        add_tile(&mut game.players[source.index()], response_tile, 1);
+        let supplement = tile(Suit::Dots, 9);
+        set_wall(&mut game, &[supplement]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(response_tile)).unwrap();
+        game.step(Action::Pong).unwrap();
+        game.step(Action::ExposedKong).unwrap();
+        let outcome = game.step(Action::Pass).unwrap();
+
+        assert_eq!(
+            game.meld(kong_responder, 0).map(|meld| meld.kind),
+            Some(MeldKind::ExposedKong)
+        );
+        assert_eq!(game.players[pong_responder.index()].meld_count, 0);
+        assert_eq!(
+            game.decision().map(|decision| decision.actor),
+            Some(kong_responder)
+        );
+        assert_eq!(outcome.score_delta, [-300, 0, 300, 0]);
+        assert_eq!(
+            outcome.draw,
+            Some(DrawEvent {
+                player: kong_responder,
+                tile: supplement,
+                replacement: true,
+            })
+        );
+    }
+
+    #[test]
+    fn exposed_kong_outranks_nearer_pong_without_hu_candidates() {
+        let mut game = constructed_game();
+        let source = Seat::EAST;
+        let pong_responder = Seat::ALL[1];
+        let kong_responder = Seat::ALL[2];
+        let response_tile = tile(Suit::Characters, 5);
+        add_tile(&mut game.players[pong_responder.index()], response_tile, 2);
+        add_tile(
+            &mut game.players[pong_responder.index()],
+            tile(Suit::Bamboo, 9),
+            1,
+        );
+        add_tile(&mut game.players[kong_responder.index()], response_tile, 3);
+        add_tile(&mut game.players[source.index()], response_tile, 1);
+        let supplement = tile(Suit::Dots, 9);
+        set_wall(&mut game, &[supplement]);
+        game.stage = Stage::Turn {
+            actor: source,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        game.step(Action::Discard(response_tile)).unwrap();
+        let pending_pong = game.step(Action::Pong).unwrap();
+        assert_eq!(pending_pong.score_delta, [0; PLAYER_COUNT]);
+        assert_eq!(game.players[pong_responder.index()].meld_count, 0);
+        assert_eq!(
+            game.decision().map(|decision| decision.actor),
+            Some(kong_responder)
+        );
+
+        let outcome = game.step(Action::ExposedKong).unwrap();
+        assert_eq!(game.players[pong_responder.index()].meld_count, 0);
+        assert_eq!(
+            game.meld(kong_responder, 0).map(|meld| meld.kind),
+            Some(MeldKind::ExposedKong)
+        );
+        assert_eq!(outcome.score_delta, [-300, 0, 300, 0]);
+        assert_eq!(
+            outcome.draw,
+            Some(DrawEvent {
+                player: kong_responder,
+                tile: supplement,
+                replacement: true,
+            })
+        );
     }
 
     #[test]
@@ -4664,7 +5198,8 @@ mod tests {
         let public_wins = game.public_win_tiles(winner);
         assert_eq!(public_wins.iter().sum::<u8>(), 1);
         assert_eq!(public_wins[winning_tile.index()], 1);
-        assert!(game.locked(winner).iter().sum::<u8>() > 1);
+        assert_eq!(game.locked(winner).iter().sum::<u8>(), 14);
+        assert_eq!(game.win_base(winner).iter().sum::<u8>(), 13);
 
         let source_observation = observation_for(&game, source).0;
         let winner_relative = usize::from(relative_seat(source, winner));
@@ -4704,9 +5239,13 @@ mod tests {
         game.step(Action::Hu).unwrap();
         game.step(Action::Hu).unwrap();
 
-        assert_eq!(game.duplicate_win_references[winning_tile.index()], 2);
-        assert_eq!(game.locked(first_winner)[winning_tile.index()], 2);
-        assert_eq!(game.locked(second_winner)[winning_tile.index()], 2);
+        assert_eq!(game.discard_len, 0);
+        assert_eq!(game.duplicate_win_references[winning_tile.index()], 1);
+        assert_eq!(game.public_win_tiles(first_winner)[winning_tile.index()], 1);
+        assert_eq!(
+            game.public_win_tiles(second_winner)[winning_tile.index()],
+            1
+        );
         assert_eq!(game.visible_tile_counts(viewer)[winning_tile.index()], 1);
     }
 
@@ -4716,6 +5255,8 @@ mod tests {
         let winner = Seat::ALL[1];
         let winning_tile = make_plain_wait(&mut game.players[winner.index()]);
         add_tile(&mut game.players[Seat::EAST.index()], winning_tile, 1);
+        let next_draw = tile(Suit::Dots, 9);
+        set_wall(&mut game, &[next_draw]);
 
         game.resolve_discard_wins(
             Seat::EAST,
@@ -4728,6 +5269,15 @@ mod tests {
         assert_eq!(
             game.visible_tile_counts(Seat::ALL[2])[winning_tile.index()],
             1
+        );
+        assert_eq!(game.decision().unwrap().actor, winner.next());
+        assert_eq!(
+            game.transition_draw,
+            Some(DrawEvent {
+                player: winner.next(),
+                tile: next_draw,
+                replacement: false,
+            })
         );
     }
 
@@ -4752,6 +5302,8 @@ mod tests {
         game.discards[0] = winning_tile.as_u8();
         game.discard_owners[0] = viewer.as_u8();
         game.discard_len = 1;
+        let next_draw = tile(Suit::Dots, 9);
+        set_wall(&mut game, &[next_draw]);
 
         game.resolve_discard_wins(
             source,
@@ -4764,10 +5316,19 @@ mod tests {
         assert_eq!(game.locked(first_winner)[winning_tile.index()], 1);
         assert_eq!(game.locked(second_winner)[winning_tile.index()], 1);
         assert_eq!(game.visible_tile_counts(viewer)[winning_tile.index()], 4);
+        assert_eq!(game.decision().unwrap().actor, source.next());
+        assert_eq!(
+            game.transition_draw,
+            Some(DrawEvent {
+                player: source.next(),
+                tile: next_draw,
+                replacement: false,
+            })
+        );
     }
 
     #[test]
-    fn multiple_hu_suppresses_melds_and_resumes_after_the_last_winner() {
+    fn multiple_hu_suppresses_melds_and_resumes_after_the_discarder() {
         let mut game = constructed_game();
         let first_winner = Seat::ALL[1];
         let last_winner = Seat::ALL[2];
@@ -4800,14 +5361,14 @@ mod tests {
         assert_eq!(
             resolved.next,
             Some(Decision {
-                actor: meld_candidate,
+                actor: first_winner,
                 phase: Phase::Turn,
             })
         );
         assert_eq!(
             resolved.draw,
             Some(DrawEvent {
-                player: meld_candidate,
+                player: first_winner,
                 tile: next_draw,
                 replacement: false,
             })
@@ -4827,11 +5388,12 @@ mod tests {
             source: Seat::EAST,
             tile: kong_tile,
             remaining: seat_bit(actor),
+            pending_melds: PendingMelds::NONE,
         };
 
         let outcome = game.step(Action::ExposedKong).unwrap();
 
-        assert_eq!(outcome.score_delta, [-100, 100, 0, 0]);
+        assert_eq!(outcome.score_delta, [-300, 300, 0, 0]);
         assert!(outcome.terminal);
         assert_eq!(outcome.draw, None);
         assert_eq!(game.phase(), Phase::Finished);
@@ -4867,6 +5429,7 @@ mod tests {
                 tile: current_draw,
                 after_kong: false,
                 last_wall_tile: false,
+                deferred_kong_forbidden_tile: None,
             },
             can_hu: false,
         };
@@ -4878,6 +5441,44 @@ mod tests {
         assert_eq!(outcome.draw, None);
         assert_eq!(game.phase(), Phase::Finished);
         assert_eq!(game.meld(actor, 0).unwrap().kind, MeldKind::AddedKong);
+    }
+
+    #[test]
+    fn a_drawn_added_kong_offer_is_visible_and_persistently_forbidden() {
+        let mut game = constructed_game();
+        let actor = Seat::ALL[1];
+        let kong_tile = tile(Suit::Characters, 5);
+        let next_draw = tile(Suit::Bamboo, 9);
+        assert!(game.players[actor.index()].add_meld(Meld {
+            tile: kong_tile,
+            kind: MeldKind::Pong,
+            source: Seat::EAST,
+        }));
+        game.players[actor.index()].missing = Some(Suit::Dots);
+        set_wall(&mut game, &[kong_tile, next_draw]);
+
+        game.begin_normal_turn(actor);
+
+        let legal = game.legal_actions().expect("the draw creates a Kong offer");
+        assert_ne!(legal.added_kong_mask & (1 << kong_tile.index()), 0);
+        assert_eq!(
+            game.players[actor.index()].kong_forbidden_mask & (1 << kong_tile.index()),
+            0,
+            "the current offer remains legal until the decision is applied"
+        );
+        let observation = observation_for(&game, actor);
+        assert_eq!(
+            observation.0[10 * TILE_KIND_COUNT + kong_tile.index()],
+            1,
+            "the viewer observes the persistent state created by the offer"
+        );
+
+        game.step(Action::Discard(kong_tile)).unwrap();
+
+        assert_ne!(
+            game.players[actor.index()].kong_forbidden_mask & (1 << kong_tile.index()),
+            0
+        );
     }
 
     #[test]
@@ -4901,6 +5502,14 @@ mod tests {
 
         game.step(Action::AddedKong(kong_tile)).unwrap();
 
+        let legal = game
+            .legal_actions()
+            .expect("the rob-Kong response is pending");
+        assert!(legal.can_hu);
+        assert!(legal.can_pass);
+        assert!(!legal.can_pong);
+        assert!(!legal.can_exposed_kong);
+
         assert_eq!(
             game.stage,
             Stage::HuResponse {
@@ -4908,6 +5517,7 @@ mod tests {
                 tile: kong_tile,
                 remaining: seat_bit(winner),
                 winners: 0,
+                pending_melds: PendingMelds::NONE,
                 kind: ReactionKind::AddedKong,
             }
         );
@@ -4936,7 +5546,11 @@ mod tests {
 
         let outcome = game.step(Action::ConcealedKong(kong_tile)).unwrap();
 
-        assert_eq!(outcome.score_delta, [-200, 600, -200, -200]);
+        assert_eq!(
+            outcome.score_delta,
+            [-200, 600, -200, -200],
+            "wall exhaustion must not refund an already settled Kong"
+        );
         assert!(outcome.terminal);
         assert_eq!(outcome.draw, None);
         assert_eq!(game.phase(), Phase::Finished);
@@ -4944,7 +5558,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_hu_reuses_old_locks_and_unions_in_the_new_winning_tile() {
+    fn repeated_hu_preserves_the_base_and_adds_one_public_winning_tile() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
         let player = &mut game.players[actor.index()];
@@ -4968,14 +5582,11 @@ mod tests {
         game.step(Action::Discard(first_winning_tile)).unwrap();
         game.step(Action::Hu).unwrap();
         let first_locks = *game.locked(actor);
-        assert_eq!(
-            first_locks
-                .iter()
-                .map(|&count| count as usize)
-                .sum::<usize>(),
-            14
-        );
-        assert_eq!(game.locked(actor), game.concealed(actor));
+        let first_base = *game.win_base(actor);
+        assert_eq!(first_locks.iter().sum::<u8>(), 14);
+        assert_eq!(first_base.iter().sum::<u8>(), 13);
+        assert_eq!(game.public_win_tiles(actor)[first_winning_tile.index()], 1);
+        assert_eq!(game.players[actor.index()].unlocked_len(), 0);
 
         let second_winning_tile = tile(Suit::Bamboo, 9);
         let following_draw = tile(Suit::Characters, 8);
@@ -4986,20 +5597,20 @@ mod tests {
             game.legal_actions().unwrap().discard_mask & (1 << second_winning_tile.index()),
             0
         );
+        assert_eq!(
+            game.legal_actions().unwrap().discard_mask,
+            1 << second_winning_tile.index()
+        );
 
         let second_hu = game.step(Action::Hu).unwrap();
-        assert_eq!(
-            game.locked(actor)
-                .iter()
-                .map(|&count| count as usize)
-                .sum::<usize>(),
-            15
-        );
+        assert_eq!(game.locked(actor).iter().sum::<u8>(), 15);
+        assert_eq!(game.win_base(actor), &first_base);
         for (before, after) in first_locks.iter().zip(game.locked(actor)) {
             assert!(after >= before);
         }
-        assert_eq!(game.locked(actor)[second_winning_tile.index()], 3);
-        assert_eq!(game.locked(actor), game.concealed(actor));
+        assert_eq!(game.public_win_tiles(actor).iter().sum::<u8>(), 2);
+        assert_eq!(game.public_win_tiles(actor)[second_winning_tile.index()], 1);
+        assert_eq!(game.players[actor.index()].unlocked_len(), 0);
         assert_eq!(game.win_count(actor), 2);
         let last_win = game.last_win(actor).expect("repeat win has a summary");
         assert!(last_win.shape_multiplier > 0);
@@ -5010,7 +5621,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_self_draw_hu_keeps_the_active_hand_empty() {
+    fn repeated_self_draw_hu_keeps_the_base_locked() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
         let winning_tile = make_plain_wait(&mut game.players[actor.index()]);
@@ -5021,33 +5632,28 @@ mod tests {
                 tile: winning_tile,
                 after_kong: false,
                 last_wall_tile: false,
+                deferred_kong_forbidden_tile: None,
             },
             can_hu: true,
         };
 
         game.step(Action::Hu).unwrap();
         assert_eq!(game.players[actor.index()].unlocked_len(), 0);
-        assert_eq!(
-            game.locked(actor)
-                .iter()
-                .map(|&count| count as usize)
-                .sum::<usize>(),
-            14
-        );
+        assert_eq!(game.locked(actor).iter().sum::<u8>(), 14);
+        assert_eq!(game.win_base(actor).iter().sum::<u8>(), 13);
 
         set_wall(&mut game, &[winning_tile, tile(Suit::Characters, 9)]);
         game.begin_normal_turn(actor);
         assert!(game.legal_actions().unwrap().can_hu);
+        assert_eq!(
+            game.legal_actions().unwrap().discard_mask,
+            1 << winning_tile.index()
+        );
         game.step(Action::Hu).unwrap();
 
         assert_eq!(game.players[actor.index()].unlocked_len(), 0);
-        assert_eq!(
-            game.locked(actor)
-                .iter()
-                .map(|&count| count as usize)
-                .sum::<usize>(),
-            15
-        );
+        assert_eq!(game.locked(actor).iter().sum::<u8>(), 15);
+        assert_eq!(game.win_base(actor).iter().sum::<u8>(), 13);
         assert_eq!(
             game.concealed(actor)
                 .iter()
@@ -5079,51 +5685,57 @@ mod tests {
             .filter(|&tile| game.can_player_win_with_added_tile(winner, tile))
             .collect();
         assert_eq!(repeat_waits, vec![winning_tile]);
-        assert_eq!(game.players[winner.index()].win_base.iter().sum::<u8>(), 13);
+        let active_hand = game.players[winner.index()]
+            .evaluation_counts()
+            .expect("historical references are a concealed subset");
+        assert_eq!(active_hand.iter().sum::<u8>(), 13);
 
-        let stable_base = game.players[winner.index()].win_base;
         let mut shape_multipliers = Vec::new();
         for historical_tile in [tile(Suit::Characters, 7), tile(Suit::Bamboo, 8)] {
             game.players[winner.index()].concealed[winning_tile.index()] += 1;
             let evaluation = game
                 .evaluate_player(winner, Some(winning_tile), WinFlags::NONE)
-                .expect("the stable base keeps the same repeat wait");
+                .expect("the active hand keeps the same repeat wait");
             shape_multipliers.push(evaluation.shape_multiplier);
             game.apply_win(winner, Some(winning_tile), evaluation, 0);
-            assert_eq!(game.players[winner.index()].win_base, stable_base);
+            assert_eq!(
+                game.players[winner.index()].evaluation_counts(),
+                Some(active_hand)
+            );
 
             game.players[winner.index()].concealed[historical_tile.index()] += 1;
             game.players[winner.index()].locked[historical_tile.index()] += 1;
+            assert_eq!(
+                game.players[winner.index()].evaluation_counts(),
+                Some(active_hand)
+            );
         }
         assert_eq!(shape_multipliers[0], shape_multipliers[1]);
     }
 
     #[test]
-    fn repeated_hu_cannot_reuse_an_already_locked_copy_as_the_new_tile() {
+    fn historical_win_reference_does_not_complete_the_active_hand() {
         let mut game = constructed_game();
         let actor = Seat::ALL[1];
         let player = &mut game.players[actor.index()];
-        add_sequence(player, Suit::Characters, 1);
-        add_sequence(player, Suit::Characters, 4);
-        add_sequence(player, Suit::Bamboo, 1);
-        add_sequence(player, Suit::Bamboo, 4);
-        add_tile(player, tile(Suit::Bamboo, 9), 2);
-        player.locked = player.concealed;
+        let winning_tile = make_plain_wait(player);
         player.win_base = player.concealed;
-        player.win_base[tile(Suit::Bamboo, 9).index()] -= 1;
-        player.missing = Some(Suit::Dots);
+        player.locked = player.win_base;
+        add_tile(player, winning_tile, 1);
+        player.locked[winning_tile.index()] += 1;
         player.has_won = true;
 
-        let incoming = tile(Suit::Characters, 1);
-        assert!(!game.can_player_win_with_added_tile(actor, incoming));
+        assert!(!game.can_player_win(actor, None));
+        assert!(game.can_player_win_with_added_tile(actor, winning_tile));
     }
 
     #[test]
-    fn flower_pig_settlement_precedes_and_can_fund_dajiao_payments() {
+    fn bankrupt_players_are_excluded_from_wall_settlement() {
         let mut game = constructed_game();
         make_flower_pig(&mut game.players[Seat::EAST.index()]);
-        game.players[Seat::ALL[1].index()].has_won = true;
-        game.players[Seat::ALL[1].index()].max_win_multiplier = 4;
+        game.players[Seat::EAST.index()].missing = Some(Suit::Characters);
+        make_flower_pig(&mut game.players[Seat::ALL[1].index()]);
+        game.players[Seat::ALL[1].index()].missing = Some(Suit::Characters);
         make_plain_wait(&mut game.players[Seat::ALL[2].index()]);
         make_plain_wait(&mut game.players[Seat::ALL[3].index()]);
         game.players[Seat::EAST.index()].score = 1_000;
@@ -5139,9 +5751,10 @@ mod tests {
 
         let settlement = game.wall_settlement().expect("wall settlement is public");
         assert!(settlement.is_flower_pig(Seat::EAST));
+        assert!(!settlement.is_flower_pig(Seat::ALL[1]));
         assert!(!settlement.is_ready(Seat::EAST));
         assert!(!settlement.is_ready(Seat::ALL[1]));
-        assert_eq!(settlement.max_shape_multiplier(Seat::ALL[1]), 4);
+        assert_eq!(settlement.max_shape_multiplier(Seat::ALL[1]), 0);
         assert_eq!(
             settlement.revealed_hand(Seat::EAST),
             game.concealed(Seat::EAST)
@@ -5164,11 +5777,9 @@ mod tests {
             ]
         );
 
-        // East first pays its only 1,000 points to the first eligible seat.
-        // South then uses 200 of that receipt for its two dajiao payments.
         assert_eq!(
             Seat::ALL.map(|seat| game.score(seat)),
-            [0, 800, 10_100, 29_100]
+            [0, 0, 11_000, 29_000]
         );
         assert_eq!(game.phase(), Phase::Finished);
         assert_eq!(
@@ -5220,19 +5831,15 @@ mod tests {
     }
 
     #[test]
-    fn robbed_added_kong_preserves_an_equivalent_locked_tile() {
+    fn robbed_added_kong_removes_only_the_active_fourth_tile() {
         let mut game = Game::new(77);
         let tile = Tile::from_index_unchecked(4);
         game.players[Seat::EAST.index()].concealed[tile.index()] = 2;
         game.players[Seat::EAST.index()].locked[tile.index()] = 1;
 
-        game.remove_lost_tile_preserving_locks(Seat::EAST, tile);
+        game.remove_robbed_added_kong_tile(Seat::EAST, tile);
         assert_eq!(game.players[Seat::EAST.index()].concealed[tile.index()], 1);
         assert_eq!(game.players[Seat::EAST.index()].locked[tile.index()], 1);
-
-        game.remove_lost_tile_preserving_locks(Seat::EAST, tile);
-        assert_eq!(game.players[Seat::EAST.index()].concealed[tile.index()], 0);
-        assert_eq!(game.players[Seat::EAST.index()].locked[tile.index()], 0);
     }
 
     #[test]
@@ -5245,8 +5852,9 @@ mod tests {
                 ReactionKind::Discard {
                     after_kong: true,
                     opening_discard: true,
+                    last_wall_tile: true,
                 },
-                0b110,
+                0b1110,
             ),
             (ReactionKind::AddedKong, 0b001),
         ] {
@@ -5256,6 +5864,7 @@ mod tests {
                 tile: pending_tile,
                 remaining: seat_bit(actor),
                 winners: seat_bit(Seat::ALL[1]),
+                pending_melds: PendingMelds::NONE,
                 kind,
             };
             let batch = Batch { games: vec![game] };
@@ -5340,28 +5949,29 @@ mod tests {
     }
 
     #[test]
-    fn information_set_resampling_does_not_freeze_hidden_winning_base() {
+    fn information_set_resampling_canonicalizes_hidden_active_hands() {
         let viewer = Seat::ALL[2];
         let winner = Seat::ALL[1];
-        let mut first_base_player = Player::new();
-        let winning_tile = make_plain_wait(&mut first_base_player);
-        let first_base = first_base_player.concealed;
+        let mut first_active_player = Player::new();
+        let winning_tile = make_plain_wait(&mut first_active_player);
+        let first_active = first_active_player.concealed;
 
-        let mut second_base_player = Player::new();
-        add_tile(&mut second_base_player, tile(Suit::Characters, 1), 2);
-        add_tile(&mut second_base_player, tile(Suit::Characters, 2), 3);
-        add_tile(&mut second_base_player, tile(Suit::Characters, 9), 3);
-        add_tile(&mut second_base_player, tile(Suit::Bamboo, 1), 3);
-        add_tile(&mut second_base_player, tile(Suit::Bamboo, 9), 2);
-        second_base_player.missing = Some(Suit::Dots);
-        let second_base = second_base_player.concealed;
+        let mut second_active_player = Player::new();
+        add_tile(&mut second_active_player, tile(Suit::Characters, 1), 2);
+        add_tile(&mut second_active_player, tile(Suit::Characters, 2), 3);
+        add_tile(&mut second_active_player, tile(Suit::Characters, 9), 3);
+        add_tile(&mut second_active_player, tile(Suit::Bamboo, 1), 3);
+        add_tile(&mut second_active_player, tile(Suit::Bamboo, 9), 2);
+        second_active_player.missing = Some(Suit::Dots);
+        let second_active = second_active_player.concealed;
 
-        let make_winner = |base: [u8; TILE_KIND_COUNT]| {
+        let make_winner = |active: [u8; TILE_KIND_COUNT]| {
             let mut player = Player::new();
-            player.concealed = base;
+            player.concealed = active;
+            player.win_base = active;
+            player.locked = active;
             player.concealed[winning_tile.index()] += 1;
-            player.locked = player.concealed;
-            player.win_base = base;
+            player.locked[winning_tile.index()] += 1;
             player.missing = Some(Suit::Dots);
             player.has_won = true;
             player
@@ -5374,20 +5984,20 @@ mod tests {
             tiles
         };
 
-        // Swap the two hidden bases between the hand and wall. Both worlds
+        // Swap the two hidden active hands between the hand and wall. Both worlds
         // therefore have the same public state and the same unknown pool.
         let filler = core::array::from_fn(|index| (index / TILE_COPIES as usize) as u8);
         let mut left_wall = filler;
         let mut right_wall = filler;
-        for (index, tile) in tile_list(&second_base).into_iter().enumerate() {
+        for (index, tile) in tile_list(&second_active).into_iter().enumerate() {
             left_wall[index] = tile;
         }
-        for (index, tile) in tile_list(&first_base).into_iter().enumerate() {
+        for (index, tile) in tile_list(&first_active).into_iter().enumerate() {
             right_wall[index] = tile;
         }
 
         let mut left = constructed_game();
-        left.players[winner.index()] = make_winner(first_base);
+        left.players[winner.index()] = make_winner(first_active);
         left.players[viewer.index()].concealed[0] = 1;
         left.wall = left_wall;
         left.wall_head = 0;
@@ -5398,7 +6008,7 @@ mod tests {
             can_hu: false,
         };
         let mut right = left.clone();
-        right.players[winner.index()] = make_winner(second_base);
+        right.players[winner.index()] = make_winner(second_active);
         right.wall = right_wall;
 
         assert_eq!(
@@ -5408,35 +6018,100 @@ mod tests {
         for seed in 0..8 {
             let sampled_left = left
                 .resample_information_set(seed)
-                .expect("a valid hidden winning base is available in the pool");
+                .expect("a valid hidden active hand is available in the pool");
             let sampled_right = right
                 .resample_information_set(seed)
-                .expect("a valid hidden winning base is available in the pool");
+                .expect("a valid hidden active hand is available in the pool");
             assert_eq!(sampled_left, sampled_right);
             assert_eq!(
                 sampled_left.public_win_tiles(winner),
                 left.public_win_tiles(winner)
             );
-            assert_eq!(
-                sampled_left.players[winner.index()]
-                    .win_base
-                    .iter()
-                    .sum::<u8>(),
-                13
-            );
+            assert_eq!(sampled_left.players[winner.index()].unlocked_len(), 0);
+            assert_eq!(sampled_left.win_base(winner).iter().sum::<u8>(), 13);
             for index in 0..TILE_KIND_COUNT {
                 assert!(
-                    sampled_left.players[winner.index()].win_base[index]
-                        <= sampled_left.players[winner.index()].locked[index]
-                        && sampled_left.players[winner.index()].locked[index]
-                            <= sampled_left.players[winner.index()].concealed[index]
+                    sampled_left.players[winner.index()].locked[index]
+                        <= sampled_left.players[winner.index()].concealed[index]
                 );
             }
         }
     }
 
     #[test]
-    fn information_set_resampling_restores_hidden_base_without_public_win_tiles() {
+    fn information_set_resampling_conditions_every_hidden_win_base() {
+        let first_winner = Seat::EAST;
+        let second_winner = Seat::ALL[1];
+        let viewer = Seat::ALL[2];
+        let mut game = constructed_game();
+
+        let first = &mut game.players[first_winner.index()];
+        add_sequence(first, Suit::Characters, 1);
+        add_sequence(first, Suit::Characters, 7);
+        add_tile(first, tile(Suit::Bamboo, 4), 1);
+        add_tile(first, tile(Suit::Bamboo, 5), 1);
+        add_tile(first, tile(Suit::Bamboo, 9), 2);
+        first.win_base = first.concealed;
+        first.locked = first.win_base;
+        for winning_tile in [tile(Suit::Bamboo, 3), tile(Suit::Bamboo, 6)] {
+            add_tile(first, winning_tile, 1);
+            first.locked[winning_tile.index()] += 1;
+        }
+        first.missing = Some(Suit::Dots);
+        first.has_won = true;
+        first.win_count = 2;
+        assert!(first.add_meld(Meld {
+            tile: tile(Suit::Characters, 5),
+            kind: MeldKind::Pong,
+            source: Seat::ALL[3],
+        }));
+
+        let second = &mut game.players[second_winner.index()];
+        let second_winning_tile = make_plain_wait(second);
+        second.win_base = second.concealed;
+        second.locked = second.win_base;
+        add_tile(second, second_winning_tile, 1);
+        second.locked[second_winning_tile.index()] += 1;
+        second.has_won = true;
+        second.win_count = 1;
+
+        game.players[viewer.index()].concealed[tile(Suit::Dots, 4).index()] = 1;
+        let mut wall = Vec::with_capacity(12);
+        for rank in 1..=3 {
+            for _ in 0..TILE_COPIES {
+                wall.push(tile(Suit::Dots, rank));
+            }
+        }
+        set_wall(&mut game, &wall);
+        game.stage = Stage::Turn {
+            actor: viewer,
+            origin: TurnOrigin::Initial,
+            can_hu: false,
+        };
+
+        let expected_observation = observation_for(&game, viewer);
+        let expected_public_wins = [
+            game.public_win_tiles(first_winner),
+            game.public_win_tiles(second_winner),
+        ];
+        for seed in 0..16 {
+            let sampled = game
+                .resample_information_set(seed)
+                .expect("the public state has a joint legal hidden assignment");
+            assert_eq!(observation_for(&sampled, viewer), expected_observation);
+            for (winner, expected_public) in [first_winner, second_winner]
+                .into_iter()
+                .zip(expected_public_wins)
+            {
+                assert_eq!(sampled.public_win_tiles(winner), expected_public);
+                assert_eq!(sampled.players[winner.index()].unlocked_len(), 0);
+                assert_stable_base_supports_public_wins(&sampled, winner);
+            }
+        }
+    }
+
+    #[test]
+    fn information_set_resampling_preserves_public_wins_after_a_kong() {
         let mut game = constructed_game();
         let winner = Seat::EAST;
         let viewer = winner.next();
@@ -5446,8 +6121,11 @@ mod tests {
             add_tile(player, tile(Suit::Characters, rank), 1);
         }
         add_tile(player, tile(Suit::Bamboo, 1), 1);
-        player.locked = player.concealed;
         player.win_base = player.concealed;
+        player.locked = player.win_base;
+        let winning_tile = tile(Suit::Bamboo, 9);
+        add_tile(player, winning_tile, 1);
+        player.locked[winning_tile.index()] += 1;
         player.has_won = true;
         assert!(player.add_meld(Meld {
             tile: tile(Suit::Characters, 5),
@@ -5468,277 +6146,21 @@ mod tests {
             can_hu: false,
         };
 
-        assert_eq!(game.public_win_tiles(winner), [0; TILE_KIND_COUNT]);
+        let public_wins = game.public_win_tiles(winner);
+        assert_eq!(public_wins.iter().sum::<u8>(), 1);
+        assert_eq!(public_wins[winning_tile.index()], 1);
         let expected_observation = observation_for(&game, viewer);
         let sampled = game.resample_information_set(17).unwrap();
         assert_eq!(observation_for(&sampled, viewer), expected_observation);
-        assert_eq!(sampled.public_win_tiles(winner), [0; TILE_KIND_COUNT]);
-        assert_eq!(
-            sampled.players[winner.index()].win_base.iter().sum::<u8>(),
-            10
-        );
+        assert_eq!(sampled.public_win_tiles(winner), public_wins);
+        assert_eq!(sampled.players[winner.index()].unlocked_len(), 0);
+        assert_eq!(sampled.win_base(winner).iter().sum::<u8>(), 10);
         for index in 0..TILE_KIND_COUNT {
             assert!(
-                sampled.players[winner.index()].win_base[index]
-                    <= sampled.players[winner.index()].locked[index]
-                    && sampled.players[winner.index()].locked[index]
-                        <= sampled.players[winner.index()].concealed[index]
+                sampled.players[winner.index()].locked[index]
+                    <= sampled.players[winner.index()].concealed[index]
             );
         }
-    }
-
-    #[test]
-    fn response_sampling_ignores_authoritative_hidden_response_masks() {
-        let source = Seat::EAST;
-        let actor = Seat::ALL[2];
-        let earlier = Seat::ALL[1];
-        let later = Seat::ALL[3];
-        let mut left = constructed_game();
-        let pending_tile = make_plain_wait(&mut left.players[actor.index()]);
-        let _ = make_plain_wait(&mut left.players[earlier.index()]);
-        for rank in 1..=9 {
-            add_tile(
-                &mut left.players[later.index()],
-                tile(Suit::Characters, rank),
-                1,
-            );
-        }
-        for rank in 1..=4 {
-            add_tile(
-                &mut left.players[later.index()],
-                tile(Suit::Bamboo, rank),
-                1,
-            );
-        }
-        for rank in 1..=9 {
-            add_tile(&mut left.players[source.index()], tile(Suit::Dots, rank), 1);
-        }
-        for rank in 1..=4 {
-            add_tile(
-                &mut left.players[source.index()],
-                tile(Suit::Characters, rank),
-                1,
-            );
-        }
-        set_wall(
-            &mut left,
-            &[
-                tile(Suit::Characters, 5),
-                tile(Suit::Bamboo, 5),
-                tile(Suit::Dots, 5),
-            ],
-        );
-        left.stage = Stage::HuResponse {
-            source,
-            tile: pending_tile,
-            remaining: seat_bit(actor) | seat_bit(later),
-            winners: seat_bit(earlier),
-            kind: ReactionKind::Discard {
-                after_kong: false,
-                opening_discard: false,
-            },
-        };
-
-        let mut right = left.clone();
-        let earlier_concealed = right.players[earlier.index()].concealed;
-        right.players[earlier.index()].concealed = right.players[later.index()].concealed;
-        right.players[later.index()].concealed = earlier_concealed;
-        right.stage = Stage::HuResponse {
-            source,
-            tile: pending_tile,
-            remaining: seat_bit(actor),
-            winners: 0,
-            kind: ReactionKind::Discard {
-                after_kong: false,
-                opening_discard: false,
-            },
-        };
-
-        let left_observation = observation_for(&left, actor);
-        let right_observation = observation_for(&right, actor);
-        assert_eq!(left_observation, right_observation);
-        let config = crate::RulePlannerConfig::DEFAULT
-            .with_draw_horizon(0)
-            .unwrap()
-            .with_candidate_states(1)
-            .unwrap()
-            .with_belief_worlds(0)
-            .unwrap()
-            .with_response_worlds(2)
-            .unwrap()
-            .with_search_iterations(0)
-            .unwrap();
-        assert_eq!(
-            left.rule_planner_action_with_config(config),
-            right.rule_planner_action_with_config(config)
-        );
-        for seed in 0..32 {
-            let sampled = left
-                .resample_current_actor_response_information_set(seed)
-                .unwrap();
-            assert_eq!(observation_for(&sampled, actor), left_observation);
-            assert_eq!(sampled.legal_action_mask(), left.legal_action_mask());
-        }
-
-        let sampled_left = left
-            .resample_current_actor_response_information_set(0x1234)
-            .unwrap();
-        let sampled_right = right
-            .resample_current_actor_response_information_set(0x1234)
-            .unwrap();
-        for seat in Seat::ALL {
-            assert_eq!(
-                sampled_left.players[seat.index()].concealed,
-                sampled_right.players[seat.index()].concealed
-            );
-        }
-        assert_eq!(sampled_left.wall, sampled_right.wall);
-        assert_eq!(sampled_left.stage, sampled_right.stage);
-        assert_eq!(sampled_left.legal_action_mask(), left.legal_action_mask());
-        assert_eq!(sampled_right.legal_action_mask(), right.legal_action_mask());
-    }
-
-    #[test]
-    fn response_sampling_preserves_added_kong_completion() {
-        let source = Seat::EAST;
-        let actor = Seat::ALL[1];
-        let mut game = constructed_game();
-        let kong_tile = make_plain_wait(&mut game.players[actor.index()]);
-        let source_player = &mut game.players[source.index()];
-        source_player.missing = Some(Suit::Dots);
-        for rank in 1..=9 {
-            add_tile(source_player, tile(Suit::Characters, rank), 1);
-        }
-        add_tile(source_player, tile(Suit::Bamboo, 1), 1);
-        source_player.locked = source_player.concealed;
-        source_player.win_base = source_player.concealed;
-        source_player.has_won = true;
-        assert!(source_player.add_meld(Meld {
-            tile: kong_tile,
-            kind: MeldKind::Pong,
-            source: Seat::ALL[3],
-        }));
-        add_tile(source_player, kong_tile, 1);
-        add_tile(source_player, tile(Suit::Dots, 1), 1);
-        assert_eq!(game.public_win_tiles(source), [0; TILE_KIND_COUNT]);
-        game.discards[0] = tile(Suit::Characters, 9).as_u8();
-        game.discard_owners[0] = source.as_u8();
-        game.discard_len = 1;
-        let supplement = tile(Suit::Dots, 2);
-        set_wall(&mut game, &[supplement]);
-        game.stage = Stage::HuResponse {
-            source,
-            tile: kong_tile,
-            remaining: seat_bit(actor),
-            winners: 0,
-            kind: ReactionKind::AddedKong,
-        };
-
-        let mut sampled = game
-            .resample_current_actor_response_information_set(0x5678)
-            .unwrap();
-        while sampled.phase() == Phase::HuResponse {
-            sampled.step(Action::Pass).unwrap();
-        }
-
-        assert_eq!(sampled.meld(source, 0).unwrap().kind, MeldKind::AddedKong);
-        assert_eq!(
-            sampled
-                .current_draw()
-                .map(|draw| (draw.player, draw.replacement)),
-            Some((source, true))
-        );
-        assert_eq!(sampled.score(source), STARTING_SCORE + 3 * SCORE_UNIT);
-        for payer in seats_after(source) {
-            assert_eq!(sampled.score(payer), STARTING_SCORE - SCORE_UNIT);
-        }
-    }
-
-    #[test]
-    fn meld_response_sampling_is_conditioned_on_no_hu() {
-        let source = Seat::EAST;
-        let actor = Seat::ALL[1];
-        let pending_tile = tile(Suit::Bamboo, 5);
-        let mut game = constructed_game();
-        let player = &mut game.players[actor.index()];
-        player.missing = Some(Suit::Dots);
-        add_tile(player, pending_tile, 2);
-        add_tile(player, tile(Suit::Dots, 1), 1);
-        for rank in 1..=9 {
-            add_tile(player, tile(Suit::Characters, rank), 1);
-        }
-        add_tile(player, tile(Suit::Bamboo, 1), 1);
-        let _ = make_plain_wait(&mut game.players[Seat::ALL[2].index()]);
-        let _ = make_plain_wait(&mut game.players[Seat::ALL[3].index()]);
-        set_wall(
-            &mut game,
-            &[
-                tile(Suit::Characters, 1),
-                tile(Suit::Characters, 2),
-                tile(Suit::Characters, 3),
-                tile(Suit::Bamboo, 6),
-                tile(Suit::Bamboo, 7),
-                tile(Suit::Bamboo, 8),
-                tile(Suit::Dots, 2),
-                tile(Suit::Dots, 3),
-                tile(Suit::Dots, 4),
-            ],
-        );
-        game.stage = Stage::MeldResponse {
-            source,
-            tile: pending_tile,
-            remaining: seat_bit(actor),
-        };
-        let expected_observation = observation_for(&game, actor);
-        let expected_legal = game.legal_action_mask();
-
-        for seed in 0..32 {
-            let sampled = game
-                .resample_current_actor_response_information_set(seed)
-                .unwrap();
-            assert_eq!(observation_for(&sampled, actor), expected_observation);
-            assert_eq!(sampled.legal_action_mask(), expected_legal);
-            assert!(
-                seats_after(source)
-                    .into_iter()
-                    .all(|seat| !sampled.can_player_win_with_added_tile(seat, pending_tile))
-            );
-        }
-    }
-
-    #[test]
-    fn information_set_resampling_respects_proven_empty_missing_suits() {
-        let mut game = Game::new(913);
-        let constrained = loop {
-            if game.phase() == Phase::Turn {
-                let actor = game.decision().unwrap().actor;
-                if let Some(constraint) = Seat::ALL
-                    .into_iter()
-                    .filter(|&seat| seat != actor)
-                    .find_map(|seat| game.known_empty_missing_suit(seat).map(|suit| (seat, suit)))
-                {
-                    break constraint;
-                }
-            }
-            let action = game
-                .simple_rule_action()
-                .expect("the seeded game reaches a constrained turn");
-            game.step_id(action).unwrap();
-        };
-        let (seat, forbidden_suit) = constrained;
-        let start = forbidden_suit as usize * 9;
-
-        for seed in 0..128 {
-            let sampled = game.resample_information_set(seed).unwrap();
-            assert_eq!(sampled.concealed(seat)[start..start + 9], [0; 9]);
-        }
-    }
-
-    #[test]
-    fn constrained_weight_sampling_never_selects_zero_mass_fallback() {
-        assert_eq!(choose_weighted_index(&[1.0, 0.0], 1.0), 0);
-        assert_eq!(choose_weighted_index(&[0.0, 1.0, 0.0], 1.0), 1);
-        assert_eq!(choose_weighted_index(&[0.0, 2.0, 0.0, 3.0], 5.0), 3);
     }
 
     #[test]
@@ -5903,67 +6325,17 @@ mod tests {
     }
 
     #[test]
-    fn long_games_preserve_stable_bloodflow_bases_and_repeat_scores() {
-        type RepeatScore = ([u8; TILE_KIND_COUNT], [Option<Meld>; 4], u32);
-
+    fn long_games_preserve_bloodflow_state_invariants() {
         for seed in 0..1_000 {
             let mut game = Game::new(seed);
-            let mut repeat_scores = [[None::<RepeatScore>; TILE_KIND_COUNT]; PLAYER_COUNT];
             for step in 0..512 {
                 let Some(action_id) = game.simple_rule_action() else {
                     break;
                 };
-                let action = action_id.action();
-                if action == Action::Hu {
-                    let actor = game.decision().expect("Hu has an actor").actor;
-                    let required = match game.stage {
-                        Stage::Turn {
-                            origin: TurnOrigin::Draw { tile, .. },
-                            ..
-                        }
-                        | Stage::HuResponse { tile, .. } => Some(tile),
-                        Stage::Turn {
-                            origin: TurnOrigin::Initial,
-                            ..
-                        } => None,
-                        Stage::Turn {
-                            origin: TurnOrigin::AfterPong,
-                            ..
-                        }
-                        | Stage::Exchange { .. }
-                        | Stage::ChooseMissing { .. }
-                        | Stage::MeldResponse { .. }
-                        | Stage::Finished => panic!("Hu must resolve a winning turn or response"),
-                    };
-                    if let Some(tile) = required
-                        && game.players[actor.index()].has_won
-                    {
-                        let mut candidate = game.clone();
-                        if matches!(game.stage, Stage::HuResponse { .. }) {
-                            candidate.players[actor.index()].concealed[tile.index()] += 1;
-                        }
-                        let evaluation = candidate
-                            .evaluate_player(actor, Some(tile), WinFlags::NONE)
-                            .expect("a legal repeat Hu has an exact evaluation");
-                        let player = &game.players[actor.index()];
-                        let signature = (player.win_base, player.melds);
-                        if let Some((base, melds, multiplier)) =
-                            repeat_scores[actor.index()][tile.index()]
-                            && (base, melds) == signature
-                        {
-                            assert_eq!(
-                                multiplier, evaluation.shape_multiplier,
-                                "seed {seed}, step {step}, actor {actor:?}, tile {tile:?}"
-                            );
-                        }
-                        repeat_scores[actor.index()][tile.index()] =
-                            Some((signature.0, signature.1, evaluation.shape_multiplier));
-                    }
-                }
-
                 game.step_id(action_id)
                     .expect("simple policy action is legal");
-                for (index, player) in game.players.iter().enumerate() {
+                for (index, &seat) in Seat::ALL.iter().enumerate() {
+                    let player = &game.players[index];
                     for tile in 0..TILE_KIND_COUNT {
                         assert!(
                             player.win_base[tile] <= player.locked[tile]
@@ -5973,15 +6345,45 @@ mod tests {
                     }
                     if !player.has_won {
                         assert_eq!(player.win_base, [0; TILE_KIND_COUNT]);
+                        assert_eq!(player.locked, [0; TILE_KIND_COUNT]);
                     }
-                    let target_len = 13_usize.saturating_sub(3 * player.meld_count as usize);
-                    assert!(
+                    assert_eq!(
+                        player.kong_forbidden_mask >> TILE_KIND_COUNT,
+                        0,
+                        "seed {seed}, step {step}, player {index}"
+                    );
+                    assert_eq!(
+                        game.public_win_tiles(seat).iter().sum::<u8>(),
+                        player.win_count.min(u32::from(u8::MAX)) as u8,
+                        "seed {seed}, step {step}, player {index}"
+                    );
+
+                    let stable_len = 13_usize.saturating_sub(3 * player.meld_count as usize);
+                    let extra_tile = match game.stage {
+                        Stage::Exchange { .. } | Stage::ChooseMissing { .. } => {
+                            usize::from(seat == game.dealer)
+                        }
+                        Stage::Turn { actor, .. } => usize::from(seat == actor),
+                        Stage::HuResponse {
+                            source,
+                            kind: ReactionKind::AddedKong,
+                            ..
+                        } => usize::from(seat == source),
+                        Stage::HuResponse {
+                            kind: ReactionKind::Discard { .. },
+                            ..
+                        }
+                        | Stage::MeldResponse { .. }
+                        | Stage::Finished => 0,
+                    };
+                    assert_eq!(
                         player
-                            .win_base
+                            .evaluation_counts()
+                            .expect("blood-flow partitions stay consistent")
                             .iter()
-                            .map(|&count| count as usize)
-                            .sum::<usize>()
-                            <= target_len,
+                            .map(|&count| usize::from(count))
+                            .sum::<usize>(),
+                        stable_len + extra_tile,
                         "seed {seed}, step {step}, player {index}"
                     );
                 }

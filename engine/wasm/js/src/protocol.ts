@@ -11,6 +11,11 @@ export type BotProfile = "rule-fast" | "rule-ev" | "rule-nn";
 
 export type HintPolicy = BotProfile;
 
+export interface EngineCapabilities {
+  engineRulesVersion: number;
+  nnAvailable: boolean;
+}
+
 export const REPLAY_PROTOCOL_VERSION = 1;
 
 export interface ReplayRecord {
@@ -80,6 +85,13 @@ export type WorkerResponse =
       type: "ready";
       requestId: string;
       engineRulesVersion: number;
+      nnAvailable: boolean;
+    }
+  | {
+      type: "capabilities";
+      requestId: string;
+      engineRulesVersion: number;
+      nnAvailable: boolean;
     }
   | {
       type: "snapshot";

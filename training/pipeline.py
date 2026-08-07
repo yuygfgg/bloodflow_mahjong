@@ -7,6 +7,7 @@ import math
 import random
 import time
 import warnings
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -56,14 +57,22 @@ class PPOConfig:
     # rollout into hundreds of tiny dynamic shapes.
     history_cache_min_batch: int = 1_024
     learning_rate: float = 2e-4
-    final_learning_rate: float = 3e-5
+    minimum_learning_rate: float = 3e-5
+    learning_rate_decay: float = 0.5
+    learning_rate_patience_evaluations: int = 6
+    learning_rate_rank_improvement: float = 0.02
+    learning_rate_score_improvement: float = 50.0
     gamma: float = 1.0
     gae_lambda: float = 0.95
     clip_ratio: float = 0.15
     value_coefficient: float = 0.5
     entropy_coefficient: float = 0.01
-    final_entropy_coefficient: float = 0.002
-    schedule_hours: float = 24.0
+    minimum_entropy_coefficient: float = 0.001
+    maximum_entropy_coefficient: float = 0.02
+    entropy_target_low: float = 0.07
+    entropy_target_high: float = 0.18
+    entropy_adjustment: float = 1.25
+    entropy_patience_evaluations: int = 3
     max_grad_norm: float = 0.5
     target_kl: float = 0.015
     kl_control: str = "monitor"
@@ -71,13 +80,17 @@ class PPOConfig:
     rank_reward_weight: float = 1.0
     shanten_coefficient: float = 0.02
     improving_coefficient: float = 0.01
-    auxiliary_decay_fraction: float = 0.10
-    self_play_enabled: bool = False
-    self_play_fraction: float = 0.25
-    self_play_gate_score_delta: float = 0.0
-    self_play_gate_consecutive_evals: int = 3
+    self_play_enabled: bool = True
+    self_play_max_fraction: float = 0.45
+    self_play_fraction_step: float = 0.15
+    self_play_gate_score_delta: float = 75.0
+    self_play_gate_mean_rank: float = 2.45
+    self_play_fallback_score_delta: float = -75.0
+    self_play_fallback_mean_rank: float = 2.55
+    self_play_gate_confidence_z: float = 1.96
+    self_play_gate_window: int = 3
+    self_play_gate_required_passes: int = 2
     historical_snapshot_probability: float = 0.50
-    opponent_refresh_updates: int = 200
     frozen_snapshot_limit: int = 4
 
     def __post_init__(self) -> None:
@@ -88,8 +101,10 @@ class PPOConfig:
             "minibatch",
             "microbatch",
             "history_cache_min_batch",
-            "self_play_gate_consecutive_evals",
-            "opponent_refresh_updates",
+            "learning_rate_patience_evaluations",
+            "entropy_patience_evaluations",
+            "self_play_gate_window",
+            "self_play_gate_required_passes",
             "frozen_snapshot_limit",
         ):
             if getattr(self, name) <= 0:
@@ -105,18 +120,472 @@ class PPOConfig:
             self.kl_control == "rollback" and self.target_kl <= 0.0
         ):
             raise ValueError("target KL must be finite and positive in rollback mode")
-        if not math.isfinite(self.self_play_fraction) or not (
-            0.0 <= self.self_play_fraction < 1.0
+        if not (
+            math.isfinite(self.learning_rate)
+            and math.isfinite(self.minimum_learning_rate)
+            and 0.0 < self.minimum_learning_rate <= self.learning_rate
         ):
-            raise ValueError("self-play fraction must be in [0, 1)")
-        if self.self_play_enabled and self.self_play_fraction == 0.0:
-            raise ValueError("enabled self-play requires a positive fraction")
-        if not math.isfinite(self.self_play_gate_score_delta):
-            raise ValueError("self-play gate score delta must be finite")
+            raise ValueError("minimum learning rate must be in (0, learning_rate]")
+        if not math.isfinite(self.learning_rate_decay) or not (
+            0.0 < self.learning_rate_decay < 1.0
+        ):
+            raise ValueError("learning rate decay must be in (0, 1)")
+        if not (
+            math.isfinite(self.minimum_entropy_coefficient)
+            and math.isfinite(self.maximum_entropy_coefficient)
+            and 0.0 <= self.minimum_entropy_coefficient
+            <= self.entropy_coefficient
+            <= self.maximum_entropy_coefficient
+        ):
+            raise ValueError("entropy coefficient limits are invalid")
+        if not (
+            0.0 <= self.entropy_target_low < self.entropy_target_high <= 1.0
+        ):
+            raise ValueError("entropy targets must be ordered within [0, 1]")
+        if not math.isfinite(self.entropy_adjustment) or self.entropy_adjustment <= 1.0:
+            raise ValueError("entropy adjustment must be greater than one")
+        if not math.isfinite(self.self_play_max_fraction) or not (
+            0.0 < self.self_play_max_fraction < 1.0
+        ):
+            raise ValueError("maximum self-play fraction must be in (0, 1)")
+        if not math.isfinite(self.self_play_fraction_step) or not (
+            0.0 < self.self_play_fraction_step <= self.self_play_max_fraction
+        ):
+            raise ValueError("self-play fraction step is invalid")
+        for name in (
+            "self_play_gate_score_delta",
+            "self_play_gate_mean_rank",
+            "self_play_fallback_score_delta",
+            "self_play_fallback_mean_rank",
+            "self_play_gate_confidence_z",
+            "learning_rate_rank_improvement",
+            "learning_rate_score_improvement",
+        ):
+            if not math.isfinite(getattr(self, name)):
+                raise ValueError(f"{name} must be finite")
+        if self.self_play_gate_confidence_z <= 0.0:
+            raise ValueError("self-play gate confidence z must be positive")
+        if (
+            self.learning_rate_rank_improvement < 0.0
+            or self.learning_rate_score_improvement < 0.0
+        ):
+            raise ValueError("learning-rate improvement margins cannot be negative")
+        if self.self_play_gate_required_passes > self.self_play_gate_window:
+            raise ValueError("required gate passes cannot exceed the gate window")
+        if not (
+            self.self_play_gate_mean_rank < self.self_play_fallback_mean_rank
+            and self.self_play_fallback_score_delta < self.self_play_gate_score_delta
+        ):
+            raise ValueError("self-play fallback thresholds must provide hysteresis")
         if not math.isfinite(self.historical_snapshot_probability) or not (
             0.0 <= self.historical_snapshot_probability <= 1.0
         ):
             raise ValueError("historical snapshot probability must be in [0, 1]")
+
+
+@dataclass(frozen=True)
+class TrainingControls:
+    learning_rate: float
+    entropy_coefficient: float
+    auxiliary_scale: float
+
+    def __post_init__(self) -> None:
+        if not math.isfinite(self.learning_rate) or self.learning_rate <= 0.0:
+            raise ValueError("controlled learning rate must be finite and positive")
+        if (
+            not math.isfinite(self.entropy_coefficient)
+            or self.entropy_coefficient < 0.0
+        ):
+            raise ValueError("controlled entropy coefficient must be finite and non-negative")
+        if not math.isfinite(self.auxiliary_scale) or not (
+            0.0 <= self.auxiliary_scale <= 1.0
+        ):
+            raise ValueError("controlled auxiliary scale must be within [0, 1]")
+
+
+def _confidence_bounds(mean: float, standard_error: float, z: float) -> tuple[float, float]:
+    radius = z * standard_error
+    return mean - radius, mean + radius
+
+
+def _pooled_panel_statistics(
+    evaluations: list[dict[str, float]],
+) -> dict[str, float]:
+    """Combine independent, seat-balanced evaluation panels."""
+    if not evaluations:
+        raise ValueError("cannot pool an empty evaluation window")
+
+    def combine(prefix: str) -> tuple[float, float, float]:
+        count = sum(int(item["panel_count"]) for item in evaluations)
+        if count <= 0:
+            raise ValueError("evaluation panel count must be positive")
+        mean = sum(
+            int(item["panel_count"]) * float(item[f"mean_{prefix}"])
+            for item in evaluations
+        ) / count
+        m2 = 0.0
+        for item in evaluations:
+            item_count = int(item["panel_count"])
+            item_mean = float(item[f"mean_{prefix}"])
+            item_std = float(item[f"{prefix}_panel_std"])
+            m2 += max(item_count - 1, 0) * item_std * item_std
+            m2 += item_count * (item_mean - mean) ** 2
+        standard_deviation = math.sqrt(m2 / (count - 1)) if count > 1 else 0.0
+        standard_error = standard_deviation / math.sqrt(count) if count > 1 else 0.0
+        return mean, standard_deviation, standard_error
+
+    score_mean, score_std, score_se = combine("score_delta")
+    rank_mean, rank_std, rank_se = combine("rank")
+    return {
+        "panel_count": float(sum(int(item["panel_count"]) for item in evaluations)),
+        "mean_score_delta": score_mean,
+        "score_delta_panel_std": score_std,
+        "score_se": score_se,
+        "mean_rank": rank_mean,
+        "rank_panel_std": rank_std,
+        "rank_se": rank_se,
+    }
+
+
+class TrainingController:
+    """Metric-driven learning controls and Rule-EV curriculum evidence."""
+
+    AUXILIARY_SCALES = (1.0, 0.5, 0.25, 0.0)
+    EVALUATION_FIELDS = frozenset(
+        {
+            "panel_count",
+            "mean_score_delta",
+            "score_delta_panel_std",
+            "score_se",
+            "mean_rank",
+            "rank_panel_std",
+            "rank_se",
+        }
+    )
+
+    def __init__(self, config: PPOConfig, evaluation_seed: int = 0) -> None:
+        self.config = config
+        self.current_learning_rate = config.learning_rate
+        self.current_entropy_coefficient = config.entropy_coefficient
+        self.learning_rate_plateau = 0
+        self.entropy_low_streak = 0
+        self.entropy_high_streak = 0
+        self.best_rank: float | None = None
+        self.best_score_delta: float | None = None
+        self.champion_rank: float | None = None
+        self.champion_score_delta: float | None = None
+        self.last_decision_evaluation: dict[str, float] | None = None
+        self.evaluation_window: list[dict[str, float]] = []
+        self.next_evaluation_seed = int(evaluation_seed)
+        self.evaluation_count = 0
+        self.entropy_sum = 0.0
+        self.entropy_updates = 0
+        self.last_decision = "hold"
+
+    def controls(self, self_play_level: int) -> TrainingControls:
+        level = min(max(int(self_play_level), 0), len(self.AUXILIARY_SCALES) - 1)
+        return TrainingControls(
+            learning_rate=self.current_learning_rate,
+            entropy_coefficient=self.current_entropy_coefficient,
+            auxiliary_scale=self.AUXILIARY_SCALES[level],
+        )
+
+    def reset_learning_rate_schedule(self) -> None:
+        """Start a new learning-rate schedule from the configured initial rate."""
+        self.current_learning_rate = self.config.learning_rate
+        self.learning_rate_plateau = 0
+        self.best_rank = None
+        self.best_score_delta = None
+
+    def take_evaluation_seed(self, games: int) -> int:
+        if games <= 0 or games % 4:
+            raise ValueError("evaluation games must be a positive multiple of four")
+        seed = self.next_evaluation_seed
+        self.next_evaluation_seed += games // 4
+        return seed
+
+    def observe_update(self, statistics: dict[str, float]) -> None:
+        entropy = float(statistics["entropy"])
+        if not math.isfinite(entropy):
+            raise ValueError("training entropy must be finite")
+        self.entropy_sum += entropy
+        self.entropy_updates += 1
+
+    @classmethod
+    def _normalize_evaluation(
+        cls, evaluation: Mapping[str, Any]
+    ) -> dict[str, float]:
+        if not isinstance(evaluation, Mapping):
+            raise ValueError("Rule-EV evaluation must be a mapping")
+        missing = cls.EVALUATION_FIELDS - evaluation.keys()
+        if missing:
+            raise ValueError(
+                "Rule-EV evaluation is missing: " + ", ".join(sorted(missing))
+            )
+        values = {
+            name: float(evaluation[name]) for name in cls.EVALUATION_FIELDS
+        }
+        if any(not math.isfinite(value) for value in values.values()):
+            raise ValueError("Rule-EV evaluation contains a non-finite value")
+        panel_count = values["panel_count"]
+        if panel_count < 1.0 or not panel_count.is_integer():
+            raise ValueError("Rule-EV evaluation panel count must be a positive integer")
+        for name in (
+            "score_delta_panel_std",
+            "score_se",
+            "rank_panel_std",
+            "rank_se",
+        ):
+            if values[name] < 0.0:
+                raise ValueError("Rule-EV evaluation uncertainty cannot be negative")
+        if not 1.0 <= values["mean_rank"] <= 4.0:
+            raise ValueError("Rule-EV mean rank must be within [1, 4]")
+        return values
+
+    def _single_passes(self, evaluation: dict[str, float]) -> bool:
+        if int(evaluation["panel_count"]) < 2:
+            return False
+        score_low, _ = _confidence_bounds(
+            float(evaluation["mean_score_delta"]),
+            float(evaluation["score_se"]),
+            self.config.self_play_gate_confidence_z,
+        )
+        _, rank_high = _confidence_bounds(
+            float(evaluation["mean_rank"]),
+            float(evaluation["rank_se"]),
+            self.config.self_play_gate_confidence_z,
+        )
+        return (
+            score_low > self.config.self_play_gate_score_delta
+            and rank_high < self.config.self_play_gate_mean_rank
+        )
+
+    def _single_fails(self, evaluation: dict[str, float]) -> bool:
+        if int(evaluation["panel_count"]) < 2:
+            return False
+        _, score_high = _confidence_bounds(
+            float(evaluation["mean_score_delta"]),
+            float(evaluation["score_se"]),
+            self.config.self_play_gate_confidence_z,
+        )
+        rank_low, _ = _confidence_bounds(
+            float(evaluation["mean_rank"]),
+            float(evaluation["rank_se"]),
+            self.config.self_play_gate_confidence_z,
+        )
+        return (
+            score_high < self.config.self_play_fallback_score_delta
+            or rank_low > self.config.self_play_fallback_mean_rank
+        )
+
+    def _update_learning_rate(self, evaluation: dict[str, float]) -> None:
+        rank = float(evaluation["mean_rank"])
+        score = float(evaluation["mean_score_delta"])
+        improved = self.best_rank is None or self.best_score_delta is None
+        if not improved:
+            improved = rank < self.best_rank - self.config.learning_rate_rank_improvement
+            if not improved and rank <= self.best_rank + self.config.learning_rate_rank_improvement:
+                improved = (
+                    score
+                    > self.best_score_delta
+                    + self.config.learning_rate_score_improvement
+                )
+        if improved:
+            self.best_rank = rank
+            self.best_score_delta = score
+            self.learning_rate_plateau = 0
+            return
+        self.learning_rate_plateau += 1
+        if (
+            self.learning_rate_plateau
+            >= self.config.learning_rate_patience_evaluations
+        ):
+            self.current_learning_rate = max(
+                self.config.minimum_learning_rate,
+                self.current_learning_rate * self.config.learning_rate_decay,
+            )
+            self.learning_rate_plateau = 0
+
+    def _update_entropy(self) -> None:
+        if self.entropy_updates == 0:
+            return
+        entropy = self.entropy_sum / self.entropy_updates
+        self.entropy_sum = 0.0
+        self.entropy_updates = 0
+        if entropy < self.config.entropy_target_low:
+            self.entropy_low_streak += 1
+            self.entropy_high_streak = 0
+        elif entropy > self.config.entropy_target_high:
+            self.entropy_high_streak += 1
+            self.entropy_low_streak = 0
+        else:
+            self.entropy_low_streak = 0
+            self.entropy_high_streak = 0
+        patience = self.config.entropy_patience_evaluations
+        if self.entropy_low_streak >= patience:
+            self.current_entropy_coefficient = min(
+                self.config.maximum_entropy_coefficient,
+                self.current_entropy_coefficient * self.config.entropy_adjustment,
+            )
+            self.entropy_low_streak = 0
+        elif self.entropy_high_streak >= patience:
+            self.current_entropy_coefficient = max(
+                self.config.minimum_entropy_coefficient,
+                self.current_entropy_coefficient / self.config.entropy_adjustment,
+            )
+            self.entropy_high_streak = 0
+
+    def observe_rule_ev(
+        self,
+        evaluation: dict[str, Any],
+        *,
+        self_play_level: int,
+        maximum_self_play_level: int,
+    ) -> str:
+        if evaluation.get("opponent") != "rule-ev":
+            raise ValueError("training controls accept only Rule-EV evaluations")
+        normalized = self._normalize_evaluation(evaluation)
+
+        self.evaluation_count += 1
+        self._update_learning_rate(normalized)
+        self._update_entropy()
+        self.evaluation_window.append(normalized)
+        self.evaluation_window = self.evaluation_window[
+            -self.config.self_play_gate_window :
+        ]
+        self.last_decision = "hold"
+        self.last_decision_evaluation = None
+        if len(self.evaluation_window) < self.config.self_play_gate_window:
+            return self.last_decision
+
+        pooled = _pooled_panel_statistics(self.evaluation_window)
+        latest_passes = self._single_passes(self.evaluation_window[-1])
+        pass_count = sum(self._single_passes(item) for item in self.evaluation_window)
+        pooled_passes = self._single_passes(pooled)
+        latest_fails = self._single_fails(self.evaluation_window[-1])
+        fail_count = sum(self._single_fails(item) for item in self.evaluation_window)
+        pooled_fails = self._single_fails(pooled)
+
+        if (
+            self.config.self_play_enabled
+            and latest_passes
+            and pooled_passes
+            and pass_count >= self.config.self_play_gate_required_passes
+        ):
+            if self_play_level < maximum_self_play_level:
+                self.last_decision = "promote"
+            elif self._improves_champion(pooled):
+                self.last_decision = "refresh"
+        elif (
+            self_play_level > 0
+            and latest_fails
+            and pooled_fails
+            and fail_count >= self.config.self_play_gate_required_passes
+        ):
+            self.last_decision = "demote"
+
+        if self.last_decision != "hold":
+            self.last_decision_evaluation = pooled
+            self.evaluation_window.clear()
+            self.learning_rate_plateau = 0
+        return self.last_decision
+
+    def _improves_champion(self, evaluation: dict[str, float]) -> bool:
+        if self.champion_rank is None or self.champion_score_delta is None:
+            return True
+        rank = float(evaluation["mean_rank"])
+        score = float(evaluation["mean_score_delta"])
+        return (
+            rank < self.champion_rank - self.config.learning_rate_rank_improvement
+            or (
+                rank <= self.champion_rank + self.config.learning_rate_rank_improvement
+                and score
+                > self.champion_score_delta
+                + self.config.learning_rate_score_improvement
+            )
+        )
+
+    def mark_champion(self) -> None:
+        if self.last_decision_evaluation is None:
+            raise RuntimeError("cannot mark a champion without gate evidence")
+        self.champion_rank = float(self.last_decision_evaluation["mean_rank"])
+        self.champion_score_delta = float(
+            self.last_decision_evaluation["mean_score_delta"]
+        )
+
+    def gate_statistics(self) -> dict[str, Any]:
+        pooled = (
+            _pooled_panel_statistics(self.evaluation_window)
+            if self.evaluation_window
+            else None
+        )
+        return {
+            "window_size": len(self.evaluation_window),
+            "required_window_size": self.config.self_play_gate_window,
+            "single_passes": sum(
+                self._single_passes(item) for item in self.evaluation_window
+            ),
+            "single_fails": sum(
+                self._single_fails(item) for item in self.evaluation_window
+            ),
+            "pooled": pooled,
+            "last_decision": self.last_decision,
+            "decision_evaluation": self.last_decision_evaluation,
+        }
+
+    def state_dict(self) -> dict[str, Any]:
+        return {
+            "current_learning_rate": self.current_learning_rate,
+            "current_entropy_coefficient": self.current_entropy_coefficient,
+            "learning_rate_plateau": self.learning_rate_plateau,
+            "entropy_low_streak": self.entropy_low_streak,
+            "entropy_high_streak": self.entropy_high_streak,
+            "best_rank": self.best_rank,
+            "best_score_delta": self.best_score_delta,
+            "champion_rank": self.champion_rank,
+            "champion_score_delta": self.champion_score_delta,
+            "last_decision_evaluation": self.last_decision_evaluation,
+            "evaluation_window": self.evaluation_window,
+            "next_evaluation_seed": self.next_evaluation_seed,
+            "evaluation_count": self.evaluation_count,
+            "entropy_sum": self.entropy_sum,
+            "entropy_updates": self.entropy_updates,
+            "last_decision": self.last_decision,
+        }
+
+    def load_state_dict(self, state: dict[str, Any] | None) -> None:
+        if not state:
+            warnings.warn(
+                "checkpoint has no metric-controller state; gate evidence was reset",
+                stacklevel=3,
+            )
+            return
+        self.current_learning_rate = float(state["current_learning_rate"])
+        self.current_entropy_coefficient = float(
+            state["current_entropy_coefficient"]
+        )
+        self.learning_rate_plateau = int(state["learning_rate_plateau"])
+        self.entropy_low_streak = int(state["entropy_low_streak"])
+        self.entropy_high_streak = int(state["entropy_high_streak"])
+        self.best_rank = state.get("best_rank")
+        self.best_score_delta = state.get("best_score_delta")
+        self.champion_rank = state.get("champion_rank")
+        self.champion_score_delta = state.get("champion_score_delta")
+        decision_evaluation = state.get("last_decision_evaluation")
+        self.last_decision_evaluation = (
+            self._normalize_evaluation(decision_evaluation)
+            if isinstance(decision_evaluation, dict)
+            else None
+        )
+        self.evaluation_window = [
+            self._normalize_evaluation(item)
+            for item in state.get("evaluation_window", [])
+        ][-self.config.self_play_gate_window :]
+        self.next_evaluation_seed = int(state["next_evaluation_seed"])
+        self.evaluation_count = int(state["evaluation_count"])
+        self.entropy_sum = float(state.get("entropy_sum", 0.0))
+        self.entropy_updates = int(state.get("entropy_updates", 0))
+        self.last_decision = str(state.get("last_decision", "hold"))
 
 
 def focal_ranks(scores: np.ndarray, seats: np.ndarray) -> np.ndarray:
@@ -188,7 +657,10 @@ class EngineBuffers:
     def create(cls, batch_size: int, history: int = 192) -> EngineBuffers:
         return cls(
             batch=bm.Batch(batch_size, seed=1),
-            tile_obs=np.empty((batch_size, 10, 27), dtype=np.uint8),
+            tile_obs=np.empty(
+                (batch_size, bm.TILE_OBSERVATION_PLANES, bm.TILE_KIND_COUNT),
+                dtype=np.uint8,
+            ),
             melds=np.empty((batch_size, 4, 4, 3), dtype=np.uint8),
             river=np.empty((batch_size, 108, 2), dtype=np.uint8),
             meta=np.empty((batch_size, 34), dtype=np.int32),
@@ -245,7 +717,10 @@ class TransitionStorage:
         self.finalized = np.zeros(capacity, dtype=np.bool_)
         self.env = np.empty(capacity, dtype=np.int32)
         self.episode = np.empty(capacity, dtype=np.int64)
-        self.tile_obs = np.empty((capacity, 10, 27), dtype=np.uint8)
+        self.tile_obs = np.empty(
+            (capacity, bm.TILE_OBSERVATION_PLANES, bm.TILE_KIND_COUNT),
+            dtype=np.uint8,
+        )
         self.melds = np.empty((capacity, 4, 4, 3), dtype=np.uint8)
         self.meta = np.empty((capacity, 34), dtype=np.int32)
         self.events = np.empty((capacity, history, 8), dtype=np.int32)
@@ -425,7 +900,7 @@ def _inference_chunk(
 
 
 class OpponentPool:
-    """Rule opponents and an optional fixed-ratio frozen-policy pool.
+    """Rule opponents and a metric-controlled frozen-policy pool.
 
     Opponent types are assigned per *absolute seat*, not once per game.  This
     gives the learner mixed three-player tables while keeping every policy
@@ -445,9 +920,7 @@ class OpponentPool:
         self.snapshots: list[BloodFlowTransformer] = []
         self.active_snapshot: int | None = None
         self.last_snapshot_update: int | None = None
-        self.rule_first_rate: float | None = None
-        self.rule_score_delta: float | None = None
-        self.rule_gate_streak = 0
+        self.self_play_level = 0
 
     @property
     def frozen_model(self) -> BloodFlowTransformer | None:
@@ -460,22 +933,34 @@ class OpponentPool:
         return self.frozen_model is not None
 
     @property
-    def gate_ready(self) -> bool:
-        return (
-            self.rule_gate_streak
-            >= self.config.self_play_gate_consecutive_evals
+    def maximum_self_play_level(self) -> int:
+        return int(
+            math.ceil(
+                self.config.self_play_max_fraction
+                / self.config.self_play_fraction_step
+                - 1e-12
+            )
+        )
+
+    @property
+    def frozen_fraction(self) -> float:
+        if not self.config.self_play_enabled or self.self_play_level <= 0:
+            return 0.0
+        return min(
+            self.self_play_level * self.config.self_play_fraction_step,
+            self.config.self_play_max_fraction,
         )
 
     def stage(self) -> str:
         """Return the executable opponent stage from rule competence.
 
-        Transition count is deliberately absent from this decision.  A few
-        consecutive evaluations are required so a noisy small evaluation
-        cannot promote the learner into a harder opponent distribution.
+        Transition count is deliberately absent from this decision. The
+        metric controller changes ``self_play_level`` only after Rule-EV
+        confidence gates have passed.
         """
         if (
             not self.config.self_play_enabled
-            or not self.gate_ready
+            or self.self_play_level == 0
             or not self.frozen_ready
         ):
             return "bootstrap"
@@ -485,12 +970,12 @@ class OpponentPool:
         """Probability of each policy for one non-learner seat."""
         if self.stage() == "bootstrap":
             return np.array([1.0 / 3.0, 2.0 / 3.0, 0.0], dtype=np.float64)
-        rule_fraction = 1.0 - self.config.self_play_fraction
+        rule_fraction = 1.0 - self.frozen_fraction
         return np.array(
             [
                 rule_fraction / 3.0,
                 2.0 * rule_fraction / 3.0,
-                self.config.self_play_fraction,
+                self.frozen_fraction,
             ],
             dtype=np.float64,
         )
@@ -519,29 +1004,44 @@ class OpponentPool:
         *,
         update: int | None = None,
     ) -> int | None:
-        """Add a frozen learner snapshot after the rule competence gate."""
-        if not self.config.self_play_enabled or not self.gate_ready:
+        """Add a frozen learner snapshot after a metric-controller decision."""
+        if not self.config.self_play_enabled or self.self_play_level == 0:
             return None
         self.snapshots.append(clone_model(model, device))
-        overflow = len(self.snapshots) - self.config.frozen_snapshot_limit
-        if self.config.frozen_snapshot_limit == 1:
-            self.snapshots[:] = self.snapshots[-1:]
-        elif overflow > 0:
-            # Keep the fork anchor and evict the oldest post-fork policies.
-            # This leaves one stable reference while the remaining slots track
-            # recent learner generations.
-            del self.snapshots[1 : 1 + overflow]
+        retained = self._retained_snapshot_indices(len(self.snapshots))
+        if len(retained) < len(self.snapshots):
+            self.snapshots[:] = [self.snapshots[index] for index in retained]
         self.last_snapshot_update = update
         return self.select_snapshot()
 
-    def snapshot_due(self, update: int) -> bool:
-        """Return whether the learner should create a new frozen policy."""
-        return (
-            not self.frozen_ready
-            or self.last_snapshot_update is None
-            or update - self.last_snapshot_update
-            >= self.config.opponent_refresh_updates
+    def _retained_snapshot_indices(self, count: int) -> list[int]:
+        limit = self.config.frozen_snapshot_limit
+        if count <= limit:
+            return list(range(count))
+        if limit == 1:
+            return [count - 1]
+        recent = range(count - limit + 1, count)
+        return [0, *recent]
+
+    def promote(
+        self,
+        model: BloodFlowTransformer,
+        device: torch.device,
+        *,
+        update: int,
+    ) -> int | None:
+        """Advance one self-play level and install the current champion."""
+        if not self.config.self_play_enabled:
+            return None
+        self.self_play_level = min(
+            self.self_play_level + 1, self.maximum_self_play_level
         )
+        return self.refresh_snapshot(model, device, update=update)
+
+    def demote(self) -> int:
+        """Reduce frozen-policy exposure without deleting league history."""
+        self.self_play_level = max(self.self_play_level - 1, 0)
+        return self.self_play_level
 
     def select_snapshot(self) -> int | None:
         """Select one batched frozen opponent for the next rollout."""
@@ -557,19 +1057,6 @@ class OpponentPool:
             self.active_snapshot = latest
         return self.active_snapshot
 
-    def update_rule_evaluation(self, evaluation: dict[str, float]) -> None:
-        """Update competence gates from a rule-anchor evaluation."""
-        first_rate = float(evaluation["first_rate"])
-        score_delta = float(evaluation["mean_score_delta"])
-        self.rule_first_rate = first_rate
-        self.rule_score_delta = score_delta
-        required = self.config.self_play_gate_consecutive_evals
-        if score_delta >= self.config.self_play_gate_score_delta:
-            self.rule_gate_streak += 1
-        else:
-            self.rule_gate_streak = 0
-        self.rule_gate_streak = min(self.rule_gate_streak, required)
-
     def set_frozen(self, model: BloodFlowTransformer | None) -> None:
         """Install a frozen model, primarily for tests and explicit resume."""
         self.snapshots.clear()
@@ -581,6 +1068,10 @@ class OpponentPool:
                 parameter.requires_grad_(False)
             self.snapshots.append(model)
             self.active_snapshot = 0
+            if self.config.self_play_enabled:
+                self.self_play_level = 1
+        else:
+            self.self_play_level = 0
 
     def state_dict(self) -> dict[str, Any]:
         return {
@@ -588,9 +1079,7 @@ class OpponentPool:
             "active_snapshot": self.active_snapshot,
             "last_snapshot_update": self.last_snapshot_update,
             "snapshots": [snapshot.state_dict() for snapshot in self.snapshots],
-            "rule_first_rate": self.rule_first_rate,
-            "rule_score_delta": self.rule_score_delta,
-            "rule_gate_streak": self.rule_gate_streak,
+            "self_play_level": self.self_play_level,
         }
 
     def load_state_dict(
@@ -607,24 +1096,38 @@ class OpponentPool:
         self.last_snapshot_update = (
             int(last_snapshot_update) if last_snapshot_update is not None else None
         )
-        self.rule_first_rate = state.get("rule_first_rate")
-        self.rule_score_delta = state.get("rule_score_delta")
-        self.rule_gate_streak = int(
-            state.get("rule_gate_streak", state.get("rule_league_streak", 0))
-        )
-        for snapshot_state in state.get("snapshots", []):
+        snapshot_states = list(state.get("snapshots", []))
+        retained = self._retained_snapshot_indices(len(snapshot_states))
+        for source_index in retained:
             snapshot = BloodFlowTransformer(model_config).to(device)
-            snapshot.load_state_dict(snapshot_state)
+            snapshot.load_state_dict(snapshot_states[source_index])
             snapshot.eval()
             for parameter in snapshot.parameters():
                 parameter.requires_grad_(False)
             self.snapshots.append(snapshot)
         active = state.get("active_snapshot")
-        self.active_snapshot = (
-            int(active)
-            if active is not None and int(active) < len(self.snapshots)
-            else None
-        )
+        source_active = int(active) if active is not None else None
+        retained_positions = {
+            source_index: position for position, source_index in enumerate(retained)
+        }
+        if source_active is None or not 0 <= source_active < len(snapshot_states):
+            self.active_snapshot = None
+        else:
+            self.active_snapshot = retained_positions.get(
+                source_active, len(self.snapshots) - 1
+            )
+        if not self.config.self_play_enabled:
+            self.self_play_level = 0
+        elif "self_play_level" in state:
+            self.self_play_level = min(
+                max(int(state["self_play_level"]), 0),
+                self.maximum_self_play_level,
+            )
+        else:
+            legacy_streak = int(
+                state.get("rule_gate_streak", state.get("rule_league_streak", 0))
+            )
+            self.self_play_level = int(bool(self.snapshots and legacy_streak))
 
     def action_kinds(
         self,
@@ -1240,14 +1743,6 @@ def categorical_return_targets(returns: Tensor, support: Tensor) -> Tensor:
     return result
 
 
-def cosine_learning_rate(config: PPOConfig, progress: float) -> float:
-    progress = min(max(float(progress), 0.0), 1.0)
-    weight = 0.5 * (1.0 + math.cos(math.pi * progress))
-    return config.final_learning_rate + weight * (
-        config.learning_rate - config.final_learning_rate
-    )
-
-
 def _shuffled_minibatches(
     history_lengths: np.ndarray, minibatch_size: int
 ) -> list[np.ndarray]:
@@ -1306,16 +1801,16 @@ def ppo_update(
     rollout: RolloutBatch,
     config: PPOConfig,
     device: torch.device,
-    progress: float,
+    controls: TrainingControls,
 ) -> dict[str, float]:
+    for parameter_group in optimizer.param_groups:
+        parameter_group["lr"] = controls.learning_rate
     model.train()
     count = len(rollout)
     if count == 0:
         raise ValueError("cannot update PPO from an empty rollout")
-    aux_scale = max(0.0, 1.0 - progress / max(config.auxiliary_decay_fraction, 1e-6))
-    entropy_scale = config.entropy_coefficient + progress * (
-        config.final_entropy_coefficient - config.entropy_coefficient
-    )
+    aux_scale = controls.auxiliary_scale
+    entropy_scale = controls.entropy_coefficient
     sums = {"policy_loss": 0.0, "value_loss": 0.0, "entropy": 0.0}
     updates = 0
     completed_epochs = 0
@@ -1536,19 +2031,15 @@ def _ppo_config_from_state(state: Any) -> PPOConfig:
     if not isinstance(state, dict):
         raise ValueError("checkpoint PPO configuration is invalid")
     state = dict(state)
-    expected = {field.name for field in fields(PPOConfig)}
+    defaults = asdict(PPOConfig())
+    expected = set(defaults)
+    migrated = False
     legacy_curriculum = {
         "rule_mix_score_delta",
         "rule_league_score_delta",
         "rule_gate_consecutive_evals",
     }
-    current_curriculum = {
-        "self_play_fraction",
-        "self_play_gate_score_delta",
-        "self_play_gate_consecutive_evals",
-        "historical_snapshot_probability",
-    }
-    if legacy_curriculum <= set(state) and not (current_curriculum & set(state)):
+    if legacy_curriculum <= set(state) and "self_play_gate_score_delta" not in state:
         league_score_delta = state.pop("rule_league_score_delta")
         gate_evaluations = state.pop("rule_gate_consecutive_evals")
         state.pop("rule_mix_score_delta")
@@ -1560,20 +2051,58 @@ def _ppo_config_from_state(state: Any) -> PPOConfig:
                 "historical_snapshot_probability": 0.50,
             }
         )
-    legacy_additions = {
+        migrated = True
+
+    for name, value in {
         "kl_control": "monitor",
         "score_reward_weight": 1.0,
         "rank_reward_weight": 0.0,
-    }
-    if set(state) == expected - set(legacy_additions):
-        state = state | legacy_additions
+    }.items():
+        if name not in state:
+            state[name] = value
+            migrated = True
+
+    if "final_learning_rate" in state:
+        state["minimum_learning_rate"] = state.pop("final_learning_rate")
+        migrated = True
+    if "final_entropy_coefficient" in state:
+        state["minimum_entropy_coefficient"] = state.pop(
+            "final_entropy_coefficient"
+        )
+        migrated = True
+    if "self_play_fraction" in state:
+        fraction = float(state.pop("self_play_fraction"))
+        state["self_play_max_fraction"] = max(fraction, 1e-6)
+        state["self_play_fraction_step"] = min(
+            defaults["self_play_fraction_step"], max(fraction, 1e-6)
+        )
+        migrated = True
+    if "self_play_gate_consecutive_evals" in state:
+        evaluations = max(int(state.pop("self_play_gate_consecutive_evals")), 1)
+        state["self_play_gate_window"] = evaluations
+        state["self_play_gate_required_passes"] = max(1, evaluations - 1)
+        migrated = True
+    for name in ("schedule_hours", "auxiliary_decay_fraction", "opponent_refresh_updates"):
+        if name in state:
+            state.pop(name)
+            migrated = True
+
+    unknown = set(state) - expected
+    if unknown:
+        raise ValueError(
+            "checkpoint PPO configuration has unknown fields: "
+            + ", ".join(sorted(unknown))
+        )
+    for name, value in defaults.items():
+        if name not in state:
+            state[name] = value
+            migrated = True
+    if migrated:
         warnings.warn(
-            "resuming a legacy score-only PPO checkpoint with KL monitoring; "
-            "start a new run to use hybrid rewards",
+            "migrated a legacy PPO configuration to metric-driven scheduling; "
+            "gate evidence will restart when controller state is absent",
             stacklevel=3,
         )
-    if set(state) != expected:
-        raise ValueError("checkpoint PPO configuration is invalid")
     return PPOConfig(**state)
 
 
@@ -1622,6 +2151,7 @@ def save_checkpoint(
     ppo_elapsed_seconds: float,
     config: PPOConfig,
     collector: RolloutCollector,
+    controller: TrainingController | None = None,
 ) -> None:
     if ppo_elapsed_seconds < 0.0:
         raise ValueError("PPO elapsed time cannot be negative")
@@ -1640,6 +2170,9 @@ def save_checkpoint(
             "ppo_elapsed_seconds": ppo_elapsed_seconds,
             "ppo_config": asdict(config),
             "collector": collector.state_dict(),
+            "training_controller": (
+                controller.state_dict() if controller is not None else None
+            ),
             "python_rng_state": random.getstate(),
             "numpy_rng_state": np.random.get_state(),
             "torch_rng_state": torch.get_rng_state(),
@@ -1661,6 +2194,7 @@ def load_checkpoint(
     device: torch.device,
     config: PPOConfig,
     collector: RolloutCollector,
+    controller: TrainingController | None = None,
     *,
     expected_checkpoint_config: PPOConfig | None = None,
 ) -> tuple[int, int, float]:
@@ -1675,6 +2209,10 @@ def load_checkpoint(
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     collector.load_state_dict(checkpoint["collector"], model.config)
+    if controller is not None:
+        controller.load_state_dict(checkpoint.get("training_controller"))
+        for parameter_group in optimizer.param_groups:
+            parameter_group["lr"] = controller.current_learning_rate
     if "python_rng_state" in checkpoint:
         random.setstate(checkpoint["python_rng_state"])
     if "numpy_rng_state" in checkpoint:
@@ -1699,22 +2237,40 @@ def evaluation_panel(games: int, seed: int) -> tuple[np.ndarray, np.ndarray]:
     return np.repeat(base_seeds, 4), np.tile(np.arange(4, dtype=np.uint8), games // 4)
 
 
-def evaluate_against_rule_ev(
+def _panel_statistics(values: np.ndarray) -> tuple[float, float]:
+    panel_means = values.reshape(-1, 4).mean(axis=1)
+    if len(panel_means) < 2:
+        return 0.0, 0.0
+    standard_deviation = float(panel_means.std(ddof=1))
+    return standard_deviation, standard_deviation / math.sqrt(len(panel_means))
+
+
+def evaluate_against_rule_policy(
     model: BloodFlowTransformer,
     device: torch.device,
+    *,
+    opponent: str,
+    rule_nn: Any | None = None,
     games: int = 256,
     envs: int = 64,
     seed: int = 0xA51CE,
-) -> dict[str, float]:
-    """Evaluate one deterministic learner against three Rule-EV opponents.
+) -> dict[str, Any]:
+    """Evaluate one deterministic learner against one fixed rule policy.
 
     Every requested ``(seed, focal_seat)`` is consumed exactly once. Finished
     rows stay disabled, which avoids the short-game bias caused by refilling a
     batch until an aggregate game count is reached.
     """
+    supported = {"rule-fast", "rule-ev", "rule-nn"}
+    if opponent not in supported:
+        raise ValueError(f"unsupported evaluation opponent: {opponent}")
+    if opponent == "rule-nn" and rule_nn is None:
+        raise ValueError("rule-nn evaluation requires an ONNX policy")
     panel_seeds, panel_seats = evaluation_panel(games, seed)
     envs = max(1, min(envs, games))
-    completed_scores: list[tuple[int, int]] = []
+    score_values = np.empty(games, dtype=np.float64)
+    rank_values = np.empty(games, dtype=np.float64)
+    completed = np.zeros(games, dtype=np.bool_)
     rule_ev_config = bm.RuleEvConfig.standard()
     model.eval()
     for start in range(0, games, envs):
@@ -1752,9 +2308,18 @@ def evaluate_against_rule_ev(
             )
             rule_enabled[:] = active
             rule_enabled[learner_rows] = 0
-            buffers.batch.rule_ev_actions_masked_into(
-                rule_enabled, buffers.actions, rule_ev_config
-            )
+            if opponent == "rule-fast":
+                buffers.batch.simple_rule_actions_masked_into(
+                    rule_enabled, buffers.actions
+                )
+            elif opponent == "rule-ev":
+                buffers.batch.rule_ev_actions_masked_into(
+                    rule_enabled, buffers.actions, rule_ev_config
+                )
+            else:
+                buffers.batch.rule_nn_actions_masked_into(
+                    rule_enabled, buffers.actions, rule_nn
+                )
             learner_actions, _, _ = learner_inference.resolve()
             buffers.actions[learner_rows] = learner_actions
             step_enabled[:] = active
@@ -1767,25 +2332,50 @@ def evaluate_against_rule_ev(
             ranks = focal_ranks(
                 cumulative[terminal_rows], learner_seats[terminal_rows]
             )
-            for row, rank in zip(terminal_rows, ranks, strict=True):
-                completed_scores.append(
-                    (int(cumulative[row, learner_seats[row]]), int(rank))
-                )
+            game_indices = start + terminal_rows
+            score_values[game_indices] = cumulative[
+                terminal_rows, learner_seats[terminal_rows]
+            ]
+            rank_values[game_indices] = ranks
+            completed[game_indices] = True
             active[terminal] = False
             if active.any():
                 buffers.refresh()
 
-    values = np.asarray(
-        [score for score, _ in completed_scores], dtype=np.float64
-    )
-    ranks = np.asarray([rank for _, rank in completed_scores], dtype=np.float64)
-    if len(values) != games:
+    if not completed.all():
         raise RuntimeError("fixed evaluation did not finish every panel game")
+    score_panel_std, score_se = _panel_statistics(score_values)
+    rank_panel_std, rank_se = _panel_statistics(rank_values)
     return {
-        "games": float(len(values)),
-        "mean_score_delta": float(values.mean()),
-        "score_std": float(values.std()),
-        "first_rate": float(np.mean(ranks == 1)),
-        "last_rate": float(np.mean(ranks == 4)),
-        "mean_rank": float(ranks.mean()),
+        "opponent": opponent,
+        "games": float(games),
+        "panel_count": float(games // 4),
+        "mean_score_delta": float(score_values.mean()),
+        "score_std": float(score_values.std()),
+        "score_delta_panel_std": score_panel_std,
+        "score_se": score_se,
+        "first_rate": float(np.mean(rank_values == 1)),
+        "last_rate": float(np.mean(rank_values == 4)),
+        "mean_rank": float(rank_values.mean()),
+        "rank_std": float(rank_values.std()),
+        "rank_panel_std": rank_panel_std,
+        "rank_se": rank_se,
     }
+
+
+def evaluate_against_rule_ev(
+    model: BloodFlowTransformer,
+    device: torch.device,
+    games: int = 256,
+    envs: int = 64,
+    seed: int = 0xA51CE,
+) -> dict[str, Any]:
+    """Return the only evaluation result accepted by the internal gate."""
+    return evaluate_against_rule_policy(
+        model,
+        device,
+        opponent="rule-ev",
+        games=games,
+        envs=envs,
+        seed=seed,
+    )

@@ -31,7 +31,7 @@ import type {
 } from "./types.ts";
 
 /** Client snapshot schema version. Engine rules version is separate. */
-export const UI_SNAPSHOT_SCHEMA_VERSION = 6;
+export const UI_SNAPSHOT_SCHEMA_VERSION = 7;
 
 /** Allocate reusable observation and event buffers for one viewer. */
 export function createObservationBuffers(): ObservationBuffers {

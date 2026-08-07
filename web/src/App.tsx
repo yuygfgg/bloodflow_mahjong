@@ -327,6 +327,7 @@ export function App() {
             pendingExchangeSelections={pendingExchangeSelections}
             pendingMissingSuit={pendingMissingSuit}
             hintPolicy={hintPolicy}
+            nnAvailable={game.nnAvailable}
             onExchangeTile={toggleExchangeTile}
             onConfirmExchange={() => void confirmExchange()}
             onPendingMissing={setPendingMissingSuit}
@@ -358,6 +359,7 @@ export function App() {
           status={game.status}
           busy={game.busy}
           config={game.config}
+          nnAvailable={game.nnAvailable}
           error={game.error}
           onConfig={game.setConfig}
           onStart={() => void start()}

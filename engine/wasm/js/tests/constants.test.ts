@@ -39,7 +39,7 @@ test("WASM module exports a full engine constant table", () => {
   const constants = exportedConstants(wasm);
   const names = Object.keys(constants);
   assert.ok(names.length > 40, `expected a full constant table, got ${names.length}`);
-  assert.equal(constants.ENGINE_RULES_VERSION, 7);
+  assert.equal(constants.ENGINE_RULES_VERSION, 10);
   for (const name of names) {
     assert.equal(wasmConst(wasm, name), constants[name], name);
   }

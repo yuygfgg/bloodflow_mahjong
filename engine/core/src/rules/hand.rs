@@ -1,11 +1,10 @@
 use crate::game::Game;
 use crate::hand::{
-    ShantenAnalysis, analyze_shanten, bloodflow_evaluation_counts, evaluate_bloodflow_max_wait,
-    evaluate_bloodflow_win, evaluate_max_wait, evaluate_win, remove_tiles_for_meld,
-    stabilize_win_base,
+    ShantenAnalysis, analyze_shanten, bloodflow_evaluation_counts, evaluate_bloodflow_win,
+    evaluate_win, remove_tiles_for_meld, stabilize_win_base,
 };
 use crate::types::{Meld, MeldKind, Seat, Suit, TILE_KIND_COUNT, Tile};
-use crate::{MaxWaitEvaluation, WinEvaluation, WinFlags};
+use crate::{WinEvaluation, WinFlags};
 
 pub(crate) const DUMMY_MELD: Meld = Meld {
     tile: Tile::from_index_unchecked(0),
@@ -16,8 +15,7 @@ pub(crate) const DUMMY_MELD: Meld = Meld {
 /// Rule-policy projection of one player's mutable hand state.
 ///
 /// This type mirrors the engine transformations which affect concealed tiles,
-/// locked winning subsets, and exposed melds. Keeping the transformations in
-/// one place prevents evaluators from drifting away from legal play.
+/// the stable winning base, historical winning tiles, and exposed melds.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Holding {
     pub(crate) concealed: [u8; TILE_KIND_COUNT],
@@ -67,19 +65,6 @@ impl Holding {
         }
     }
 
-    pub(crate) fn max_wait(&self) -> Option<MaxWaitEvaluation> {
-        if self.has_won {
-            evaluate_bloodflow_max_wait(
-                &self.evaluation_counts()?,
-                &self.win_base,
-                self.melds(),
-                self.missing,
-            )
-        } else {
-            evaluate_max_wait(&self.concealed, self.melds(), self.missing)
-        }
-    }
-
     pub(crate) fn analysis(&self) -> ShantenAnalysis {
         let counts = self.evaluation_counts().unwrap_or(self.concealed);
         analyze_shanten(&counts, self.melds(), self.missing)
@@ -100,21 +85,9 @@ impl Holding {
     pub(crate) fn missing_count(&self) -> u8 {
         self.missing.map_or(0, |suit| {
             let start = suit as usize * 9;
-            self.concealed[start..start + 9].iter().copied().sum()
+            self.evaluation_counts()
+                .map_or(0, |counts| counts[start..start + 9].iter().sum())
         })
-    }
-
-    pub(crate) fn suit_count(&self) -> usize {
-        Suit::ALL
-            .into_iter()
-            .filter(|suit| {
-                let start = *suit as usize * 9;
-                self.concealed[start..start + 9]
-                    .iter()
-                    .any(|&count| count != 0)
-                    || self.melds().iter().any(|meld| meld.tile.suit() == *suit)
-            })
-            .count()
     }
 
     fn unlocked_len(&self) -> usize {
@@ -155,14 +128,14 @@ impl Holding {
         Some(self)
     }
 
-    fn remove_for_meld(&mut self, tile: Tile, amount: u8, allow_locked: bool) -> bool {
+    fn remove_for_meld(&mut self, tile: Tile, amount: u8, allow_win_base: bool) -> bool {
         remove_tiles_for_meld(
             &mut self.concealed,
             &mut self.locked,
             &mut self.win_base,
             tile,
             amount,
-            allow_locked,
+            allow_win_base,
         )
     }
 
@@ -228,24 +201,6 @@ impl Holding {
             .iter_mut()
             .find(|meld| meld.kind == MeldKind::Pong && meld.tile == tile)?;
         meld.kind = MeldKind::AddedKong;
-        Some(self)
-    }
-
-    pub(crate) fn after_robbed_added_kong(mut self, tile: Tile) -> Option<Self> {
-        if !self.remove_for_meld(tile, 1, true) {
-            return None;
-        }
-        if self.has_won {
-            let target_len = 13_usize.saturating_sub(3 * self.meld_len);
-            if !stabilize_win_base(
-                &self.concealed,
-                &mut self.locked,
-                &mut self.win_base,
-                target_len,
-            ) {
-                return None;
-            }
-        }
         Some(self)
     }
 }
@@ -381,37 +336,59 @@ mod tests {
     }
 
     #[test]
-    fn suit_count_includes_exposed_melds() {
-        let characters = Tile::from_suit_rank(Suit::Characters, 0).expect("test tile is valid");
-        let bamboo = Tile::from_suit_rank(Suit::Bamboo, 0).expect("test tile is valid");
-        let dots = Tile::from_suit_rank(Suit::Dots, 0).expect("test tile is valid");
-        let mut holding = Holding {
-            concealed: [0; TILE_KIND_COUNT],
-            locked: [0; TILE_KIND_COUNT],
-            win_base: [0; TILE_KIND_COUNT],
-            melds: [DUMMY_MELD; 4],
-            meld_len: 1,
-            missing: None,
-            has_won: false,
-        };
-        holding.melds[0] = Meld {
-            tile: characters,
-            kind: MeldKind::Pong,
-            source: Seat::EAST.next(),
-        };
-        holding.concealed[bamboo.index()] = 1;
-        holding.concealed[dots.index()] = 1;
+    fn repeated_win_ignores_the_historical_winning_tile() {
+        let winning_tile = Tile::from_index_unchecked(17);
+        let mut win_base = [0; TILE_KIND_COUNT];
+        for count in win_base.iter_mut().take(6) {
+            *count = 1;
+        }
+        for count in win_base.iter_mut().take(15).skip(9) {
+            *count = 1;
+        }
+        win_base[winning_tile.index()] = 1;
 
-        assert_eq!(holding.suit_count(), 3);
+        let mut holding = Holding {
+            concealed: win_base,
+            locked: win_base,
+            win_base,
+            melds: [DUMMY_MELD; 4],
+            meld_len: 0,
+            missing: None,
+            has_won: true,
+        };
+        holding.concealed[winning_tile.index()] += 1;
+        holding.locked[winning_tile.index()] += 1;
+
+        assert_eq!(
+            holding.evaluation_counts().unwrap()[winning_tile.index()],
+            1
+        );
+        assert!(
+            holding
+                .evaluate_win(Some(winning_tile), WinFlags::NONE)
+                .is_none()
+        );
+        let after_draw = holding
+            .after_draw(winning_tile)
+            .expect("the active winning tile can be drawn");
+        assert!(
+            after_draw
+                .evaluate_win(Some(winning_tile), WinFlags::NONE)
+                .is_some()
+        );
     }
 
-    fn post_win_added_kong_holding() -> (Holding, Tile, Tile, Tile) {
+    fn post_win_added_kong_holding(source: KongTileSource) -> (Holding, Tile, Tile, Tile) {
         let kong_tile = Tile::from_index_unchecked(0);
         let active_tile = Tile::from_index_unchecked(20);
         let replacement_tile = Tile::from_index_unchecked(21);
         let mut win_base = [0; TILE_KIND_COUNT];
-        for count in win_base.iter_mut().take(10) {
+        for count in win_base.iter_mut().take(11).skip(1) {
             *count = 1;
+        }
+        if source == KongTileSource::StableBase {
+            win_base[1] = 0;
+            win_base[kong_tile.index()] = 1;
         }
         let mut holding = Holding {
             concealed: win_base,
@@ -419,10 +396,18 @@ mod tests {
             win_base,
             melds: [DUMMY_MELD; 4],
             meld_len: 1,
-            missing: Some(Suit::Dots),
+            missing: None,
             has_won: true,
         };
-        holding.concealed[active_tile.index()] += 1;
+        holding.concealed[active_tile.index()] = 1;
+        match source {
+            KongTileSource::Active => holding.concealed[kong_tile.index()] += 1,
+            KongTileSource::Historical => {
+                holding.concealed[kong_tile.index()] += 1;
+                holding.locked[kong_tile.index()] += 1;
+            }
+            KongTileSource::StableBase => {}
+        }
         holding.melds[0] = Meld {
             tile: kong_tile,
             kind: MeldKind::Pong,
@@ -431,27 +416,92 @@ mod tests {
         (holding, kong_tile, active_tile, replacement_tile)
     }
 
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum KongTileSource {
+        Active,
+        Historical,
+        StableBase,
+    }
+
     #[test]
-    fn added_kong_consumes_historical_references_before_the_stable_base() {
-        let (mut holding, kong_tile, _, _) = post_win_added_kong_holding();
+    fn added_kong_rejects_a_historical_winning_tile() {
+        let (holding, kong_tile, _, _) = post_win_added_kong_holding(KongTileSource::Historical);
+
+        assert!(holding.after_added_kong(kong_tile).is_none());
+    }
+
+    #[test]
+    fn concealed_kong_uses_active_and_stable_base_tiles() {
+        let kong_tile = Tile::from_index_unchecked(0);
+        let mut win_base = [0; TILE_KIND_COUNT];
+        win_base[kong_tile.index()] = 3;
+        for count in win_base.iter_mut().take(11).skip(1) {
+            *count = 1;
+        }
+        let mut holding = Holding {
+            concealed: win_base,
+            locked: win_base,
+            win_base,
+            melds: [DUMMY_MELD; 4],
+            meld_len: 0,
+            missing: None,
+            has_won: true,
+        };
         holding.concealed[kong_tile.index()] += 1;
-        holding.locked[kong_tile.index()] += 1;
-        let original_base = holding.win_base;
 
         let after = holding
-            .after_added_kong(kong_tile)
-            .expect("the historical fourth tile extends the Pong");
+            .after_concealed_kong(kong_tile, Seat::EAST)
+            .expect("three stable tiles and one active tile form a concealed Kong");
 
-        assert_eq!(after.win_base, original_base);
-        assert_eq!(
-            after.locked[kong_tile.index()],
-            original_base[kong_tile.index()]
+        assert_eq!(after.win_base[kong_tile.index()], 0);
+        assert_eq!(after.locked[kong_tile.index()], 0);
+        assert_eq!(after.concealed[kong_tile.index()], 0);
+    }
+
+    #[test]
+    fn concealed_kong_rejects_historical_winning_tiles() {
+        let kong_tile = Tile::from_index_unchecked(0);
+        let mut win_base = [0; TILE_KIND_COUNT];
+        for count in win_base.iter_mut().take(13).skip(1) {
+            *count = 1;
+        }
+        win_base[13] = 1;
+        let mut holding = Holding {
+            concealed: win_base,
+            locked: win_base,
+            win_base,
+            melds: [DUMMY_MELD; 4],
+            meld_len: 0,
+            missing: None,
+            has_won: true,
+        };
+        holding.concealed[kong_tile.index()] = 4;
+        holding.locked[kong_tile.index()] = 4;
+
+        assert!(
+            holding
+                .after_concealed_kong(kong_tile, Seat::EAST)
+                .is_none()
         );
     }
 
     #[test]
+    fn added_kong_accepts_an_active_fourth_tile() {
+        let (holding, kong_tile, _, _) = post_win_added_kong_holding(KongTileSource::Active);
+        let win_base = holding.win_base;
+
+        let after = holding
+            .after_added_kong(kong_tile)
+            .expect("an active fourth tile extends the Pong");
+
+        assert_eq!(after.win_base, win_base);
+        assert_eq!(after.unlocked_count(kong_tile), 0);
+    }
+
+    #[test]
     fn post_kong_discard_restores_a_consumed_stable_base_tile() {
-        let (holding, kong_tile, active_tile, replacement_tile) = post_win_added_kong_holding();
+        let (holding, kong_tile, active_tile, replacement_tile) =
+            post_win_added_kong_holding(KongTileSource::StableBase);
 
         let after = holding
             .after_added_kong(kong_tile)
@@ -462,20 +512,6 @@ mod tests {
         assert_eq!(after.win_base.iter().sum::<u8>(), 10);
         assert_eq!(after.win_base[kong_tile.index()], 0);
         assert_eq!(after.win_base[replacement_tile.index()], 1);
-        assert_eq!(after.locked, after.concealed);
-    }
-
-    #[test]
-    fn robbed_added_kong_restores_the_base_from_the_current_active_tile() {
-        let (holding, kong_tile, active_tile, _) = post_win_added_kong_holding();
-
-        let after = holding
-            .after_robbed_added_kong(kong_tile)
-            .expect("the current active tile restores the robbed base tile");
-
-        assert_eq!(after.win_base.iter().sum::<u8>(), 10);
-        assert_eq!(after.win_base[kong_tile.index()], 0);
-        assert_eq!(after.win_base[active_tile.index()], 1);
         assert_eq!(after.locked, after.concealed);
     }
 }

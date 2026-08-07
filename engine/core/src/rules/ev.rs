@@ -97,8 +97,13 @@ impl Game {
             ),
             Phase::ChooseMissing => opening::choose_missing(self.concealed(actor)),
             Phase::Turn => choose_turn(self, actor, &legal, config),
-            Phase::HuResponse => ActionId::HU,
-            Phase::MeldResponse => choose_meld_response(self, actor, &legal, config),
+            Phase::HuResponse | Phase::MeldResponse => {
+                if legal.can_hu {
+                    ActionId::HU
+                } else {
+                    choose_meld_response(self, actor, &legal, config)
+                }
+            }
             Phase::Finished => return None,
         };
         debug_assert!(
@@ -882,6 +887,42 @@ mod tests {
         };
         assert!(discard_better(safe, dangerous, false));
         assert!(!discard_better(dangerous, safe, false));
+    }
+
+    #[test]
+    fn lower_shanten_precedes_stale_wait_value() {
+        let advanced = DiscardCandidate {
+            tile: tile(Suit::Characters, 1),
+            quality: HandQuality {
+                shanten: 0,
+                live_improvements: 0,
+                one_draw_value: 0,
+                waits: WaitQuality::default(),
+                structure: 0,
+            },
+            danger: DiscardDanger {
+                expected_loss: u64::MAX,
+            },
+            exposure: 0,
+        };
+        let stale_wait = DiscardCandidate {
+            tile: tile(Suit::Characters, 2),
+            quality: HandQuality {
+                shanten: 1,
+                waits: WaitQuality {
+                    weighted_value: u64::MAX,
+                    live_copies: u16::MAX,
+                    max_multiplier: u32::MAX,
+                    distinct_tiles: u8::MAX,
+                },
+                ..advanced.quality
+            },
+            danger: DiscardDanger::default(),
+            exposure: u8::MAX,
+        };
+
+        assert!(discard_better(advanced, stale_wait, false));
+        assert!(!discard_better(stale_wait, advanced, false));
     }
 
     #[test]

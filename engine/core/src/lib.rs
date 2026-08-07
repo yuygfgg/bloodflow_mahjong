@@ -42,16 +42,6 @@ pub use rules::ev::{RULE_EV_ACTION_TERMINAL, RuleEvConfig, RuleEvDefense};
 pub use rules::fast::SIMPLE_RULE_ACTION_TERMINAL;
 #[cfg(feature = "rule-nn")]
 pub use rules::nn::{RULE_NN_HISTORY, RULE_NN_LOGITS, RuleNn, RuleNnError};
-pub use rules::planner::{
-    RULE_PLANNER_ACTION_TERMINAL, RulePlannerConfig, RulePlannerSearchStats,
-    reset_rule_planner_search_stats, rule_planner_search_stats,
-};
-#[cfg(feature = "planner-analysis")]
-pub use rules::planner::{
-    RulePlannerAnalysis, RulePlannerAnalysisOptions, RulePlannerContinuation,
-    RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
-    RulePlannerSearchAnalysis, RulePlannerSearchOutcome,
-};
 pub use types::{
     ExchangeDirection, Meld, MeldKind, PLAYER_COUNT, Seat, Suit, TILE_KIND_COUNT, Tile,
     WALL_TILE_COUNT, WinSource,

@@ -11,14 +11,20 @@ import numpy as np
 import torch
 from torch import Tensor, nn
 
-from .contracts import MODEL_HISTORY_CAPACITY
-from .model import ACTION_SPACE_SIZE, BloodFlowTransformer
+from .contracts import ENGINE_RULES_VERSION, MODEL_HISTORY_CAPACITY
+from .model import (
+    ACTION_SPACE_SIZE,
+    TILE_KIND_COUNT,
+    TILE_OBSERVATION_PLANES,
+    BloodFlowTransformer,
+)
 from .pipeline import load_checkpoint_model
 
 
 ONNX_OPSET = 17
 INPUT_NAMES = ("tile_obs", "melds", "meta", "events", "event_lengths")
 OUTPUT_NAME = "logits"
+MODEL_RULES_VERSION_METADATA = "engine_rules_version"
 
 PolicyInputs: TypeAlias = tuple[Tensor, Tensor, Tensor, Tensor, Tensor]
 
@@ -62,7 +68,7 @@ def sample_inputs() -> PolicyInputs:
     tile_obs = torch.randint(
         0,
         5,
-        (1, 10, 27),
+        (1, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT),
         generator=generator,
         dtype=torch.uint8,
     )
@@ -109,8 +115,24 @@ def _shape(value: Any) -> tuple[int, ...]:
 def _check_graph_contract(model: Any) -> None:
     import onnx
 
+    metadata = {
+        entry.key: entry.value
+        for entry in model.metadata_props
+        if entry.key == MODEL_RULES_VERSION_METADATA
+    }
+    expected_version = str(ENGINE_RULES_VERSION)
+    if metadata != {MODEL_RULES_VERSION_METADATA: expected_version}:
+        raise ValueError(
+            "exported ONNX model does not declare the current engine rules "
+            f"version {expected_version}: {metadata}"
+        )
+
     expected_inputs = (
-        ("tile_obs", onnx.TensorProto.UINT8, (1, 10, 27)),
+        (
+            "tile_obs",
+            onnx.TensorProto.UINT8,
+            (1, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT),
+        ),
         ("melds", onnx.TensorProto.UINT8, (1, 4, 4, 3)),
         ("meta", onnx.TensorProto.INT32, (1, 34)),
         (
@@ -207,19 +229,23 @@ def export_model(
             do_constant_folding=True,
         )
 
-        if check or parity:
-            import onnx
+        import onnx
 
-            onnx_model = onnx.load(temporary, load_external_data=False)
-            if check:
-                onnx.checker.check_model(onnx_model)
-                _check_graph_contract(onnx_model)
-            if parity:
-                maximum_error, mean_error, argmax_matches = _reference_parity(
-                    onnx_model,
-                    policy,
-                    inputs,
-                )
+        onnx_model = onnx.load(temporary, load_external_data=False)
+        onnx_model.metadata_props.add(
+            key=MODEL_RULES_VERSION_METADATA,
+            value=str(ENGINE_RULES_VERSION),
+        )
+        if check:
+            onnx.checker.check_model(onnx_model)
+            _check_graph_contract(onnx_model)
+        if parity:
+            maximum_error, mean_error, argmax_matches = _reference_parity(
+                onnx_model,
+                policy,
+                inputs,
+            )
+        onnx.save(onnx_model, temporary)
         temporary.replace(output)
     finally:
         temporary.unlink(missing_ok=True)

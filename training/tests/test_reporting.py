@@ -53,8 +53,8 @@ def test_supervised_summary_is_compact() -> None:
 def test_ppo_summaries_cover_each_phase() -> None:
     baseline = {
         "phase": "ppo_start",
-        "evaluation": evaluation(),
-        "evaluation_seconds": 0.75,
+        "gate_evaluation": evaluation(),
+        "gate_evaluation_seconds": 0.75,
     }
     assert compact_ppo_record(baseline) == (
         "BASE EV  rank 3.25  score -725  first 12.5%  last 50.0%"
@@ -66,18 +66,14 @@ def test_ppo_summaries_cover_each_phase() -> None:
         "update": 2,
         "transitions": 128,
         "previous_run_elapsed_seconds": 7_200.0,
-        "target_hours": 24.0,
     }
-    assert compact_ppo_record(resume) == (
-        "RESUME  u    2  128 states  elapsed 2h00m/24h"
-    )
+    assert compact_ppo_record(resume) == "RESUME  u    2  128 states  elapsed 2h00m"
 
     update = {
         "phase": "ppo",
         "update": 3,
         "transitions": 196_608,
         "ppo_elapsed_seconds": 3_661.0,
-        "target_hours": 24.0,
         "rollout_states_per_second": 12_345.0,
         "policy_loss": -0.01234,
         "value_loss": 2.41,
@@ -89,13 +85,19 @@ def test_ppo_summaries_cover_each_phase() -> None:
             "rule_ev": 16,
             "frozen_transformer": 0,
         },
-        "evaluation": evaluation(),
+        "gate_evaluation": evaluation(),
+        "analysis_evaluation": evaluation()
+        | {
+            "opponent": "rule-nn",
+            "model_sha256": "abc123",
+        },
     }
     assert compact_ppo_record(update) == (
-        "PPO u    3  1h01m/24h  196,608 states  12.35k states/s"
+        "PPO u    3  1h01m  196,608 states  12.35k states/s"
         "  pi -0.0123  value 2.410  ent 0.720  KL +0.00610  lr 2.80e-04"
         "  opp fast/EV 33.3%/66.7%"
         "  EV rank 3.25  score -725  first 12.5%  last 50.0%"
+        "  RULE-NN rank 3.25  score -725  first 12.5%  last 50.0%"
     )
     off_update = update | {"kl_control": "off"}
     assert "  KL off  lr" in compact_ppo_record(off_update)
@@ -105,12 +107,23 @@ def test_ppo_summaries_cover_each_phase() -> None:
         "update": 4,
         "transitions": 262_144,
         "ppo_elapsed_seconds": 86_400.0,
-        "target_hours": 24.0,
-        "final": evaluation(),
+        "gate_evaluation": evaluation(),
     }
     assert compact_ppo_record(complete) == (
-        "DONE  u    4  262,144 states  1d00h/24h"
+        "DONE  u    4  262,144 states  1d00h"
         "  EV rank 3.25  score -725  first 12.5%  last 50.0%  games 8"
+    )
+
+    interrupted = {
+        "phase": "interrupted",
+        "update": 5,
+        "transitions": 327_680,
+        "ppo_elapsed_seconds": 90_000.0,
+        "checkpoint": "run/latest.pt",
+    }
+    assert compact_ppo_record(interrupted) == (
+        "STOP  u    5  327,680 states  elapsed 1d01h"
+        "  checkpoint run/latest.pt"
     )
 
 
@@ -118,8 +131,8 @@ def test_ppo_record_writes_json_but_prints_only_the_summary(tmp_path, capsys) ->
     path = tmp_path / "metrics.jsonl"
     record = {
         "phase": "ppo_start",
-        "evaluation": evaluation(),
-        "evaluation_seconds": 0.75,
+        "gate_evaluation": evaluation(),
+        "gate_evaluation_seconds": 0.75,
     }
 
     _append_record(path, record)

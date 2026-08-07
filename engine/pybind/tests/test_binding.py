@@ -1,7 +1,12 @@
+from pathlib import Path
+
 import numpy as np
 import pytest
 
 import bloodflow_mahjong as bm
+
+
+MODEL_PATH = Path(__file__).resolve().parents[3] / "model" / "latest.onnx"
 
 
 def first_legal_action(words: np.ndarray) -> int:
@@ -65,7 +70,7 @@ def test_game_step_and_state_buffers() -> None:
     assert len(record) == bm.STEP_RECORD_WIDTH
 
 
-def test_rule_configs_validate_budgets_and_defaults() -> None:
+def test_rule_ev_config_validates_budget_and_defaults() -> None:
     ev = bm.RuleEvConfig()
     assert (ev.search_depth, ev.defense) == (1, True)
     assert (bm.RuleEvConfig.fast().search_depth, bm.RuleEvConfig.fast().defense) == (
@@ -78,76 +83,70 @@ def test_rule_configs_validate_budgets_and_defaults() -> None:
     with pytest.raises(AttributeError):
         ev.search_depth = 0
 
-    planner = bm.RulePlannerConfig()
-    assert (
-        planner.hand_changes,
-        planner.draw_horizon,
-        planner.candidate_states,
-        planner.belief_worlds,
-        planner.response_worlds,
-        planner.search_iterations,
-    ) == (0, 1, 1, 64, 0, 64)
-    assert "candidate_states=1" in repr(planner)
-
-    invalid_values = (
-        ("hand_changes", 3),
-        ("draw_horizon", 33),
-        ("candidate_states", 0),
-        ("belief_worlds", 257),
-        ("response_worlds", 257),
-        ("search_iterations", 4097),
-    )
-    for name, value in invalid_values:
-        with pytest.raises(ValueError, match=name):
-            bm.RulePlannerConfig(**{name: value})
-
-
-def test_game_rule_ev_and_planner_actions_are_legal() -> None:
+def test_game_rule_ev_actions_are_legal() -> None:
     game = bm.Game(seed=43)
-    minimal_planner = bm.RulePlannerConfig(
-        hand_changes=0,
-        draw_horizon=0,
-        candidate_states=1,
-    )
-    for action in (game.rule_ev_action(), game.rule_planner_action()):
-        assert action is not None
-        word = action // 64
-        bit = action % 64
-        assert int(game.legal_action_mask[word]) & (1 << bit)
+    action = game.rule_ev_action()
+    assert action is not None
+    assert int(game.legal_action_mask[action // 64]) & (1 << (action % 64))
 
     while game.phase != bm.PHASE_TURN:
         action = game.simple_rule_action()
         assert action is not None
         game.step_id(action)
 
-    actions = (
-        game.rule_ev_action(bm.RuleEvConfig.fast()),
-        game.rule_planner_action(minimal_planner),
-    )
-
-    for action in actions:
-        assert action is not None
-        word = action // 64
-        bit = action % 64
-        assert int(game.legal_action_mask[word]) & (1 << bit)
-
-    with pytest.raises(TypeError):
-        game.rule_ev_action(bm.RulePlannerConfig())
-    with pytest.raises(TypeError):
-        game.rule_planner_action(bm.RuleEvConfig.fast())
+    action = game.rule_ev_action(bm.RuleEvConfig.fast())
+    assert action is not None
+    assert int(game.legal_action_mask[action // 64]) & (1 << (action % 64))
 
 
-def test_batch_rule_ev_and_planner_write_fixed_buffers() -> None:
+def test_batch_rule_nn_actions_are_legal_and_masked() -> None:
+    if not hasattr(bm, "RuleNn"):
+        pytest.skip("Python binding was built without rule-nn")
+    if not MODEL_PATH.is_file():
+        pytest.skip("repository ONNX model is unavailable")
+
+    try:
+        policy = bm.RuleNn.from_file(str(MODEL_PATH))
+    except ValueError as error:
+        pytest.skip(f"repository ONNX model is not compatible: {error}")
+    size = 64
+    batch = bm.Batch(size, seed=45)
+    masks = np.empty((size, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    batch.legal_action_masks_into(masks)
+
+    untouched = np.uint8(201)
+    actions = np.full(size, untouched, dtype=np.uint8)
+    enabled = np.zeros(size, dtype=np.uint8)
+    enabled[[0, size - 1]] = 1
+    batch.rule_nn_actions_masked_into(enabled, actions, policy)
+
+    assert np.all(actions[enabled == 0] == untouched)
+    for index in np.flatnonzero(enabled):
+        action = int(actions[index])
+        assert int(masks[index, action // 64]) & (1 << (action % 64))
+
+    small = batch.clone_indices(np.array([0, 1], dtype=np.uint32))
+    small_masks = np.empty((2, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
+    small_actions = np.empty(2, dtype=np.uint8)
+    small.legal_action_masks_into(small_masks)
+    small.rule_nn_actions_into(small_actions, policy)
+    for action, legal in zip(small_actions, small_masks, strict=True):
+        action = int(action)
+        assert int(legal[action // 64]) & (1 << (action % 64))
+
+    with pytest.raises(ValueError, match="shape"):
+        batch.rule_nn_actions_masked_into(enabled[:-1], actions, policy)
+    invalid = enabled.copy()
+    invalid[1] = 2
+    with pytest.raises(ValueError, match="legal"):
+        batch.rule_nn_actions_masked_into(invalid, actions, policy)
+
+
+def test_batch_rule_ev_writes_fixed_buffers() -> None:
     size = 8
     batch = bm.Batch(size, seed=47)
     masks = np.empty((size, bm.LEGAL_ACTION_MASK_WORDS), dtype=np.uint64)
     ev_actions = np.empty(size, dtype=np.uint8)
-    planner_actions = np.empty(size, dtype=np.uint8)
-    minimal_planner = bm.RulePlannerConfig(
-        hand_changes=0,
-        draw_horizon=0,
-        candidate_states=1,
-    )
     records = np.empty((size, bm.STEP_RECORD_WIDTH), dtype=np.int64)
     _, _, tile_obs, melds, river, meta = buffers(size)
     for _ in range(32):
@@ -161,38 +160,27 @@ def test_batch_rule_ev_and_planner_write_fixed_buffers() -> None:
 
     batch.legal_action_masks_into(masks)
     batch.rule_ev_actions_into(ev_actions, bm.RuleEvConfig.fast())
-    batch.rule_planner_actions_into(planner_actions, minimal_planner)
 
-    for actions in (ev_actions, planner_actions):
-        for action, words in zip(actions, masks, strict=True):
-            assert int(words[int(action) // 64]) & (1 << (int(action) % 64))
+    for action, words in zip(ev_actions, masks, strict=True):
+        assert int(words[int(action) // 64]) & (1 << (int(action) % 64))
 
     enabled = (np.arange(size) % 2 == 0).astype(np.uint8)
     sentinel = np.uint8(0xA5)
     ev_masked = np.full(size, sentinel, dtype=np.uint8)
-    planner_masked = np.full(size, sentinel, dtype=np.uint8)
     batch.rule_ev_actions_masked_into(
         enabled, ev_masked, bm.RuleEvConfig.fast()
     )
-    batch.rule_planner_actions_masked_into(
-        enabled, planner_masked, minimal_planner
-    )
     np.testing.assert_array_equal(ev_masked[enabled == 1], ev_actions[enabled == 1])
-    np.testing.assert_array_equal(
-        planner_masked[enabled == 1], planner_actions[enabled == 1]
-    )
     assert np.all(ev_masked[enabled == 0] == sentinel)
-    assert np.all(planner_masked[enabled == 0] == sentinel)
 
     with pytest.raises(ValueError, match="shape"):
         batch.rule_ev_actions_into(ev_actions[:-1])
     invalid = enabled.copy()
     invalid[1] = 2
     with pytest.raises(ValueError, match="action"):
-        batch.rule_planner_actions_masked_into(invalid, planner_masked)
+        batch.rule_ev_actions_masked_into(invalid, ev_masked)
 
     assert bm.RULE_EV_ACTION_TERMINAL == np.iinfo(np.uint8).max
-    assert bm.RULE_PLANNER_ACTION_TERMINAL == np.iinfo(np.uint8).max
 
 
 def test_game_step_into_rejects_unaligned_output_before_mutating() -> None:

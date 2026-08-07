@@ -6,7 +6,6 @@
 
 - `rule-fast`
 - `rule-ev`
-- `rule-planner`
 - `rule-nn`
 
 ## 平衡设计
@@ -44,41 +43,19 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
 | `--policy-a` | `rule-ev` | A 侧策略 |
 | `--policy-b` | `rule-fast` | B 侧策略 |
 
-默认 `4096` blocks 会运行 24576 局。planner 搜索和 ONNX 推理可能需要较长时间。先用较小 blocks 测量吞吐，再决定正式样本量。
+默认 `4096` blocks 会运行 24576 局。ONNX 推理可能需要较长时间。先用较小 blocks 测量吞吐，再决定正式样本量。
 
 ## 策略参数
 
 A 侧参数使用 `--a-*`，B 侧使用 `--b-*`。两侧参数完全对称。
 
-| 参数后缀 | `rule-fast` | `rule-ev` | `rule-planner` | `rule-nn` |
-| --- | --- | --- | --- | --- |
-| `lookahead-depth` | 忽略 | 确定性前瞻深度 `0..3` | 忽略 | 忽略 |
-| `hand-changes` | 忽略 | 忽略 | 候选图允许的有效换牌次数 `0..2` | 忽略 |
-| `draw-horizon` | 忽略 | 忽略 | 候选图摸牌视野 `0..32` | 忽略 |
-| `candidate-states` | 忽略 | 忽略 | 候选图状态上限 `1..200000` | 忽略 |
-| `belief-worlds` | 忽略 | 忽略 | 信念粒子数 `0..256` | 忽略 |
-| `root-belief` | 忽略 | 忽略 | `posterior`、`uniform` 或 `oracle-hidden` | 忽略 |
-| `continuation` | 忽略 | 忽略 | `current` 或 `oracle-continuation` | 忽略 |
-| `response-worlds` | 忽略 | 忽略 | 响应分析世界数 `0..256` | 忽略 |
-| `search-iterations` | 忽略 | 忽略 | 配对 rollout iteration 数 `0..4096` | 忽略 |
-| `defense` | 忽略 | `none` 或 `heuristic` | 忽略 | 忽略 |
-| `nn-model` | 忽略 | 忽略 | 忽略 | 必填 ONNX 文件路径 |
+| 参数后缀 | `rule-fast` | `rule-ev` | `rule-nn` |
+| --- | --- | --- | --- |
+| `lookahead-depth` | 忽略 | 确定性前瞻深度 `0..3` | 忽略 |
+| `defense` | 忽略 | `none` 或 `heuristic` | 忽略 |
+| `nn-model` | 忽略 | 忽略 | 必填 ONNX 文件路径 |
 
-CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`search-iterations` 只影响 `rule-planner`。`nn-model` 只影响 `rule-nn`，并且选择 `rule-nn` 时必须提供。配对 rollout 指固定其余三个座位的行动不变、只改进当前座位的动作，再用独立粒子流验证改动。
-
-`root-belief` 只改变 planner 根搜索的粒子分布。`posterior` 是生产模式。`uniform` 对合法隐藏世界等权。`oracle-hidden` 固定权威状态中的真实暗手和剩余牌组成，并为每个粒子独立重排未来牌墙。该模式读取隐藏信息，只能用于诊断 belief 的信息价值，不能作为可部署策略或正式 Elo 成绩。
-
-`continuation` 只改变 planner 根搜索的终局续局策略。`current` 保留生产路径中的 `Simple` 和 `Direct` 两个代理模型。`oracle-continuation` 根据当前 2v2 seat mask，把本局已知的 `rule-fast`、`rule-ev` 或 planner baseline 分配到四个座位。每个座位只读取自己的合法 observation。planner baseline 保留手牌图、belief 和 response 配置，但关闭 paired root search，避免 rollout 内递归搜索。continuation profile 不执行 ONNX；`rule-nn` 在该诊断模式中使用 `rule-fast` fallback。该模式会读取对手策略身份，只能用于诊断 continuation mismatch。
-
-以下组合分别对应三项主要消融：
-
-| 名称 | `root-belief` | `continuation` |
-| --- | --- | --- |
-| Current | `posterior` | `current` |
-| Oracle continuation | `posterior` | `oracle-continuation` |
-| Joint oracle | `oracle-hidden` | `oracle-continuation` |
-
-只有 `rule-planner` 的 `belief-worlds`、`response-worlds` 和 `search-iterations` 会影响内层搜索的自动并发判断。需要固定调度时，显式设置 `--parallel-games`。
+CLI 为两侧提供统一参数集。与所选策略无关的参数不会进入动作配置。`nn-model` 只影响 `rule-nn`，并且选择 `rule-nn` 时必须提供。
 
 查看当前二进制的完整默认值：
 
@@ -88,7 +65,9 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- --help
 
 ## NN 对 Rule-Fast 示例
 
-`rule-nn` 在启动时加载一次 ONNX 模型。模型经过 schema 检查和图优化后，由所有 tournament worker 共享。以下命令应在 `engine/` 目录执行，使用仓库中的 [`../../../model/latest.onnx`](../../../model/latest.onnx)：
+`rule-nn` 在启动时加载一次 ONNX 模型。模型经过 schema 检查和图优化后，由所有 tournament worker 共享。必须先训练并导出包含 `engine_rules_version=10` metadata 的模型。仓库当前附带的旧 `model/latest.onnx` 不兼容，不能直接用于该命令。
+
+以下命令应在 `engine/` 目录执行，并将示例路径替换为实际的规则版本 10 模型：
 
 ```bash
 cargo run --release -p bloodflow-mahjong-rule-tournament -- \
@@ -96,37 +75,11 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- \
   --bootstrap-samples 2000 \
   --root-seed 20260804 \
   --policy-a rule-nn \
-  --a-nn-model ../model/latest.onnx \
+  --a-nn-model /path/to/rules-v10.onnx \
   --policy-b rule-fast
 ```
 
-当 B 侧使用 `rule-nn` 时，改用 `--b-nn-model`。策略名称包含模型文件名；例如 `latest.onnx` 在输出中显示为 `rule_nn_latest`。模型的输入、输出和合法动作过滤契约见 [`../../core/README.md`](../../core/README.md) 的 `rule-nn` 一节。
-
-## Planner 对 EV 示例
-
-以下命令运行 32 blocks，共 192 局：
-
-```bash
-cargo run --release -p bloodflow-mahjong-rule-tournament -- \
-  --blocks 32 \
-  --bootstrap-samples 10000 \
-  --root-seed 20265001 \
-  --parallel-games 2 \
-  --policy-a rule-planner \
-  --a-hand-changes 0 \
-  --a-draw-horizon 1 \
-  --a-candidate-states 1 \
-  --a-belief-worlds 64 \
-  --a-response-worlds 0 \
-  --a-search-iterations 64 \
-  --a-root-belief posterior \
-  --a-continuation current \
-  --policy-b rule-ev \
-  --b-lookahead-depth 1 \
-  --b-defense heuristic
-```
-
-该命令用于统计验证，不是快速测试。`--parallel-games` 同时增加局级并行和内层搜索竞争。过高的值可能降低吞吐。当前 32 线程机器上，`2` 快于 `1` 和 `4`；其他机器仍应先测量吞吐。
+当 B 侧使用 `rule-nn` 时，改用 `--b-nn-model`。策略名称包含模型文件名；例如 `rules-v10.onnx` 在输出中显示为 `rule_nn_rules_v10`。模型的输入、输出和合法动作过滤契约见 [`../../core/README.md`](../../core/README.md) 的 `rule-nn` 一节。
 
 ## 输出示例
 
@@ -154,14 +107,12 @@ RESULT rule_ev_d1_heuristic-vs-rule_fast Elo +64.47 uncertainty-unavailable
 - `cross-policy-win`：同局内 A 座位名次优于 B 座位的两两比例；
 - `mean-rank`、`mean-score`、`first` 和 `last`：每种策略的 seat-game 汇总；`mean-score` 是相对每局初始分数的平均变化，不是终局绝对分数；
 - `Decisions`：胡、碰、杠和过的选择计数；
-- `Planner search <policy>`：按 A/B 策略侧分别统计搜索决策、proposal、验证拒绝、改动和 rollout；
-- `Planner`：两侧实际对局决策的确定性规划和危险度统计；oracle continuation 内部模拟不会写入该统计；
 - `Throughput`：牌局、动作和统计耗时。
 
 `Elo-like delta` 不是跨规则、跨阵容或跨版本通用的外部等级分。它只描述本次二对二实验。只有在新 seed 上复现且置信区间稳定时，才能把正点估计解释为可靠提升。
 
 ## 进度和并行
 
-工具每 5 秒向 stderr 输出完成局数、活跃局数、动作吞吐、耗时和 ETA。启用内层搜索时，工具倾向使用保守的局级并发；无内层搜索时，默认使用 Rayon 线程数。最终选择会打印在启动行中。
+工具每 5 秒向 stderr 输出完成局数、活跃局数、动作吞吐、耗时和 ETA。最终选择会打印在启动行中。
 
 固定 root seed、二进制版本和策略配置后，游戏结果不依赖任务完成顺序。动态 work queue 只改变调度，不改变 game index、seed 或座位分配。

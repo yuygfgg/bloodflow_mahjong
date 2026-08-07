@@ -6,17 +6,20 @@
 
 本仓库按 GNU Affero General Public License v3.0（AGPLv3）发布，完整文本见 [`LICENSE`](LICENSE)。
 
-四人血流麻将的完整实现：Rust 权威引擎，附带三种规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具、Python 与 WebAssembly 绑定、训练流程和纯静态 Web 客户端。
+四人血流麻将的完整实现：Rust 权威引擎，附带两种内置规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具、Python 与 WebAssembly 绑定、训练流程和纯静态 Web 客户端。
+
+当前引擎规则版本为 `10`。首次和牌会锁定完整基础结构；后续普通回合只能摸切，但仍可暗杠或碰杠；历次和牌张公开隔离，不得参与后续动作。版本 7、8 和 9 的重放、checkpoint 与模型不兼容当前引擎，模型必须重新训练。
 
 ## 功能
 
 - 108 张三门数牌（万/条/筒），换三张、定缺；
 - 碰、直杠、碰杠、暗杠、抢杠胡和一炮多响；
-- 胡后继续行牌，和牌结构锁定，可重复胡；
+- 弃牌响应支持胡、碰、直杠和过，并按胡优先规则结算；
+- 胡后继续行牌，和牌基础保持锁定，历次和牌张公开隔离，可重复胡；
 - 全部结构牌型、状态/事件番与即时计分；
 - 牌墙耗尽后查花猪、查大叫，分数下限为 0；
 - 115 维固定动作空间、观察者视角事件和批量环境；
-- 三种规则策略、ONNX 神经网络策略和任意两两平衡测评；
+- `rule-fast`、`rule-ev`、ONNX 神经网络策略和任意两两平衡测评；
 - Python 与 WebAssembly 绑定，以及基于 Three.js 的纯静态 Web 客户端。
 
 完整玩法与计分规范见 [`GAME_RULES.md`](GAME_RULES.md)。
@@ -46,7 +49,7 @@
 | [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种受支持策略的平衡测评工具 |
 | [`web`](web/) | 基于 Three.js 的纯静态 Web 客户端 |
 | [`training`](training/) | 自对弈训练与 ONNX 导出流程 |
-| [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 使用的 ONNX 模型 |
+| [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 的部署路径；使用前必须替换为规则版本 10 重新训练并导出的模型 |
 
 Rust workspace 包含四个 package：
 
@@ -86,14 +89,13 @@ fn main() -> Result<(), GameError> {
 | --- | --- | --- |
 | `rule-fast` | 低成本、确定性的基准策略 | Rust/Python `Game` 和 `Batch` |
 | `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust/Python `Game` 和 `Batch` |
-| `rule-planner` | 手牌图、公开状态价值、信念采样和配对 rollout 改进 | Rust/Python `Game` 和 `Batch` |
 | `rule-nn` | ONNX Actor；引擎负责 observation 编码和合法动作过滤 | Rust/Python/Wasm `RuleNn` 和锦标赛 |
 
-前三种策略不需要外部模型。`rule-nn` 需要 [`model/latest.onnx`](model/latest.onnx)，并且当前只提供单局推理，不提供 `Batch` 推理。四种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
+`rule-fast` 和 `rule-ev` 不需要外部模型。`rule-nn` 需要与规则版本 10 配套的 ONNX 模型；仓库中的旧 `model/latest.onnx` 不能继续用于当前规则。Rust 和 Python 接口支持单局与 `Batch` 推理，WebAssembly 接口提供单局推理。三种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
 ## Python 绑定
 
-需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样、三种规则策略和 `RuleNn`。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
+需要 Python 3.10 或更高版本、NumPy 和 Maturin。绑定公开 `Game`、`Batch`、压缩合法动作 mask、observation、事件、信息集重采样、两种内置规则策略和 `RuleNn`。安装、数组格式和示例见 [`engine/pybind/README.md`](engine/pybind/README.md)。
 
 ## 构建与验证
 

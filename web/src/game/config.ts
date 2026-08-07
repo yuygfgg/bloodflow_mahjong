@@ -9,6 +9,7 @@ const DEFAULT_BOT_PROFILES = [
   "rule-fast",
   "rule-fast",
 ] as const;
+export const BOT_PROFILES = ["rule-fast", "rule-ev", "rule-nn"] as const;
 
 export interface GameConfig {
   seed: string;
@@ -33,7 +34,24 @@ function defaultConfig(seed: string): GameConfig {
 }
 
 function isBotProfile(value: unknown): value is BotProfile {
-  return value === "rule-fast" || value === "rule-ev" || value === "rule-nn";
+  return BOT_PROFILES.some((profile) => profile === value);
+}
+
+export function isBotProfileAvailable(
+  profile: BotProfile,
+  nnAvailable: boolean,
+): boolean {
+  return profile !== "rule-nn" || nnAvailable;
+}
+
+export function areConfiguredBotsAvailable(
+  config: GameConfig,
+  nnAvailable: boolean,
+): boolean {
+  return config.botProfiles.every(
+    (profile, seat) =>
+      seat === config.humanSeat || isBotProfileAvailable(profile, nnAvailable),
+  );
 }
 
 export function loadStoredGameConfig(

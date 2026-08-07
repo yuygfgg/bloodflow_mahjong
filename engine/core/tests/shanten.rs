@@ -71,6 +71,30 @@ fn exposed_melds_reduce_the_number_of_concealed_groups_needed() {
 }
 
 #[test]
+fn exposed_melds_share_the_four_copy_limit_with_concealed_tiles() {
+    let blocked_tile = tile(Suit::Characters, 5);
+    let melds = [
+        meld(Suit::Characters, 5),
+        meld(Suit::Bamboo, 1),
+        meld(Suit::Dots, 3),
+        meld(Suit::Dots, 7),
+    ];
+    let counts = hand(&[(Suit::Characters, 5, 2)]);
+
+    assert_ne!(
+        evaluate_shanten(&counts, &melds, None),
+        SHANTEN_COMPLETE,
+        "a pong and a concealed pair cannot represent five physical copies"
+    );
+    assert!(!is_winning(&counts, &melds, Some(blocked_tile)));
+
+    let ready_counts = hand(&[(Suit::Characters, 5, 1)]);
+    let analysis = analyze_shanten(&ready_counts, &melds, None);
+    assert_eq!(analysis.shanten, 0);
+    assert_eq!(analysis.improving_tiles & (1 << blocked_tile.index()), 0);
+}
+
+#[test]
 fn seven_pairs_counts_a_quad_as_two_pairs() {
     let counts = hand(&[
         (Suit::Characters, 1, 4),
@@ -148,22 +172,29 @@ fn lookup_matches_an_independent_recursive_reference() {
             _ => None,
         };
 
+        let meld_suits: Vec<_> = Suit::ALL
+            .into_iter()
+            .filter(|&suit| Some(suit) != missing)
+            .collect();
+        let melds: Vec<_> = (0..fixed_melds)
+            .map(|index| meld(meld_suits[index % meld_suits.len()], (index / 2 + 1) as u8))
+            .collect();
+        let mut limits = [4_u8; 27];
+        for exposed in &melds {
+            limits[exposed.tile.index()] -= 3;
+        }
+
         let mut counts = [0_u8; 27];
         for _ in 0..14 - 3 * fixed_melds {
             loop {
                 random = next_random(random);
                 let index = random as usize % counts.len();
-                if counts[index] < 4 {
+                if counts[index] < limits[index] {
                     counts[index] += 1;
                     break;
                 }
             }
         }
-        let meld_suit = Suit::ALL
-            .into_iter()
-            .find(|&suit| Some(suit) != missing)
-            .expect("at least two suits are not missing");
-        let melds = vec![meld(meld_suit, 1); fixed_melds];
 
         assert_eq!(
             evaluate_shanten(&counts, &melds, missing),

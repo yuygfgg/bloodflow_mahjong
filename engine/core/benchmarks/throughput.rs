@@ -32,16 +32,13 @@ fn choose_action(legal: LegalActions, rng: &mut ChaCha8Rng) -> Action {
         Phase::ChooseMissing => {
             Action::ChooseMissing(Suit::ALL[rng.random_range(0..Suit::ALL.len())])
         }
-        Phase::HuResponse => {
-            if legal.can_hu && rng.random_range(0..2) == 1 {
-                Action::Hu
-            } else {
-                Action::Pass
-            }
-        }
-        Phase::MeldResponse => {
-            let mut actions = [Action::Pass; 3];
+        Phase::HuResponse | Phase::MeldResponse => {
+            let mut actions = [Action::Pass; 4];
             let mut len = 1;
+            if legal.can_hu {
+                actions[len] = Action::Hu;
+                len += 1;
+            }
             if legal.can_pong {
                 actions[len] = Action::Pong;
                 len += 1;

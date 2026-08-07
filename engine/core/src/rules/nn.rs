@@ -11,9 +11,11 @@ use thiserror::Error;
 use tract_onnx::prelude::*;
 
 use crate::{
-    ActionId, ActionMask, EVENT_RECORD_WIDTH, Game, GameError, MELD_OBSERVATION_WIDTH,
-    META_OBSERVATION_WIDTH, TILE_OBSERVATION_WIDTH,
+    ActionId, ActionMask, Batch, EVENT_RECORD_WIDTH, Game, GameError, MELD_OBSERVATION_WIDTH,
+    META_OBSERVATION_WIDTH, TILE_KIND_COUNT, TILE_OBSERVATION_PLANES, TILE_OBSERVATION_WIDTH,
 };
+
+use super::batch_policy_actions_try_into;
 
 /// Number of event records exported to the policy graph.
 pub const RULE_NN_HISTORY: usize = 192;
@@ -22,12 +24,19 @@ pub const RULE_NN_LOGITS: usize = crate::ACTION_SPACE_SIZE;
 
 const INPUT_COUNT: usize = 5;
 const OUTPUT_COUNT: usize = 1;
+const ENGINE_RULES_VERSION_METADATA_KEY: &str = "onnx.metadata_props.engine_rules_version";
 
 /// Errors returned while loading or running an ONNX policy.
 #[derive(Debug, Error)]
 pub enum RuleNnError {
     #[error("failed to read ONNX model: {0}")]
     ModelLoad(String),
+    #[error("ONNX model does not declare engine_rules_version metadata")]
+    MissingEngineRulesVersion,
+    #[error("ONNX model has malformed engine_rules_version metadata: {0}")]
+    MalformedEngineRulesVersion(String),
+    #[error("ONNX model uses engine rules version {actual}; expected {expected}")]
+    EngineRulesVersionMismatch { actual: String, expected: u32 },
     #[error("failed to optimize ONNX model: {0}")]
     ModelOptimize(String),
     #[error("ONNX model schema is incompatible with rule-nn: {0}")]
@@ -42,8 +51,51 @@ pub enum RuleNnError {
     NoFiniteLegalLogit,
     #[error("the engine returned a decision without a legal-action mask")]
     DecisionWithoutLegalActions,
+    #[error("invalid rule-nn batch input: {0}")]
+    BatchInput(GameError),
     #[error("engine observation encoding failed: {0}")]
     Observation(#[from] GameError),
+}
+
+impl Batch {
+    /// Writes one rule-NN action per environment.
+    ///
+    /// Terminal environments receive `u8::MAX`. The policy is immutable and
+    /// shared by all batch workers.
+    pub fn rule_nn_actions_into(
+        &self,
+        policy: &RuleNn,
+        output: &mut [u8],
+    ) -> Result<(), RuleNnError> {
+        batch_policy_actions_try_into(
+            self,
+            None,
+            output,
+            u8::MAX,
+            RuleNnError::BatchInput,
+            |game| policy.action(game),
+        )
+    }
+
+    /// Writes rule-NN actions only where `enabled` is one.
+    ///
+    /// Disabled output rows are left untouched. Input buffers are validated
+    /// before inference starts.
+    pub fn rule_nn_actions_masked_into(
+        &self,
+        enabled: &[u8],
+        policy: &RuleNn,
+        output: &mut [u8],
+    ) -> Result<(), RuleNnError> {
+        batch_policy_actions_try_into(
+            self,
+            Some(enabled),
+            output,
+            u8::MAX,
+            RuleNnError::BatchInput,
+            |game| policy.action(game),
+        )
+    }
 }
 
 /// A thread-safe, immutable ONNX policy.
@@ -66,7 +118,9 @@ impl RuleNn {
 
         let model = tract_onnx::onnx()
             .model_for_read(&mut Cursor::new(bytes))
-            .map_err(|error| RuleNnError::ModelLoad(error.to_string()))?
+            .map_err(|error| RuleNnError::ModelLoad(error.to_string()))?;
+        validate_engine_rules_version(&model)?;
+        let model = model
             .into_optimized()
             .map_err(|error| RuleNnError::ModelOptimize(error.to_string()))?;
         validate_model_schema(&model)?;
@@ -109,7 +163,11 @@ impl RuleNn {
         let event_length = event_length as i64;
 
         let inputs = tvec!(
-            tensor(&[1, 10, 27], &tile_obs, "tile_obs")?,
+            tensor(
+                &[1, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT],
+                &tile_obs,
+                "tile_obs",
+            )?,
             tensor(&[1, 4, 4, 3], &melds, "melds")?,
             tensor(&[1, 34], &meta, "meta")?,
             tensor(&[1, RULE_NN_HISTORY, EVENT_RECORD_WIDTH], &events, "events")?,
@@ -142,6 +200,32 @@ impl RuleNn {
             .map_err(|error| RuleNnError::OutputSchema(error.to_string()))?;
         Ok(Some(select_legal_action(logits, legal)?))
     }
+}
+
+fn validate_engine_rules_version(model: &InferenceModel) -> Result<(), RuleNnError> {
+    let property = model
+        .properties
+        .get(ENGINE_RULES_VERSION_METADATA_KEY)
+        .ok_or(RuleNnError::MissingEngineRulesVersion)?;
+    if property.datum_type() != DatumType::String || !property.shape().is_empty() {
+        return Err(RuleNnError::MalformedEngineRulesVersion(format!(
+            "expected a string scalar, got {:?} with shape {:?}",
+            property.datum_type(),
+            property.shape()
+        )));
+    }
+    let actual = property
+        .try_as_plain()
+        .and_then(|plain| plain.to_scalar::<String>().cloned())
+        .map_err(|error| RuleNnError::MalformedEngineRulesVersion(error.to_string()))?;
+    let expected = crate::ENGINE_RULES_VERSION;
+    let parsed = actual
+        .parse::<u32>()
+        .map_err(|error| RuleNnError::MalformedEngineRulesVersion(error.to_string()))?;
+    if parsed != expected {
+        return Err(RuleNnError::EngineRulesVersionMismatch { actual, expected });
+    }
+    Ok(())
 }
 
 fn tensor<T: Datum + Copy>(shape: &[usize], data: &[T], name: &str) -> Result<TValue, RuleNnError> {
@@ -186,7 +270,11 @@ fn validate_model_schema(model: &TypedModel) -> Result<(), RuleNnError> {
         )));
     }
     let expected = [
-        ("tile_obs", DatumType::U8, vec![1, 10, 27]),
+        (
+            "tile_obs",
+            DatumType::U8,
+            vec![1, TILE_OBSERVATION_PLANES, TILE_KIND_COUNT],
+        ),
         ("melds", DatumType::U8, vec![1, 4, 4, 3]),
         ("meta", DatumType::I32, vec![1, 34]),
         (
@@ -281,5 +369,44 @@ mod tests {
             select_legal_action(&logits, legal),
             Err(RuleNnError::NoFiniteLegalLogit)
         ));
+    }
+
+    fn model_with_version(value: Option<Arc<Tensor>>) -> InferenceModel {
+        let mut model = InferenceModel::default();
+        if let Some(value) = value {
+            model
+                .properties
+                .insert(ENGINE_RULES_VERSION_METADATA_KEY.to_owned(), value);
+        }
+        model
+    }
+
+    #[test]
+    fn requires_the_current_engine_rules_version_metadata() {
+        assert!(matches!(
+            validate_engine_rules_version(&model_with_version(None)),
+            Err(RuleNnError::MissingEngineRulesVersion)
+        ));
+        assert!(matches!(
+            validate_engine_rules_version(&model_with_version(Some(rctensor0(10_i64)))),
+            Err(RuleNnError::MalformedEngineRulesVersion(_))
+        ));
+        assert!(matches!(
+            validate_engine_rules_version(&model_with_version(Some(rctensor0(
+                "not-a-version".to_owned(),
+            )))),
+            Err(RuleNnError::MalformedEngineRulesVersion(_))
+        ));
+        assert!(matches!(
+            validate_engine_rules_version(&model_with_version(Some(rctensor0("9".to_owned())))),
+            Err(RuleNnError::EngineRulesVersionMismatch { actual, expected })
+                if actual == "9" && expected == crate::ENGINE_RULES_VERSION
+        ));
+        assert!(
+            validate_engine_rules_version(&model_with_version(Some(rctensor0(
+                crate::ENGINE_RULES_VERSION.to_string(),
+            ))))
+            .is_ok()
+        );
     }
 }

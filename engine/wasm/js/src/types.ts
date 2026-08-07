@@ -60,9 +60,9 @@ export interface UiSnapshot {
   scores: readonly [number, number, number, number];
   /** Relative missing suits; -1 means unset. */
   missingSuits: readonly [number, number, number, number];
-  /** Viewer concealed histogram including locked winning structures. */
+  /** Viewer concealed histogram including the locked winning structure. */
   ownHand: Uint8Array;
-  /** Viewer playable tiles after subtracting locked counts. */
+  /** Viewer playable tiles after subtracting all locked tiles. */
   unlockedHand: Uint8Array;
   /** Stable winning base for the viewer; empty before the first win. */
   winBase: Uint8Array;
@@ -72,7 +72,7 @@ export interface UiSnapshot {
   exchangeSelectedCount: number;
   /** Suit the exchange selection is locked to once non-empty; -1 when unset. */
   exchangeSelectionSuit: number;
-  /** Locked winning-tile histograms for relative seats 0..3. */
+  /** Full viewer locks, followed by public winning references for opponents. */
   lockedTiles: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
   /** Per-relative-seat discard histograms. */
   discardCounts: readonly [Uint8Array, Uint8Array, Uint8Array, Uint8Array];
@@ -91,6 +91,7 @@ export interface UiSnapshot {
   unlockedHandCounts: readonly [number, number, number, number];
   pendingSource: number;
   pendingTile: number;
+  /** Bit 0 rob-Kong, bit 1 Kong discard, bit 2 opening discard, bit 3 last-wall discard. */
   pendingResponseFlags: number;
   /** Visible draw tile for the viewer, or -1. */
   drawTile: number;

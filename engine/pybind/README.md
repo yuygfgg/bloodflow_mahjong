@@ -11,7 +11,7 @@ maturin develop --release --manifest-path engine/pybind/Cargo.toml
 python -m pytest engine/pybind/tests
 ```
 
-PyO3 使用 `abi3-py310`。模块公开 `Game`、`Batch`、事件枚举、常量、三种规则策略和 `RuleNn`。`rule-ev` 和 `rule-planner` 使用不可变配置对象 `RuleEvConfig` 和 `RulePlannerConfig`。默认构建启用 feature `rule-nn`。
+PyO3 使用 `abi3-py310`。模块公开 `Game`、`Batch`、事件枚举、常量、两种内置规则策略和 `RuleNn`。`rule-ev` 使用不可变配置对象 `RuleEvConfig`。默认构建启用 feature `rule-nn`。
 
 ## 快速开始
 
@@ -27,31 +27,29 @@ print(game.rankings())
 
 `simple_rule_action` 在终局返回 `None`。`step_id` 返回该步的 step record（见下文）。要按观察者视角查看单步结果，用 `observe_into` 和 `events_into`。
 
-`rule_ev_action` 和 `rule_planner_action` 接受可选配置。省略配置时使用默认预算：
+`rule_ev_action` 接受可选配置。省略配置时使用标准预算：
 
 ```python
 ev_config = bm.RuleEvConfig(search_depth=1, defense=True)
-planner_config = bm.RulePlannerConfig()
 
 ev_action = game.rule_ev_action(ev_config)
-planner_action = game.rule_planner_action(planner_config)
 ```
 
-`RuleEvConfig` 提供 `fast()` 和 `standard()`。`RulePlannerConfig` 只有一个默认配置：`hand_changes=0`、`draw_horizon=1`、`candidate_states=1`、`belief_worlds=64`、`response_worlds=0`、`search_iterations=64`。构造函数会拒绝超出 core 约束的预算。
+`RuleEvConfig` 提供 `fast()` 和 `standard()`。构造函数会拒绝超出 core 约束的预算。
 
-`RuleNn` 从 ONNX 文件或字节加载模型。模型加载会检查固定输入和输出契约。一个实例可以在多个 `Game` 决策中复用：
+`RuleNn` 从 ONNX 文件或字节加载模型。调用方必须使用规则版本 10 重新训练的模型；当前仓库中的旧 `model/latest.onnx` 不能用于当前引擎。模型加载会检查固定输入和输出契约。一个实例可以在多个 `Game` 决策中复用：
 
 ```python
 import bloodflow_mahjong as bm
 
-policy = bm.RuleNn.from_file("model/latest.onnx")
+policy = bm.RuleNn.from_file("/path/to/rules-v10.onnx")
 game = bm.Game(seed=42)
 
 while (action := policy.action(game)) is not None:
     game.step_id(action)
 ```
 
-模型只输出原始 logits。Rust core 应用当前 `Game` 的合法动作 mask，因此 `RuleNn.action` 不会返回非法动作。当前接口不支持 `Batch` 神经网络推理。
+模型只输出原始 logits。Rust core 应用当前 `Game` 的合法动作 mask，因此 `RuleNn.action` 不会返回非法动作。`Batch.rule_nn_actions_into` 和 `Batch.rule_nn_actions_masked_into` 复用同一个模型，并在 Rust worker 中并行执行固定 batch-size 1 的 ONNX 图。
 
 ## 固定动作空间
 
@@ -76,21 +74,21 @@ while (action := policy.action(game)) is not None:
 `Game` 提供单局接口：
 
 - reset、阶段、当前决策和合法动作 mask；
-- 三种规则策略的单局动作接口、`RuleNn.action` 和 `step_id`；
+- 两种内置规则策略的单局动作接口、`RuleNn.action` 和 `step_id`；
 - observation、事件和全知 tile count 写入；
-- 四家分数、缺门、暗手、锁牌、面子、弃牌、排名和终局原因；
+- 四家分数、缺门、合并持牌、历次和牌张、面子、弃牌、排名和终局原因；
 - 信息集重采样。
 
 `Batch` 提供对应的批量 `*_into` 接口，以及：
 
 - 按索引重置、克隆和 swap-remove；
 - 批量信息集或 live-wall 重采样；
-- 三种规则策略的普通和 masked `*_actions_into` 接口；
+- 两种内置规则策略和 `RuleNn` 的普通和 masked `*_actions_into` 接口；
 - masked step 和融合 step；
 - 向听分析；
 - 只为指定绝对座位写入事件历史。
 
-数组 dtype、shape、C-contiguous、对齐和内存不重叠是 API 合约。无效数组在状态推进前返回错误。Batch 执行 reset、mask、策略和 step 时释放 GIL，并在 batch 足够大时使用 Rayon。单局 `rule_ev_action`、`rule_planner_action` 和 `RuleNn.action` 也会释放 GIL。
+数组 dtype、shape、C-contiguous、对齐和内存不重叠是 API 合约。无效数组在状态推进前返回错误。Batch 执行 reset、mask、策略和 step 时释放 GIL，并在 batch 足够大时使用 Rayon。单局 `rule_ev_action` 和 `RuleNn.action` 也会释放 GIL。
 
 ## Step record
 
@@ -118,7 +116,7 @@ Step record 是权威环境数据，不会按观察者隐藏摸牌。策略输�
 
 向听数表示还差几次有效进张才能听牌，正常范围从 `SHANTEN_COMPLETE`（`-1`，结构已完成）到 `SHANTEN_MAX`（`8`）。终局 batch 行使用 `SHANTEN_TERMINAL`（`127`）和空 mask。
 
-向听分析覆盖普通四面子一对、该游戏规则中的七对、公开面子和缺门。玩家和牌后，旧结构仍保留在扩展持牌中，因此 `-1` 不代表距离下一次血流和牌只有一步。
+向听分析覆盖普通四面子一对、该游戏规则中的七对、公开面子和缺门。引擎分析玩家状态时会先排除历次和牌张。结果始终表示当前普通手牌距离下一次和牌的结构距离。
 
 ## 事件流
 
@@ -163,15 +161,16 @@ Observation 以指定 viewer 为相对座位 `0`，其下家依次为 `1`、`2`�
 
 ### `tile_obs`
 
-`Game.observe_into` 的 shape 为 `[10, 27]`，Batch 接口的 shape 为 `[batch, 10, 27]`：
+`Game.observe_into` 的 shape 为 `[11, 27]`，Batch 接口的 shape 为 `[batch, 11, 27]`：
 
 | Plane | 内容 |
 | ---: | --- |
-| `0` | 相对座位 0 的暗手 |
+| `0` | 相对座位 0 的合并持牌直方图，包含普通手牌和历次和牌张 |
 | `1` | 相对座位 0 已选择的换牌 |
-| `2` | 相对座位 `0` 的完整锁牌 |
-| `3..5` | 相对座位 `1..3` 公开的和牌张，不包含隐藏牌型 |
+| `2` | 相对座位 `0` 的完整锁定暗牌，包括和牌基础和历次和牌张 |
+| `3..5` | 相对座位 `1..3` 的历次和牌张 |
 | `6..9` | 相对座位 `0..3` 的弃牌计数 |
+| `10` | 相对座位 `0` 的永久禁杠牌种；当前摸牌刚触发的禁用也立即可见 |
 
 ### `melds`
 
@@ -202,9 +201,9 @@ Observation 以指定 viewer 为相对座位 `0`，其下家依次为 `1`、`2`�
 | `12..15` | 相对座位 `0..3` 的分数 |
 | `16..19` | 相对座位 `0..3` 的缺门；未公开时为 `-1` |
 | `20..23` | 相对座位 `0..3` 是否已经和牌 |
-| `24..27` | 相对座位 `0..3` 的暗手张数 |
+| `24..27` | 相对座位 `0..3` 的合并持牌张数，包含历次和牌张 |
 | `28` | 终局标记 |
-| `29` | 响应 flags：bit 0 抢杠、bit 1 杠后弃牌、bit 2 开局首弃 |
+| `29` | 响应 flags：bit 0 抢杠、bit 1 杠后弃牌、bit 2 开局首弃、bit 3 末张弃牌 |
 | `30..33` | 相对座位 `0..3` 的历史最高和牌牌型倍率 |
 
 分配数组时必须使用模块公开的 width 常量。shape 校验会在 schema 变化时立即失败。
@@ -253,7 +252,9 @@ batch.step_and_observe_history_into(
 
 `ENGINE_RULES_VERSION` 标识游戏规则执行和初始化语义。紧凑轨迹至少应保存该版本、seed 和动作序列。版本不同时应拒绝重放，不应猜测迁移。
 
-`Game.resample_information_set(seed)` 返回一个与当前观测一致的隐藏世界采样（determinization），并保持当前行动者的 observation 和 legal mask 不变。普通回合会共同重洗对手未锁暗牌和 live wall。换牌阶段会固定已经选择牌的玩家。响应阶段会固定四家暗手，因为待响应集合本身依赖暗手。
+当前绑定使用规则版本 `10`。首次和牌锁定完整和牌基础，历史和牌张单独公开；胡后普通回合只能摸切，但仍可暗杠或碰杠。弃牌响应有胡候选时，当前决策者可在同一个响应窗口选择胡、碰、直杠或过；`Pass` 拒绝该弃牌上的全部动作，任一胡选择都会取消碰和直杠，并允许一炮多响。只有没有胡候选时才进入 `MeldResponse`。依赖旧动作语义的版本 7、8 和 9 Actor、checkpoint 和 ONNX 模型必须重新训练。`RuleNn` 要求 ONNX metadata `engine_rules_version=10`。
+
+`Game.resample_information_set(seed)` 返回一个与当前观测一致的隐藏世界采样（determinization），并保持当前行动者的 observation 和 legal mask 不变。普通回合会共同重洗对手普通手牌和 live wall，同时固定公开的历次和牌张。换牌阶段会固定已经选择牌的玩家。响应阶段会固定四家普通手牌，因为待响应集合本身依赖普通手牌。
 
 `Batch.resample_information_sets(indices, seeds)` 合并按索引克隆和重采样。重复 index 配合成对 seed，可以让多个候选动作共享同一批隐藏世界。
 
@@ -261,6 +262,6 @@ batch.step_and_observe_history_into(
 
 ## 全知 tile count
 
-`oracle_tile_counts_into` 写入 `uint8[..., 9, 27]`：四家绝对座位暗手、四家对应锁牌，以及一个无顺序 live-wall 直方图。
+`oracle_tile_counts_into` 写入 `uint8[..., 9, 27]`：四家绝对座位的合并持牌直方图、四家的完整锁定暗牌，以及一个无顺序 live-wall 直方图。完整锁定暗牌包括和牌基础和历次和牌张。
 
 该数组包含完美信息，只能用于模拟、诊断或显式的全知 Critic。它不能进入部署策略输入，也不会改变普通 observation。

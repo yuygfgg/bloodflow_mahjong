@@ -6,6 +6,7 @@ import type {
 import type { UiSnapshot } from "../../../engine/wasm/js/src/types";
 import { EngineClient, type TransitionResult } from "../engine/EngineClient";
 import {
+  areConfiguredBotsAvailable,
   createNextGameConfig,
   loadStoredGameConfig,
   storeGameConfig,
@@ -27,6 +28,7 @@ export interface UseGameEngineResult {
   error: string | null;
   snapshot: UiSnapshot | null;
   config: GameConfig;
+  nnAvailable: boolean;
   busy: boolean;
   activity: EngineActivity | null;
   paused: boolean;
@@ -50,6 +52,7 @@ export function useGameEngine(): UseGameEngineResult {
   const [error, setError] = useState<string | null>(null);
   const [snapshot, setSnapshot] = useState<UiSnapshot | null>(null);
   const [config, setConfigState] = useState<GameConfig>(loadStoredGameConfig);
+  const [nnAvailable, setNnAvailable] = useState(false);
   const [activity, setActivity] = useState<EngineActivity | null>(null);
   const [paused, setPaused] = useState(false);
   const [hintAction, setHintAction] = useState<number | null>(null);
@@ -63,9 +66,15 @@ export function useGameEngine(): UseGameEngineResult {
   useEffect(() => {
     let mounted = true;
     client.cancelDispose();
+    const unsubscribeCapabilities = client.subscribeCapabilities(
+      (capabilities) => {
+        if (mounted) setNnAvailable(capabilities.nnAvailable);
+      },
+    );
     void client.ready
       .then(() => {
-        if (mounted) setStatus("ready");
+        if (!mounted) return;
+        setStatus("ready");
       })
       .catch((reason: unknown) => {
         if (mounted) {
@@ -75,6 +84,7 @@ export function useGameEngine(): UseGameEngineResult {
       });
     return () => {
       mounted = false;
+      unsubscribeCapabilities();
       client.dispose();
     };
   }, [client]);
@@ -99,8 +109,12 @@ export function useGameEngine(): UseGameEngineResult {
   const start = useCallback(
     async (requested?: GameConfig): Promise<boolean> => {
       if (startInFlight.current) return false;
-      startInFlight.current = true;
       const next = requested ?? activeConfig.current;
+      if (!areConfiguredBotsAvailable(next, nnAvailable)) {
+        setError("The selected rule-nn policy is not available.");
+        return false;
+      }
+      startInFlight.current = true;
       setConfig(next);
       setActivity("starting");
       setError(null);
@@ -125,7 +139,7 @@ export function useGameEngine(): UseGameEngineResult {
         setActivity(null);
       }
     },
-    [client, setConfig],
+    [client, nnAvailable, setConfig],
   );
 
   const submit = useCallback(
@@ -224,6 +238,7 @@ export function useGameEngine(): UseGameEngineResult {
     error,
     snapshot,
     config,
+    nnAvailable,
     busy: activity != null,
     activity,
     paused,

@@ -100,11 +100,7 @@ function actionFor(profile: BotProfile): number | undefined {
   }
 }
 
-/**
- * Load the optional NN policy only when a game actually needs it. Model
- * construction performs synchronous WASM work, so doing it during worker boot
- * prevents the worker from reporting that the rules engine is ready.
- */
+/** Load and validate the optional NN policy once, then reuse it. */
 async function loadNn(): Promise<RuleNn> {
   if (nn != null) return nn;
   if (nnLoad != null) return nnLoad;
@@ -115,6 +111,17 @@ async function loadNn(): Promise<RuleNn> {
       throw new Error(`NN model request failed with HTTP ${response.status}.`);
     }
     const loaded = new RuleNn(new Uint8Array(await response.arrayBuffer()));
+    const probe = new Game(0n);
+    try {
+      if (loaded.action(probe) == null) {
+        throw new Error("NN model did not return an action for a fresh game.");
+      }
+    } catch (error) {
+      loaded.free();
+      throw error;
+    } finally {
+      probe.free();
+    }
     nn = loaded;
     return loaded;
   })().catch((error: unknown) => {
@@ -404,11 +411,29 @@ void (async () => {
   try {
     await init({ module_or_path: wasmUrl });
     initPanicHook();
+    const engineRulesVersion = ENGINE_RULES_VERSION();
     post({
       type: "ready",
       requestId: "boot",
-      engineRulesVersion: ENGINE_RULES_VERSION(),
+      engineRulesVersion,
+      nnAvailable: false,
     });
+    void loadNn().then(
+      () =>
+        post({
+          type: "capabilities",
+          requestId: "capabilities",
+          engineRulesVersion,
+          nnAvailable: true,
+        }),
+      () =>
+        post({
+          type: "capabilities",
+          requestId: "capabilities",
+          engineRulesVersion,
+          nnAvailable: false,
+        }),
+    );
   } catch (error) {
     post({
       type: "error",

@@ -27,7 +27,7 @@ def config() -> TransformerConfig:
 def state(batch: int = 3, history: int = 12) -> tuple[torch.Tensor, ...]:
     generator = torch.Generator().manual_seed(17)
     tile_obs = torch.randint(
-        0, 5, (batch, 10, 27), generator=generator, dtype=torch.uint8
+        0, 5, (batch, 11, 27), generator=generator, dtype=torch.uint8
     )
     melds = torch.full((batch, 4, 4, 3), 255, dtype=torch.uint8)
     melds[:, 0, 0] = torch.tensor([0, 1, 2], dtype=torch.uint8)[:batch, None]

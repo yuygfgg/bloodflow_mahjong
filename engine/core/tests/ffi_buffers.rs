@@ -258,7 +258,7 @@ fn ffi_buffers_match_typed_batch_across_states() {
 
 #[test]
 fn observation_buffers_match_public_state_in_parallel() {
-    assert_eq!(TILE_OBSERVATION_WIDTH, 270);
+    assert_eq!(TILE_OBSERVATION_WIDTH, 297);
     assert_eq!(MELD_OBSERVATION_WIDTH, 48);
     assert_eq!(RIVER_OBSERVATION_WIDTH, 216);
     assert_eq!(META_OBSERVATION_WIDTH, 34);

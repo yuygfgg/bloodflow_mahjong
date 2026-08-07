@@ -8,11 +8,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use bloodflow_mahjong::{
-    Action, ActionId, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense,
-    RulePlannerAnalysisOptions, RulePlannerConfig, RulePlannerContinuation,
-    RulePlannerContinuationPolicy, RulePlannerContinuationProfile, RulePlannerRootBelief,
-    RulePlannerSearchAnalysis, RulePlannerSearchOutcome, Seat, reset_rule_planner_search_stats,
-    rule_planner_search_stats,
+    Action, ActionId, Game, LegalActions, Phase, RuleEvConfig, RuleEvDefense, Seat,
 };
 use clap::{Parser, ValueEnum, error::ErrorKind};
 use rand::{Rng as _, SeedableRng};
@@ -50,54 +46,13 @@ struct Config {
     root_seed: u64,
     #[arg(long, default_value_t = DEFAULT_BOOTSTRAP_SAMPLES)]
     bootstrap_samples: NonZeroUsize,
-    /// Maximum games evaluated concurrently. Nested search defaults to one.
+    /// Maximum games evaluated concurrently.
     #[arg(long)]
     parallel_games: Option<NonZeroUsize>,
     #[arg(long, value_enum, default_value = "rule-ev")]
     policy_a: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
     a_lookahead_depth: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.hand_changes(),
-        value_parser = clap::value_parser!(u8).range(0..=2)
-    )]
-    a_hand_changes: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.draw_horizon(),
-        value_parser = clap::value_parser!(u8).range(0..=32)
-    )]
-    a_draw_horizon: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.candidate_states(),
-        value_parser = clap::value_parser!(u32).range(1..=200_000)
-    )]
-    a_candidate_states: u32,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.belief_worlds(),
-        value_parser = clap::value_parser!(u16).range(0..=256)
-    )]
-    a_belief_worlds: u16,
-    #[arg(long, value_enum, default_value = "posterior")]
-    a_root_belief: PlannerRootBelief,
-    #[arg(long, value_enum, default_value = "current")]
-    a_continuation: PlannerContinuation,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.response_worlds(),
-        value_parser = clap::value_parser!(u16).range(0..=256)
-    )]
-    a_response_worlds: u16,
-    #[arg(
-        long,
-        visible_alias = "a-search-budget",
-        default_value_t = RulePlannerConfig::DEFAULT.search_iterations(),
-        value_parser = clap::value_parser!(u16).range(0..=4_096)
-    )]
-    a_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     a_defense: Defense,
     /// ONNX model used when `--policy-a rule-nn` is selected.
@@ -107,47 +62,6 @@ struct Config {
     policy_b: PolicyKind,
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(0..=3))]
     b_lookahead_depth: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.hand_changes(),
-        value_parser = clap::value_parser!(u8).range(0..=2)
-    )]
-    b_hand_changes: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.draw_horizon(),
-        value_parser = clap::value_parser!(u8).range(0..=32)
-    )]
-    b_draw_horizon: u8,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.candidate_states(),
-        value_parser = clap::value_parser!(u32).range(1..=200_000)
-    )]
-    b_candidate_states: u32,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.belief_worlds(),
-        value_parser = clap::value_parser!(u16).range(0..=256)
-    )]
-    b_belief_worlds: u16,
-    #[arg(long, value_enum, default_value = "posterior")]
-    b_root_belief: PlannerRootBelief,
-    #[arg(long, value_enum, default_value = "current")]
-    b_continuation: PlannerContinuation,
-    #[arg(
-        long,
-        default_value_t = RulePlannerConfig::DEFAULT.response_worlds(),
-        value_parser = clap::value_parser!(u16).range(0..=256)
-    )]
-    b_response_worlds: u16,
-    #[arg(
-        long,
-        visible_alias = "b-search-budget",
-        default_value_t = RulePlannerConfig::DEFAULT.search_iterations(),
-        value_parser = clap::value_parser!(u16).range(0..=4_096)
-    )]
-    b_search_iterations: u16,
     #[arg(long, value_enum, default_value = "heuristic")]
     b_defense: Defense,
     /// ONNX model used when `--policy-b rule-nn` is selected.
@@ -161,8 +75,6 @@ enum PolicyKind {
     Fast,
     #[value(name = "rule-ev")]
     Ev,
-    #[value(name = "rule-planner")]
-    Planner,
     #[value(name = "rule-nn")]
     Nn,
 }
@@ -172,7 +84,6 @@ impl PolicyKind {
         match self {
             Self::Fast => "rule-fast",
             Self::Ev => "rule-ev",
-            Self::Planner => "rule-planner",
             Self::Nn => "rule-nn",
         }
     }
@@ -202,124 +113,19 @@ impl Defense {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum PlannerRootBelief {
-    #[default]
-    Posterior,
-    Uniform,
-    OracleHidden,
-}
-
-impl PlannerRootBelief {
-    const fn name_suffix(self) -> &'static str {
-        match self {
-            Self::Posterior => "",
-            Self::Uniform => "_uniform",
-            Self::OracleHidden => "_oracle_hidden",
-        }
-    }
-}
-
-impl From<PlannerRootBelief> for RulePlannerRootBelief {
-    fn from(value: PlannerRootBelief) -> Self {
-        match value {
-            PlannerRootBelief::Posterior => Self::Posterior,
-            PlannerRootBelief::Uniform => Self::Uniform,
-            PlannerRootBelief::OracleHidden => Self::OracleHidden,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
-enum PlannerContinuation {
-    #[default]
-    Current,
-    OracleContinuation,
-}
-
-impl PlannerContinuation {
-    const fn name_suffix(self) -> &'static str {
-        match self {
-            Self::Current => "",
-            Self::OracleContinuation => "_oracle_continuation",
-        }
-    }
-}
-
 #[derive(Clone)]
 enum Policy {
     Fast,
     Ev(RuleEvConfig),
     Nn(Arc<bloodflow_mahjong::RuleNn>),
-    Planner {
-        config: RulePlannerConfig,
-        root_belief: PlannerRootBelief,
-        continuation: PlannerContinuation,
-    },
-}
-
-#[derive(Clone, Copy, Debug)]
-struct PolicyDecision {
-    action: ActionId,
-    search: Option<RulePlannerSearchAnalysis>,
-}
-
-impl PolicyDecision {
-    const fn without_search(action: ActionId) -> Self {
-        Self {
-            action,
-            search: None,
-        }
-    }
 }
 
 impl Policy {
-    fn continuation_policy(&self) -> RulePlannerContinuationPolicy {
+    fn decide(&self, game: &Game) -> Option<ActionId> {
         match self {
-            Self::Fast => RulePlannerContinuationPolicy::Fast,
-            Self::Ev(config) => RulePlannerContinuationPolicy::Ev(*config),
-            Self::Planner { config, .. } => RulePlannerContinuationPolicy::PlannerBaseline(*config),
-            // NN continuation is only a fallback for planner diagnostics. The
-            // model itself is still used for all root decisions.
-            Self::Nn(_) => RulePlannerContinuationPolicy::Fast,
-        }
-    }
-
-    fn decide(
-        &self,
-        game: &Game,
-        continuation_profile: RulePlannerContinuationProfile,
-    ) -> Option<PolicyDecision> {
-        match self {
-            Self::Fast => game
-                .simple_rule_action()
-                .map(PolicyDecision::without_search),
-            Self::Ev(config) => game
-                .rule_ev_action_with_config(*config)
-                .map(PolicyDecision::without_search),
-            Self::Nn(model) => model
-                .action(game)
-                .expect("rule-nn inference failed")
-                .map(PolicyDecision::without_search),
-            Self::Planner {
-                config,
-                root_belief,
-                continuation,
-            } => {
-                let continuation = match continuation {
-                    PlannerContinuation::Current => RulePlannerContinuation::Current,
-                    PlannerContinuation::OracleContinuation => {
-                        RulePlannerContinuation::KnownPolicies(continuation_profile)
-                    }
-                };
-                let options = RulePlannerAnalysisOptions::new((*root_belief).into())
-                    .with_continuation(continuation);
-                game.rule_planner_analysis_with_options(*config, options)
-                    .map(|analysis| PolicyDecision {
-                        action: analysis.action(),
-                        search: analysis.search(),
-                    })
-            }
+            Self::Fast => game.simple_rule_action(),
+            Self::Ev(config) => game.rule_ev_action_with_config(*config),
+            Self::Nn(model) => model.action(game).expect("rule-nn inference failed"),
         }
     }
 }
@@ -333,26 +139,10 @@ impl Default for Config {
             parallel_games: None,
             policy_a: PolicyKind::Ev,
             a_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            a_hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
-            a_draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
-            a_candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
-            a_belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
-            a_root_belief: PlannerRootBelief::Posterior,
-            a_continuation: PlannerContinuation::Current,
-            a_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
-            a_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             a_defense: Defense::Heuristic,
             a_nn_model: None,
             policy_b: PolicyKind::Fast,
             b_lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            b_hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
-            b_draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
-            b_candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
-            b_belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
-            b_root_belief: PlannerRootBelief::Posterior,
-            b_continuation: PlannerContinuation::Current,
-            b_response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
-            b_search_iterations: RulePlannerConfig::DEFAULT.search_iterations(),
             b_defense: Defense::Heuristic,
             b_nn_model: None,
         }
@@ -366,45 +156,6 @@ struct GameResult {
     score_deltas: [i64; 4],
     actions: u32,
     decisions: [DecisionStats; 2],
-    searches: [PlannerSearchStats; 2],
-}
-
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct PlannerSearchStats {
-    decisions: u64,
-    proposals: u64,
-    validation_rejections: u64,
-    overrides: u64,
-    rollouts: u64,
-}
-
-impl PlannerSearchStats {
-    fn observe(&mut self, search: Option<RulePlannerSearchAnalysis>) {
-        let Some(search) = search else {
-            return;
-        };
-        self.decisions += 1;
-        self.rollouts += search.rollouts();
-        match search.outcome() {
-            RulePlannerSearchOutcome::NoProposal => {}
-            RulePlannerSearchOutcome::Rejected(_) => {
-                self.proposals += 1;
-                self.validation_rejections += 1;
-            }
-            RulePlannerSearchOutcome::Accepted(_) => {
-                self.proposals += 1;
-                self.overrides += 1;
-            }
-        }
-    }
-
-    fn merge(&mut self, other: Self) {
-        self.decisions += other.decisions;
-        self.proposals += other.proposals;
-        self.validation_rejections += other.validation_rejections;
-        self.overrides += other.overrides;
-        self.rollouts += other.rollouts;
-    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -441,6 +192,10 @@ impl DecisionStats {
             Phase::HuResponse => {
                 self.hu_responses += 1;
                 self.hu_response_taken += u64::from(matches!(action, Action::Hu));
+                self.pong_available += u64::from(legal.can_pong);
+                self.pong_taken += u64::from(matches!(action, Action::Pong));
+                self.exposed_kong_available += u64::from(legal.can_exposed_kong);
+                self.exposed_kong_taken += u64::from(matches!(action, Action::ExposedKong));
                 self.response_passes += u64::from(matches!(action, Action::Pass));
             }
             Phase::MeldResponse => {
@@ -573,20 +328,6 @@ fn play_game(
     play_game_with_progress(seed, policy_a_seat_mask, policy_a, policy_b, None)
 }
 
-fn continuation_profile(
-    policy_a_seat_mask: u8,
-    policy_a: &Policy,
-    policy_b: &Policy,
-) -> RulePlannerContinuationProfile {
-    RulePlannerContinuationProfile::new(Seat::ALL.map(|seat| {
-        if policy_a_seat_mask & (1 << seat.index()) != 0 {
-            policy_a.continuation_policy()
-        } else {
-            policy_b.continuation_policy()
-        }
-    }))
-}
-
 fn play_game_with_progress(
     seed: u64,
     policy_a_seat_mask: u8,
@@ -597,26 +338,23 @@ fn play_game_with_progress(
     debug_assert_eq!(policy_a_seat_mask.count_ones(), 2);
     let active_game = ActiveGame::new(progress);
     let mut game = Game::new(seed);
-    let continuation_profile = continuation_profile(policy_a_seat_mask, policy_a, policy_b);
     let initial_scores = Seat::ALL.map(|seat| game.score(seat));
     let mut decisions = [DecisionStats::default(); 2];
-    let mut searches = [PlannerSearchStats::default(); 2];
 
     for action_index in 0..MAX_ACTIONS_PER_GAME {
         let legal = game
             .legal_actions()
             .expect("a non-terminal game always has a decision");
         let policy_a_controls_actor = policy_a_seat_mask & (1 << legal.decision.actor.index()) != 0;
-        let decision = if policy_a_controls_actor {
-            policy_a.decide(&game, continuation_profile)
+        let action = if policy_a_controls_actor {
+            policy_a.decide(&game)
         } else {
-            policy_b.decide(&game, continuation_profile)
+            policy_b.decide(&game)
         }
         .expect("a non-terminal rule policy always returns an action");
         let policy_index = if policy_a_controls_actor { 0 } else { 1 };
-        decisions[policy_index].observe(&legal, decision.action.action());
-        searches[policy_index].observe(decision.search);
-        let outcome = game.step_id(decision.action).unwrap_or_else(|error| {
+        decisions[policy_index].observe(&legal, action.action());
+        let outcome = game.step_id(action).unwrap_or_else(|error| {
             panic!(
                 "rule policy selected an illegal action: seed={seed}, mask={policy_a_seat_mask:#06b}, error={error}"
             )
@@ -639,7 +377,6 @@ fn play_game_with_progress(
             score_deltas,
             actions: (action_index + 1) as u32,
             decisions,
-            searches,
         };
         active_game.complete();
         return result;
@@ -870,15 +607,6 @@ fn aggregate_decisions(blocks: &[BlockResult]) -> [DecisionStats; 2] {
     totals
 }
 
-fn aggregate_searches(blocks: &[BlockResult]) -> [PlannerSearchStats; 2] {
-    let mut totals = [PlannerSearchStats::default(); 2];
-    for game in blocks.iter().flat_map(|block| &block.games) {
-        totals[0].merge(game.searches[0]);
-        totals[1].merge(game.searches[1]);
-    }
-    totals
-}
-
 fn print_decisions(name: &str, stats: DecisionStats) {
     println!(
         "Decisions {name}  turns {}  Hu turn {}/{} response {}/{}  kong concealed {}/{} added {}/{} exposed {}/{}  pong {}/{}  response-pass {}",
@@ -899,35 +627,11 @@ fn print_decisions(name: &str, stats: DecisionStats) {
     );
 }
 
-fn print_searches(name: &str, stats: PlannerSearchStats) {
-    println!(
-        "Planner search {name}  decisions {}  proposals {}  rejected {}  overrides {} ({:.2}%)  rollouts {}",
-        stats.decisions,
-        stats.proposals,
-        stats.validation_rejections,
-        stats.overrides,
-        if stats.decisions == 0 {
-            0.0
-        } else {
-            100.0 * stats.overrides as f64 / stats.decisions as f64
-        },
-        stats.rollouts,
-    );
-}
-
 #[derive(Clone, Debug)]
 struct PolicySettings {
     argument_prefix: &'static str,
     kind: PolicyKind,
     lookahead_depth: u8,
-    hand_changes: u8,
-    draw_horizon: u8,
-    candidate_states: u32,
-    belief_worlds: u16,
-    root_belief: PlannerRootBelief,
-    continuation: PlannerContinuation,
-    response_worlds: u16,
-    search_iterations: u16,
     defense: Defense,
     nn_model: Option<PathBuf>,
 }
@@ -971,81 +675,6 @@ fn build_policy(settings: PolicySettings) -> Result<(Policy, String), clap::Erro
                 ),
             ))
         }
-        PolicyKind::Planner => {
-            let policy = RulePlannerConfig::DEFAULT
-                .with_hand_changes(settings.hand_changes)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "hand-changes",
-                        settings.hand_changes,
-                        "an integer from 0 through 2",
-                    )
-                })?
-                .with_draw_horizon(settings.draw_horizon)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "draw-horizon",
-                        settings.draw_horizon,
-                        "an integer from 0 through 32",
-                    )
-                })?
-                .with_candidate_states(settings.candidate_states)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "candidate-states",
-                        settings.candidate_states,
-                        "an integer from 1 through 200000",
-                    )
-                })?
-                .with_belief_worlds(settings.belief_worlds)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "belief-worlds",
-                        settings.belief_worlds,
-                        "an integer from 0 through 256",
-                    )
-                })?
-                .with_response_worlds(settings.response_worlds)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "response-worlds",
-                        settings.response_worlds,
-                        "an integer from 0 through 256",
-                    )
-                })?
-                .with_search_iterations(settings.search_iterations)
-                .ok_or_else(|| {
-                    invalid_policy_value(
-                        &settings,
-                        "search-iterations",
-                        settings.search_iterations,
-                        "an integer from 0 through 4096",
-                    )
-                })?;
-            Ok((
-                Policy::Planner {
-                    config: policy,
-                    root_belief: settings.root_belief,
-                    continuation: settings.continuation,
-                },
-                format!(
-                    "rule_planner_h{}_d{}_c{}_b{}_r{}_i{}{}{}",
-                    settings.hand_changes,
-                    settings.draw_horizon,
-                    settings.candidate_states,
-                    settings.belief_worlds,
-                    settings.response_worlds,
-                    settings.search_iterations,
-                    settings.root_belief.name_suffix(),
-                    settings.continuation.name_suffix(),
-                ),
-            ))
-        }
         PolicyKind::Nn => {
             let path = settings.nn_model.ok_or_else(|| {
                 clap::Error::raw(
@@ -1085,39 +714,14 @@ fn run(config: Config) -> Result<(), clap::Error> {
     let games = block_count
         .checked_mul(POLICY_A_SEAT_MASKS.len())
         .expect("game count overflowed usize");
-    let nested_search = (config.policy_a == PolicyKind::Planner
-        && (config.a_search_iterations != 0
-            || config.a_belief_worlds != 0
-            || config.a_response_worlds != 0))
-        || (config.policy_b == PolicyKind::Planner
-            && (config.b_search_iterations != 0
-                || config.b_belief_worlds != 0
-                || config.b_response_worlds != 0));
     let parallel_games = config
         .parallel_games
-        .map_or_else(
-            || {
-                if nested_search {
-                    1
-                } else {
-                    rayon::current_num_threads()
-                }
-            },
-            NonZeroUsize::get,
-        )
+        .map_or_else(rayon::current_num_threads, NonZeroUsize::get)
         .min(games);
     let settings_a = PolicySettings {
         argument_prefix: "a",
         kind: config.policy_a,
         lookahead_depth: config.a_lookahead_depth,
-        hand_changes: config.a_hand_changes,
-        draw_horizon: config.a_draw_horizon,
-        candidate_states: config.a_candidate_states,
-        belief_worlds: config.a_belief_worlds,
-        root_belief: config.a_root_belief,
-        continuation: config.a_continuation,
-        response_worlds: config.a_response_worlds,
-        search_iterations: config.a_search_iterations,
         defense: config.a_defense,
         nn_model: config.a_nn_model,
     };
@@ -1125,14 +729,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         argument_prefix: "b",
         kind: config.policy_b,
         lookahead_depth: config.b_lookahead_depth,
-        hand_changes: config.b_hand_changes,
-        draw_horizon: config.b_draw_horizon,
-        candidate_states: config.b_candidate_states,
-        belief_worlds: config.b_belief_worlds,
-        root_belief: config.b_root_belief,
-        continuation: config.b_continuation,
-        response_worlds: config.b_response_worlds,
-        search_iterations: config.b_search_iterations,
         defense: config.b_defense,
         nn_model: config.b_nn_model,
     };
@@ -1159,8 +755,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         &fast,
         &fast,
     );
-    reset_rule_planner_search_stats();
-
     let started = Instant::now();
     let progress = TournamentProgress::default();
     let finished = AtomicBool::new(false);
@@ -1237,8 +831,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         .flat_map(|block| &block.games)
         .map(|game| u64::from(game.actions))
         .sum();
-    let planner_stats = rule_planner_search_stats();
-
     let statistics_started = Instant::now();
     let summary = summarize_tournament(
         &blocks,
@@ -1269,9 +861,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
     let decision_stats = aggregate_decisions(&blocks);
     print_decisions(&policy_a_name, decision_stats[0]);
     print_decisions(&policy_b_name, decision_stats[1]);
-    let search_stats = aggregate_searches(&blocks);
-    print_searches(&policy_a_name, search_stats[0]);
-    print_searches(&policy_b_name, search_stats[1]);
     println!(
         "Throughput  play {:.3}s  statistics {:.3}s  games/s {:.3}  actions/s {:.1}  actions {}",
         play_elapsed,
@@ -1279,39 +868,6 @@ fn run(config: Config) -> Result<(), clap::Error> {
         games as f64 / play_elapsed,
         action_count as f64 / play_elapsed,
         action_count,
-    );
-    println!(
-        "Planner  turns {}  overrides {} ({:.2}%)  mean-hazard {:.3} points/candidate  won {:.3}  unwon {:.3}",
-        planner_stats.planned_turns,
-        planner_stats.turn_overrides,
-        if planner_stats.planned_turns == 0 {
-            0.0
-        } else {
-            100.0 * planner_stats.turn_overrides as f64 / planner_stats.planned_turns as f64
-        },
-        if planner_stats.hazard_candidates == 0 {
-            0.0
-        } else {
-            planner_stats.hazard_loss_millipoints as f64
-                / 1_000.0
-                / planner_stats.hazard_candidates as f64
-        },
-        if planner_stats.hazard_candidates == 0 {
-            0.0
-        } else {
-            planner_stats.hazard_won_loss_millipoints as f64
-                / 1_000.0
-                / planner_stats.hazard_candidates as f64
-        },
-        if planner_stats.hazard_candidates == 0 {
-            0.0
-        } else {
-            planner_stats
-                .hazard_loss_millipoints
-                .saturating_sub(planner_stats.hazard_won_loss_millipoints) as f64
-                / 1_000.0
-                / planner_stats.hazard_candidates as f64
-        },
     );
     if let Some(uncertainty) = summary.uncertainty {
         println!(
@@ -1421,46 +977,11 @@ mod tests {
                 score_deltas: [0; 4],
                 actions: 0,
                 decisions: [DecisionStats::default(); 2],
-                searches: [PlannerSearchStats::default(); 2],
             }),
             rank_pattern_counts: [1; RANK_PATTERNS.len()],
         };
 
         assert!(summarize_tournament(&[block], 16, 7).uncertainty.is_none());
-    }
-
-    #[test]
-    fn planner_search_stats_remain_separate_by_policy_side() {
-        let mut games = POLICY_A_SEAT_MASKS.map(|policy_a_seat_mask| GameResult {
-            policy_a_seat_mask,
-            ranks: [1, 2, 3, 4],
-            score_deltas: [0; 4],
-            actions: 0,
-            decisions: [DecisionStats::default(); 2],
-            searches: [PlannerSearchStats::default(); 2],
-        });
-        games[0].searches = [
-            PlannerSearchStats {
-                decisions: 3,
-                proposals: 2,
-                validation_rejections: 1,
-                overrides: 1,
-                rollouts: 30,
-            },
-            PlannerSearchStats {
-                decisions: 5,
-                proposals: 4,
-                validation_rejections: 3,
-                overrides: 1,
-                rollouts: 50,
-            },
-        ];
-        let block = BlockResult {
-            games,
-            rank_pattern_counts: [1; RANK_PATTERNS.len()],
-        };
-
-        assert_eq!(aggregate_searches(&[block]), games[0].searches);
     }
 
     #[test]
@@ -1479,23 +1000,13 @@ mod tests {
                 "--bootstrap-samples",
                 "56",
                 "--policy-a",
-                "rule-planner",
-                "--a-hand-changes",
-                "2",
-                "--a-draw-horizon",
-                "19",
-                "--a-candidate-states",
-                "2048",
-                "--a-belief-worlds",
-                "8",
-                "--a-root-belief",
-                "oracle-hidden",
-                "--a-continuation",
-                "oracle-continuation",
-                "--a-search-iterations",
-                "16",
-                "--policy-b",
                 "rule-ev",
+                "--a-lookahead-depth",
+                "3",
+                "--a-defense",
+                "none",
+                "--policy-b",
+                "rule-fast",
                 "--b-lookahead-depth",
                 "0",
                 "--b-defense",
@@ -1507,28 +1018,12 @@ mod tests {
                 root_seed: 34,
                 bootstrap_samples: NonZeroUsize::new(56).unwrap(),
                 parallel_games: None,
-                policy_a: PolicyKind::Planner,
-                a_lookahead_depth: 1,
-                a_hand_changes: 2,
-                a_draw_horizon: 19,
-                a_candidate_states: 2_048,
-                a_belief_worlds: 8,
-                a_root_belief: PlannerRootBelief::OracleHidden,
-                a_continuation: PlannerContinuation::OracleContinuation,
-                a_response_worlds: 0,
-                a_search_iterations: 16,
-                a_defense: Defense::Heuristic,
+                policy_a: PolicyKind::Ev,
+                a_lookahead_depth: 3,
+                a_defense: Defense::None,
                 a_nn_model: None,
-                policy_b: PolicyKind::Ev,
+                policy_b: PolicyKind::Fast,
                 b_lookahead_depth: 0,
-                b_hand_changes: 0,
-                b_draw_horizon: 1,
-                b_candidate_states: 1,
-                b_belief_worlds: 64,
-                b_root_belief: PlannerRootBelief::Posterior,
-                b_continuation: PlannerContinuation::Current,
-                b_response_worlds: 0,
-                b_search_iterations: 64,
                 b_defense: Defense::None,
                 b_nn_model: None,
             }
@@ -1538,14 +1033,6 @@ mod tests {
     #[test]
     fn clap_rejects_out_of_range_values() {
         assert!(Config::try_parse_from(["rule-tournament", "--a-lookahead-depth", "4"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--a-hand-changes", "3"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--b-draw-horizon", "33"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--a-candidate-states", "0"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--a-belief-worlds", "257"]).is_err());
-        assert!(Config::try_parse_from(["rule-tournament", "--a-response-worlds", "257"]).is_err());
-        assert!(
-            Config::try_parse_from(["rule-tournament", "--b-search-iterations", "4097"]).is_err()
-        );
         assert!(Config::try_parse_from(["rule-tournament", "--blocks", "0"]).is_err());
     }
 
@@ -1555,14 +1042,6 @@ mod tests {
             argument_prefix: "a",
             kind: PolicyKind::Nn,
             lookahead_depth: 0,
-            hand_changes: 0,
-            draw_horizon: 0,
-            candidate_states: 1,
-            belief_worlds: 0,
-            root_belief: PlannerRootBelief::Posterior,
-            continuation: PlannerContinuation::Current,
-            response_worlds: 0,
-            search_iterations: 0,
             defense: Defense::None,
             nn_model: None,
         });
@@ -1570,62 +1049,6 @@ mod tests {
             panic!("rule-nn requires --a-nn-model");
         };
         assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
-    }
-
-    #[test]
-    fn rule_ev_ignores_planner_only_parameters() {
-        let settings = PolicySettings {
-            argument_prefix: "a",
-            kind: PolicyKind::Ev,
-            lookahead_depth: RuleEvConfig::STANDARD.search_depth(),
-            hand_changes: RulePlannerConfig::DEFAULT.hand_changes(),
-            draw_horizon: RulePlannerConfig::DEFAULT.draw_horizon(),
-            candidate_states: RulePlannerConfig::DEFAULT.candidate_states(),
-            belief_worlds: RulePlannerConfig::DEFAULT.belief_worlds(),
-            root_belief: PlannerRootBelief::OracleHidden,
-            continuation: PlannerContinuation::OracleContinuation,
-            response_worlds: RulePlannerConfig::DEFAULT.response_worlds(),
-            search_iterations: 256,
-            defense: Defense::Heuristic,
-            nn_model: None,
-        };
-        let with_budget = build_policy(settings.clone()).unwrap();
-        let without_budget = build_policy(PolicySettings {
-            search_iterations: 0,
-            root_belief: PlannerRootBelief::Posterior,
-            continuation: PlannerContinuation::Current,
-            ..settings
-        })
-        .unwrap();
-
-        assert_eq!(with_budget.1, without_budget.1);
-        match (with_budget.0, without_budget.0) {
-            (Policy::Ev(left), Policy::Ev(right)) => assert_eq!(left, right),
-            _ => panic!("both policies must be rule-ev"),
-        }
-    }
-
-    #[test]
-    fn planner_defaults_use_the_canonical_tournament_budget() {
-        let config = Config::default();
-        let (_, name) = build_policy(PolicySettings {
-            argument_prefix: "a",
-            kind: PolicyKind::Planner,
-            lookahead_depth: config.a_lookahead_depth,
-            hand_changes: config.a_hand_changes,
-            draw_horizon: config.a_draw_horizon,
-            candidate_states: config.a_candidate_states,
-            belief_worlds: config.a_belief_worlds,
-            root_belief: config.a_root_belief,
-            continuation: config.a_continuation,
-            response_worlds: config.a_response_worlds,
-            search_iterations: config.a_search_iterations,
-            defense: config.a_defense,
-            nn_model: config.a_nn_model,
-        })
-        .expect("the default planner budget is valid");
-
-        assert_eq!(name, "rule_planner_h0_d1_c1_b64_r0_i64");
     }
 
     #[test]
@@ -1645,27 +1068,5 @@ mod tests {
 
         assert!(unwind.is_err());
         assert!(finished.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn continuation_profile_follows_every_balanced_seat_mask() {
-        let policy_a = Policy::Ev(RuleEvConfig::FAST);
-        let policy_b = Policy::Planner {
-            config: RulePlannerConfig::DEFAULT,
-            root_belief: PlannerRootBelief::OracleHidden,
-            continuation: PlannerContinuation::OracleContinuation,
-        };
-
-        for mask in POLICY_A_SEAT_MASKS {
-            let profile = continuation_profile(mask, &policy_a, &policy_b);
-            for seat in Seat::ALL {
-                let expected = if mask & (1 << seat.index()) != 0 {
-                    RulePlannerContinuationPolicy::Ev(RuleEvConfig::FAST)
-                } else {
-                    RulePlannerContinuationPolicy::PlannerBaseline(RulePlannerConfig::DEFAULT)
-                };
-                assert_eq!(profile.for_seat(seat), expected);
-            }
-        }
     }
 }

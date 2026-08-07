@@ -32,7 +32,6 @@ path = "examples/rule_nn_smoke.rs"
 required-features = ["rule-nn"]
 
 [features]
-planner-analysis = []
 rule-nn = ["dep:tract-onnx", "dep:getrandom"]
 
 [dependencies]

@@ -4,6 +4,8 @@
 
 游戏规则见 [`../../GAME_RULES.md`](../../GAME_RULES.md)，确定性约定和信息边界见 [`../../IMPLEMENTATION.md`](../../IMPLEMENTATION.md)。
 
+当前 `ENGINE_RULES_VERSION` 为 `10`。首次和牌锁定完整和牌基础；历史和牌张单独公开，胡后普通回合只能摸切，但仍可暗杠或碰杠。在一个弃牌响应窗口中，每名候选玩家只提交一次动作；有任何胡候选时，合法动作可以同时包含胡、碰、直杠和过，胡会覆盖所有面子选择。没有胡候选时才使用 `MeldResponse`。版本 7、8 和 9 的轨迹与训练模型与当前规则不兼容。
+
 ## 单局循环
 
 ```rust
@@ -33,7 +35,7 @@ fn play(seed: u64) -> Result<Game, GameError> {
 - `analyze_shanten`：返回结构向听数和有效牌 mask；
 - `evaluate_max_wait`：返回查大叫所需的最大牌型与根倍率，不计算状态/事件番。
 
-向听数表示还差几次有效进张才能听牌的结构指标；`SHANTEN_COMPLETE`（`-1`）表示当前结构已经完成。玩家和牌后，旧结构仍保留在扩展持牌中，因此 `-1` 不代表距离下一次血流和牌只有一步。
+向听数表示还差几次有效进张才能听牌的结构指标；`SHANTEN_COMPLETE`（`-1`）表示当前结构已经完成。引擎分析玩家状态时会先排除历次和牌张。结果始终表示当前普通手牌距离下一次和牌的结构距离。
 
 ## 信息边界
 
@@ -50,7 +52,7 @@ fn play(seed: u64) -> Result<Game, GameError> {
 
 ## 策略 API
 
-core 提供三种不依赖模型文件的规则策略：`rule-fast` 是轻量基准，`rule-ev` 是中等预算，`rule-planner` 的预算最高。feature `rule-nn` 额外提供 ONNX 神经网络策略。
+core 提供两种不依赖模型文件的规则策略：`rule-fast` 是轻量基准，`rule-ev` 是中等预算。feature `rule-nn` 额外提供 ONNX 神经网络策略。
 
 ### `rule-fast`
 
@@ -73,31 +75,11 @@ let action = game.rule_ev_action_with_config(config);
 
 `search_depth` 控制确定性手牌前瞻：枚举公开有效牌和后续弃牌，不采样隐藏牌，也不读取权威牌墙。`RuleEvConfig::STANDARD` 使用 depth 1 和启发式防守。
 
-`Batch::rule_ev_actions_into` 和 `Batch::rule_ev_actions_with_config_into` 提供批量接口。隐藏世界搜索只由 `rule-planner` 实现。
-
-### `rule-planner`
-
-```rust
-use bloodflow_mahjong::RulePlannerConfig;
-
-let config = RulePlannerConfig::DEFAULT;
-let action = game.rule_planner_action_with_config(config);
-```
-
-planner 先评估手牌候选图和公开状态价值，再决定动作。`belief_worlds` 控制危险度和 rollout 使用的信息集粒子数。`search_iterations` 非零时，策略对候选动作做配对 rollout——固定其余三座位的行动不变，只改进当前动作——并用独立粒子流验证改动。
-
-
-#### 分析接口
-
-feature `planner-analysis` 额外公开 `RulePlannerRootBelief`、`RulePlannerAnalysisOptions`、冻结 continuation profile 和两组 `Game::rule_planner_analysis_*` 接口。`with_config` 接口保留当前生产 continuation；`with_options` 接口可以独立选择根 belief 和 continuation model。结构化结果包含 baseline、proposal、validation 结果和真实执行的 rollout 计数。
-
-`RulePlannerContinuationProfile` 为四个座位分别指定 `Fast`、`Ev` 或 `PlannerBaseline`。profile 是封闭策略集合，不接受任意回调；`PlannerBaseline` 会关闭 paired root search，但保留其余 planner 配置。这样保证一次根策略改进具有固定 continuation，并防止 rollout 内递归搜索。每个 continuation 策略只读取当前行动者的普通 observation 输入。
-
-`OracleHidden` 读取权威隐藏状态，`KnownPolicies` 读取评测器提供的策略身份。两者只能用于诊断，不能用于部署或正式策略成绩。
+`Batch::rule_ev_actions_into` 和 `Batch::rule_ev_actions_with_config_into` 提供批量接口。
 
 ### `rule-nn`
 
-`RuleNn` 通过 `tract-onnx` 加载 Actor 图。core 默认不启用该依赖；调用者必须启用 feature `rule-nn`。仓库中的当前模型位于 [`../../model/latest.onnx`](../../model/latest.onnx)。模型应在进程启动时加载一次，并在后续决策中复用。
+`RuleNn` 通过 `tract-onnx` 加载 Actor 图。core 默认不启用该依赖；调用者必须启用 feature `rule-nn`。调用者必须提供规则版本 10 重新训练的模型；仓库中的旧 [`../../model/latest.onnx`](../../model/latest.onnx) 不能用于当前引擎。模型应在进程启动时加载一次，并在后续决策中复用。
 
 ```rust
 use std::error::Error;
@@ -105,7 +87,7 @@ use std::error::Error;
 use bloodflow_mahjong::{Game, RuleNn};
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let bytes = std::fs::read("../../model/latest.onnx")?;
+    let bytes = std::fs::read("/path/to/rules-v10.onnx")?;
     let policy = RuleNn::from_onnx_bytes(&bytes)?;
     let game = Game::new(7);
     let action = policy.action(&game)?;
@@ -114,18 +96,18 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 ```
 
-模型使用固定 batch size 1 的接口：
+模型使用固定 batch size 1 的接口。模型 metadata 必须包含 `engine_rules_version=10`；缺少 metadata 或版本不匹配时，加载立即失败：
 
 | 名称 | dtype | shape |
 | --- | --- | --- |
-| `tile_obs` | `uint8` | `[1, 10, 27]` |
+| `tile_obs` | `uint8` | `[1, 11, 27]` |
 | `melds` | `uint8` | `[1, 4, 4, 3]` |
 | `meta` | `int32` | `[1, 34]` |
 | `events` | `int32` | `[1, 192, 8]` |
 | `event_lengths` | `int64` | `[1]` |
 | `logits` | `float32` | `[1, 115]` |
 
-ONNX 图只输出未屏蔽的 Actor logits。`RuleNn::action` 从当前行动者视角生成 observation 和事件历史，再使用引擎的 legal mask 选择最高有限 logit。模型不能提交非法动作。相同 logit 使用最小动作 ID。`rule-nn` 当前没有 `Batch` 推理接口。
+ONNX 图只输出未屏蔽的 Actor logits。`RuleNn::action` 从当前行动者视角生成 observation 和事件历史，再使用引擎的 legal mask 选择最高有限 logit。模型不能提交非法动作。相同 logit 使用最小动作 ID。`Batch::rule_nn_actions_into` 和 masked 版本复用一个不可变模型，并通过 Rayon 并行执行每个固定 batch-size 1 的图。
 
 ## Batch
 
@@ -144,13 +126,11 @@ ONNX 图只输出未屏蔽的 Actor logits。`RuleNn::action` 从当前行动者
 ```bash
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong --all-targets
 cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
-  --all-targets --features planner-analysis
-cargo test --manifest-path ../Cargo.toml -p bloodflow-mahjong \
   --all-targets --features rule-nn
 
 cargo run --release --manifest-path ../Cargo.toml \
   -p bloodflow-mahjong \
   --features rule-nn \
   --example rule_nn_smoke -- \
-  ../../model/latest.onnx
+  /path/to/rules-v10.onnx
 ```

@@ -46,8 +46,6 @@ export interface WasmGame {
   simpleRuleAction(): number | undefined;
   ruleEvAction(): number | undefined;
   ruleEvActionWithConfig(config: WasmRuleEvConfig): number | undefined;
-  rulePlannerAction(): number | undefined;
-  rulePlannerActionWithConfig(config: WasmRulePlannerConfig): number | undefined;
   scores(): Int32Array;
   missingSuits(): Int8Array;
   rankings(): Uint8Array;
@@ -81,16 +79,6 @@ export interface WasmRuleEvConfig {
   readonly defense: boolean;
 }
 
-export interface WasmRulePlannerConfig {
-  free(): void;
-  readonly handChanges: number;
-  readonly drawHorizon: number;
-  readonly candidateStates: number;
-  readonly beliefWorlds: number;
-  readonly responseWorlds: number;
-  readonly searchIterations: number;
-}
-
 export interface WasmRuleNn {
   free(): void;
   action(game: WasmGame): number | undefined;
@@ -104,17 +92,6 @@ export interface WasmModule {
     new (searchDepth: number, defense: boolean): WasmRuleEvConfig;
     fast(): WasmRuleEvConfig;
     standard(): WasmRuleEvConfig;
-  };
-  RulePlannerConfig: {
-    new (
-      handChanges: number,
-      drawHorizon: number,
-      candidateStates: number,
-      beliefWorlds: number,
-      responseWorlds: number,
-      searchIterations: number,
-    ): WasmRulePlannerConfig;
-    defaultConfig(): WasmRulePlannerConfig;
   };
   RuleNn: new (onnx: Uint8Array) => WasmRuleNn;
   [name: string]: unknown;
