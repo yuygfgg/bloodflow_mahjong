@@ -12,9 +12,11 @@ def evaluation() -> dict[str, float]:
         "games": 8.0,
         "mean_score_delta": -725.0,
         "score_std": 100.0,
+        "score_se": 50.0,
         "first_rate": 0.125,
         "last_rate": 0.5,
         "mean_rank": 3.25,
+        "rank_se": 0.125,
     }
 
 
@@ -57,7 +59,8 @@ def test_ppo_summaries_cover_each_phase() -> None:
         "gate_evaluation_seconds": 0.75,
     }
     assert compact_ppo_record(baseline) == (
-        "BASE EV  rank 3.25  score -725  first 12.5%  last 50.0%"
+        "BASE EV  rank 3.25 [95% CI 3.005, 3.495]"
+        "  score -725 [95% CI -823.0, -627.0]  first 12.5%  last 50.0%"
         "  games 8  opp fast/EV 33.3%/66.7%  time 1s"
     )
 
@@ -96,8 +99,10 @@ def test_ppo_summaries_cover_each_phase() -> None:
         "PPO u    3  1h01m  196,608 states  12.35k states/s"
         "  pi -0.0123  value 2.410  ent 0.720  KL +0.00610  lr 2.80e-04"
         "  opp fast/EV 33.3%/66.7%"
-        "  EV rank 3.25  score -725  first 12.5%  last 50.0%"
-        "  RULE-NN rank 3.25  score -725  first 12.5%  last 50.0%"
+        "  EV rank 3.25 [95% CI 3.005, 3.495]"
+        "  score -725 [95% CI -823.0, -627.0]  first 12.5%  last 50.0%"
+        "  RULE-NN rank 3.25 [95% CI 3.005, 3.495]"
+        "  score -725 [95% CI -823.0, -627.0]  first 12.5%  last 50.0%"
     )
     off_update = update | {"kl_control": "off"}
     assert "  KL off  lr" in compact_ppo_record(off_update)
@@ -111,7 +116,8 @@ def test_ppo_summaries_cover_each_phase() -> None:
     }
     assert compact_ppo_record(complete) == (
         "DONE  u    4  262,144 states  1d00h"
-        "  EV rank 3.25  score -725  first 12.5%  last 50.0%  games 8"
+        "  EV rank 3.25 [95% CI 3.005, 3.495]"
+        "  score -725 [95% CI -823.0, -627.0]  first 12.5%  last 50.0%  games 8"
     )
 
     interrupted = {
@@ -141,3 +147,17 @@ def test_ppo_record_writes_json_but_prints_only_the_summary(tmp_path, capsys) ->
     assert output.startswith("BASE EV  rank 3.25")
     assert not output.startswith("{")
     assert json.loads(path.read_text(encoding="utf-8")) == record
+
+
+def test_ppo_summary_uses_the_recorded_confidence_multiplier() -> None:
+    record = {
+        "phase": "ppo_start",
+        "gate_evaluation": evaluation(),
+        "gate_confidence_z": 1.0,
+        "gate_evaluation_seconds": 0.75,
+    }
+
+    summary = compact_ppo_record(record)
+
+    assert "rank 3.25 [68% CI 3.125, 3.375]" in summary
+    assert "score -725 [68% CI -775.0, -675.0]" in summary

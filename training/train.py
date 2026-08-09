@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import random
 import signal
 import time
@@ -199,13 +200,40 @@ def _optimizer(
     return torch.optim.AdamW(model.parameters(), **options)
 
 
-def _compact_evaluation(evaluation: dict[str, Any]) -> str:
+def _confidence_label(z: float) -> str:
+    coverage = math.erf(z / math.sqrt(2.0))
+    return f"{100.0 * coverage:.0f}% CI"
+
+
+def _compact_evaluation(
+    evaluation: dict[str, Any], *, confidence_z: float = 1.96
+) -> str:
+    rank = float(evaluation["mean_rank"])
+    score = float(evaluation["mean_score_delta"])
+    rank_summary = f"rank {rank:.2f}"
+    score_summary = f"score {score:+,.0f}"
+    rank_se = evaluation.get("rank_se")
+    score_se = evaluation.get("score_se")
+    if rank_se is not None and score_se is not None:
+        label = _confidence_label(confidence_z)
+        rank_radius = confidence_z * float(rank_se)
+        score_radius = confidence_z * float(score_se)
+        rank_summary += (
+            f" [{label} {rank - rank_radius:.3f}, {rank + rank_radius:.3f}]"
+        )
+        score_summary += (
+            f" [{label} {score - score_radius:+,.1f}, {score + score_radius:+,.1f}]"
+        )
     return (
-        f"rank {float(evaluation['mean_rank']):.2f}"
-        f"  score {float(evaluation['mean_score_delta']):+,.0f}"
+        f"{rank_summary}"
+        f"  {score_summary}"
         f"  first {format_percent(evaluation['first_rate'])}"
         f"  last {format_percent(evaluation['last_rate'])}"
     )
+
+
+def _record_confidence_z(record: dict[str, Any]) -> float:
+    return float(record.get("gate_confidence_z", 1.96))
 
 
 def _compact_opponents(record: dict[str, Any]) -> str:
@@ -233,11 +261,12 @@ def _compact_opponents(record: dict[str, Any]) -> str:
 
 def _compact_record(record: dict[str, Any]) -> str:
     phase = str(record.get("phase", "event"))
+    confidence_z = _record_confidence_z(record)
     if phase == "ppo_start":
         evaluation = record["gate_evaluation"]
         assert isinstance(evaluation, dict)
         return (
-            f"BASE EV  {_compact_evaluation(evaluation)}"
+            f"BASE EV  {_compact_evaluation(evaluation, confidence_z=confidence_z)}"
             f"  games {int(evaluation['games']):,}"
             "  opp fast/EV 33.3%/66.7%"
             f"  time {format_duration(float(record['gate_evaluation_seconds']))}"
@@ -255,7 +284,7 @@ def _compact_record(record: dict[str, Any]) -> str:
             f"FORK  u{int(record['update']):>5}"
             f"  {int(record['transitions']):,} states"
             f"  elapsed {format_duration(float(record['previous_run_elapsed_seconds']))}"
-            f"  EV {_compact_evaluation(evaluation)}"
+            f"  EV {_compact_evaluation(evaluation, confidence_z=confidence_z)}"
         )
     if phase == "ppo":
         kl_summary = (
@@ -281,11 +310,16 @@ def _compact_record(record: dict[str, Any]) -> str:
             message += f"  {opponents}"
         evaluation = record.get("gate_evaluation")
         if isinstance(evaluation, dict):
-            message += f"  EV {_compact_evaluation(evaluation)}"
+            message += (
+                f"  EV {_compact_evaluation(evaluation, confidence_z=confidence_z)}"
+            )
         analysis = record.get("analysis_evaluation")
         if isinstance(analysis, dict) and analysis.get("opponent") != "rule-ev":
             label = str(analysis.get("opponent", "analysis")).upper()
-            message += f"  {label} {_compact_evaluation(analysis)}"
+            message += (
+                f"  {label} "
+                f"{_compact_evaluation(analysis, confidence_z=confidence_z)}"
+            )
         return message
     if phase == "complete":
         evaluation = record["gate_evaluation"]
@@ -294,7 +328,7 @@ def _compact_record(record: dict[str, Any]) -> str:
             f"DONE  u{int(record['update']):>5}"
             f"  {int(record['transitions']):,} states"
             f"  {format_duration(float(record['ppo_elapsed_seconds']))}"
-            f"  EV {_compact_evaluation(evaluation)}"
+            f"  EV {_compact_evaluation(evaluation, confidence_z=confidence_z)}"
             f"  games {int(evaluation['games']):,}"
         )
     if phase == "interrupted":
@@ -685,6 +719,7 @@ def run(args: argparse.Namespace) -> None:
         synchronize()
         result: dict[str, Any] = {
             "gate_evaluation": gate,
+            "gate_confidence_z": config.self_play_gate_confidence_z,
             "gate_evaluation_seed": seed,
             "gate_evaluation_seconds": time.perf_counter() - gate_start,
         }
@@ -889,6 +924,7 @@ def run(args: argparse.Namespace) -> None:
                 {
                     "phase": "complete",
                     "gate_evaluation": final,
+                    "gate_confidence_z": config.self_play_gate_confidence_z,
                     "gate_evaluation_seconds": time.perf_counter()
                     - evaluation_start,
                     "update": update,
