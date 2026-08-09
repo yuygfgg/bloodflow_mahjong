@@ -16,3 +16,5 @@ runs/
 # Browser client dependencies and generated static output
 /web/node_modules/
 /web/dist/
+
+.DS_Store

@@ -67,7 +67,7 @@ cargo run --release -p bloodflow-mahjong-rule-tournament -- --help
 
 `rule-nn` 在启动时加载一次 ONNX 模型。模型经过 schema 检查和图优化后，由所有 tournament worker 共享。必须先训练并导出包含 `engine_rules_version=10` metadata 的模型。仓库当前附带的旧 `model/latest.onnx` 不兼容，不能直接用于该命令。
 
-以下命令应在 `engine/` 目录执行，并将示例路径替换为实际的规则版本 10 模型：
+以下命令应在 `engine/` 目录执行：
 
 ```bash
 cargo run --release -p bloodflow-mahjong-rule-tournament -- \

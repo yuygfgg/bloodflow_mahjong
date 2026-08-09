@@ -79,7 +79,7 @@ let action = game.rule_ev_action_with_config(config);
 
 ### `rule-nn`
 
-`RuleNn` 通过 `tract-onnx` 加载 Actor 图。core 默认不启用该依赖；调用者必须启用 feature `rule-nn`。调用者必须提供规则版本 10 重新训练的模型；仓库中的旧 [`../../model/latest.onnx`](../../model/latest.onnx) 不能用于当前引擎。模型应在进程启动时加载一次，并在后续决策中复用。
+`RuleNn` 通过 `tract-onnx` 加载 Actor 图。core 默认不启用该依赖；调用者必须启用 feature `rule-nn`。模型应在进程启动时加载一次，并在后续决策中复用。
 
 ```rust
 use std::error::Error;

@@ -8,8 +8,6 @@
 
 四人血流麻将的完整实现：Rust 权威引擎，附带两种内置规则策略、可加载的 ONNX 神经网络策略、策略锦标赛工具、Python 与 WebAssembly 绑定、训练流程和纯静态 Web 客户端。
 
-当前引擎规则版本为 `10`。首次和牌会锁定完整基础结构；后续普通回合只能摸切，但仍可暗杠或碰杠；历次和牌张公开隔离，不得参与后续动作。版本 7、8 和 9 的重放、checkpoint 与模型不兼容当前引擎，模型必须重新训练。
-
 ## 功能
 
 - 108 张三门数牌（万/条/筒），换三张、定缺；
@@ -49,7 +47,7 @@
 | [`engine/tools/rule-tournament`](engine/tools/rule-tournament/) | 任意两种受支持策略的平衡测评工具 |
 | [`web`](web/) | 基于 Three.js 的纯静态 Web 客户端 |
 | [`training`](training/) | 自对弈训练与 ONNX 导出流程 |
-| [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 的部署路径；使用前必须替换为规则版本 10 重新训练并导出的模型 |
+| [`model/latest.onnx`](model/latest.onnx) | `rule-nn` 的部署路径 |
 
 Rust workspace 包含四个 package：
 
@@ -91,7 +89,7 @@ fn main() -> Result<(), GameError> {
 | `rule-ev` | 手牌价值、防守启发式和确定性有限前瞻 | Rust/Python `Game` 和 `Batch` |
 | `rule-nn` | ONNX Actor；引擎负责 observation 编码和合法动作过滤 | Rust/Python/Wasm `RuleNn` 和锦标赛 |
 
-`rule-fast` 和 `rule-ev` 不需要外部模型。`rule-nn` 需要与规则版本 10 配套的 ONNX 模型；仓库中的旧 `model/latest.onnx` 不能继续用于当前规则。Rust 和 Python 接口支持单局与 `Batch` 推理，WebAssembly 接口提供单局推理。三种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
+`rule-fast` 和 `rule-ev` 不需要外部模型。Rust 和 Python 接口支持单局与 `Batch` 推理，WebAssembly 接口提供单局推理。三种策略的强弱对比用锦标赛工具评估，统计方法见 [`engine/tools/rule-tournament/README.md`](engine/tools/rule-tournament/README.md)。
 
 ## Python 绑定
 

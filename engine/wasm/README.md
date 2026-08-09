@@ -2,10 +2,6 @@
 
 本 crate 将血流成河规则引擎暴露给 JavaScript / TypeScript。底层 API 与 Python 扩展对称；`js/` 中的 TypeScript 封装再把这些原语整理成客户端使用的观察者相对 UI 快照和 worker 协议类型。
 
-当前绑定公开 `ENGINE_RULES_VERSION() == 10`。首次和牌锁定完整和牌基础；历史和牌张单独公开，胡后普通回合只能摸切，但仍可暗杠或碰杠。有胡候选的弃牌响应可以在同一个 legal mask 中同时包含胡、碰、直杠和过。客户端必须逐项呈现该 mask，不能根据 `HuResponse` 阶段名隐藏碰或直杠。胡仍由引擎全局优先结算，并允许一炮多响。版本 7、8 和 9 的重放与训练模型不兼容版本 10。`RuleNn` 还会检查 ONNX metadata `engine_rules_version`。
-
-WASM 仍导出 `RuleNn`。仓库当前附带的旧 `model/latest.onnx` 缺少规则版本 10 metadata，加载器会拒绝该文件。必须先替换为重新训练并导出的规则版本 10 模型，才能运行 NN 烟测或通过 Web worker 使用该策略。
-
 ## 目录
 
 | 路径 | 作用 |

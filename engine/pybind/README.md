@@ -37,7 +37,7 @@ ev_action = game.rule_ev_action(ev_config)
 
 `RuleEvConfig` 提供 `fast()` 和 `standard()`。构造函数会拒绝超出 core 约束的预算。
 
-`RuleNn` 从 ONNX 文件或字节加载模型。调用方必须使用规则版本 10 重新训练的模型；当前仓库中的旧 `model/latest.onnx` 不能用于当前引擎。模型加载会检查固定输入和输出契约。一个实例可以在多个 `Game` 决策中复用：
+`RuleNn` 从 ONNX 文件或字节加载模型。模型加载会检查固定输入和输出契约。一个实例可以在多个 `Game` 决策中复用：
 
 ```python
 import bloodflow_mahjong as bm
@@ -251,8 +251,6 @@ batch.step_and_observe_history_into(
 ## 重放和信息集采样
 
 `ENGINE_RULES_VERSION` 标识游戏规则执行和初始化语义。紧凑轨迹至少应保存该版本、seed 和动作序列。版本不同时应拒绝重放，不应猜测迁移。
-
-当前绑定使用规则版本 `10`。首次和牌锁定完整和牌基础，历史和牌张单独公开；胡后普通回合只能摸切，但仍可暗杠或碰杠。弃牌响应有胡候选时，当前决策者可在同一个响应窗口选择胡、碰、直杠或过；`Pass` 拒绝该弃牌上的全部动作，任一胡选择都会取消碰和直杠，并允许一炮多响。只有没有胡候选时才进入 `MeldResponse`。依赖旧动作语义的版本 7、8 和 9 Actor、checkpoint 和 ONNX 模型必须重新训练。`RuleNn` 要求 ONNX metadata `engine_rules_version=10`。
 
 `Game.resample_information_set(seed)` 返回一个与当前观测一致的隐藏世界采样（determinization），并保持当前行动者的 observation 和 legal mask 不变。普通回合会共同重洗对手普通手牌和 live wall，同时固定公开的历次和牌张。换牌阶段会固定已经选择牌的玩家。响应阶段会固定四家普通手牌，因为待响应集合本身依赖普通手牌。
 
